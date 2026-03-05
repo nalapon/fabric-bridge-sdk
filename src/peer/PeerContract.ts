@@ -8,7 +8,7 @@ import type {
   BridgeSubmittedTx,
   CommitStatus,
 } from "../types/bridge";
-import type { BridgeConfig, TimeoutConfig } from "../types/config";
+import type { ResolvedBridgeConfig, TimeoutConfig } from "../types/config";
 import type { DiscoveryResult } from "../types/discovery";
 import {
   EndorsementError,
@@ -32,7 +32,7 @@ export class PeerNetwork implements BridgeNetwork {
   constructor(
     gateway: fabricNetwork.Gateway,
     channelName: string,
-    config: BridgeConfig,
+    config: ResolvedBridgeConfig,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
   ) {

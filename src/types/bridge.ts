@@ -8,6 +8,8 @@ import type {
   EvaluationError,
   ConfigurationError,
   TimeoutError,
+  FileResolveError,
+  NotConnectedError,
 } from '../errors/index';
 
 export type BridgeError =
@@ -18,7 +20,9 @@ export type BridgeError =
   | CommitError
   | EvaluationError
   | ConfigurationError
-  | TimeoutError;
+  | TimeoutError
+  | FileResolveError
+  | NotConnectedError;
 
 export type BridgeResult<T> = Result<T, BridgeError>;
 

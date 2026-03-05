@@ -8,7 +8,7 @@ import type {
   BridgeSubmittedTx,
   CommitStatus,
 } from '../types/bridge';
-import type { BridgeConfig, TimeoutConfig } from '../types/config';
+import type { ResolvedBridgeConfig, TimeoutConfig } from '../types/config';
 import {
   EndorsementError,
   SubmitError,
@@ -23,13 +23,13 @@ export class GatewayNetwork implements BridgeNetwork {
   private channelName: string;
   private timeouts: Required<TimeoutConfig>;
 
-  constructor(gateway: fabricGateway.Gateway, channelName: string, config: BridgeConfig) {
+  constructor(gateway: fabricGateway.Gateway, channelName: string, config: ResolvedBridgeConfig) {
     this.gateway = gateway;
     this.channelName = channelName;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
   }
 
-  getContract(chaincodeName: string, contractName?: string): BridgeContract {
+  async getContract(chaincodeName: string, contractName?: string): Promise<BridgeContract> {
     const network = this.gateway.getNetwork(this.channelName);
     const contract = network.getContract(chaincodeName, contractName);
     return new GatewayContract(contract, chaincodeName, contractName ?? '', this.timeouts);

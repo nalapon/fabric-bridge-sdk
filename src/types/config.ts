@@ -1,10 +1,33 @@
+export type FileOrBuffer = string | Buffer | { path: string };
+
 export interface BridgeConfig {
   gatewayPeer: string;
   
   identity: {
     mspId: string;
+    credentials: FileOrBuffer;
+    privateKey?: FileOrBuffer;
+  };
+  
+  signer: Signer;
+  
+  tlsOptions?: {
+    trustedRoots?: FileOrBuffer;
+    verify?: boolean;
+  };
+  
+  discovery?: boolean;
+  
+  timeouts?: TimeoutConfig;
+}
+
+export interface ResolvedBridgeConfig {
+  gatewayPeer: string;
+  
+  identity: {
+    mspId: string;
     credentials: Buffer;
-    privateKey?: Buffer; // Optional, required for peer-targeted mode with fabric-network
+    privateKey?: Buffer;
   };
   
   signer: Signer;

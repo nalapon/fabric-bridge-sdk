@@ -1,9 +1,11 @@
+import { promises as fs } from "fs";
 import { GatewayConnection } from "./gateway/GatewayConnection";
 import { GatewayNetwork } from "./gateway/GatewayContract";
 import { PeerConnection } from "./peer/PeerConnection";
 import { PeerNetwork } from "./peer/PeerContract";
 import { DiscoveryCache } from "./cache/DiscoveryCache";
-import type { BridgeConfig } from "./types/config";
+import type { BridgeConfig, FileOrBuffer, ResolvedBridgeConfig, TimeoutConfig } from "./types/config";
+import { DEFAULT_TIMEOUTS } from "./types/config";
 import type {
   BridgeNetwork,
   BridgeContract,
@@ -11,39 +13,99 @@ import type {
   BridgeResult,
   BridgeSubmittedTx,
 } from "./types/bridge";
-import { ConfigurationError, TimeoutError } from "./errors/index";
+import { ConfigurationError, TimeoutError, FileResolveError, NotConnectedError } from "./errors/index";
 import { Result } from "better-result";
+
+function isFilePath(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("./") || value.startsWith("../");
+}
+
+function isPEMContent(value: string): boolean {
+  return value.includes("-----BEGIN");
+}
+
+async function resolveFileOrBuffer(value: FileOrBuffer): Promise<Buffer> {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  
+  if (typeof value === "string") {
+    if (isPEMContent(value)) {
+      return Buffer.from(value);
+    }
+    if (isFilePath(value)) {
+      return fs.readFile(value);
+    }
+  }
+  
+  if (typeof value === "object" && "path" in value) {
+    return fs.readFile(value.path);
+  }
+  
+  throw new Error(`Unable to resolve FileOrBuffer: ${typeof value}`);
+}
+
+function resolveFileOrBufferResultAsync(value: FileOrBuffer): Promise<Result<Buffer, FileResolveError>> {
+  return Result.tryPromise({
+    try: () => resolveFileOrBuffer(value),
+    catch: (e) => new FileResolveError({
+      path: typeof value === 'string' ? value : 'unknown',
+      message: e instanceof Error ? e.message : String(e),
+      cause: e instanceof Error ? e : undefined,
+    }),
+  });
+}
+
+function applyDefaultTimeouts(config: BridgeConfig): BridgeConfig {
+  if (!config.timeouts) {
+    return { ...config, timeouts: { ...DEFAULT_TIMEOUTS } };
+  }
+  
+  return {
+    ...config,
+    timeouts: {
+      ...DEFAULT_TIMEOUTS,
+      ...config.timeouts,
+    },
+  };
+}
 
 export class FabricBridge {
   private config: BridgeConfig;
-  private gatewayConnection: GatewayConnection;
-  private peerConnection: PeerConnection;
+  private resolvedConfig: ResolvedBridgeConfig | null = null;
+  private gatewayConnection: GatewayConnection | null = null;
+  private peerConnection: PeerConnection | null = null;
   private discoveryCache: DiscoveryCache;
   private isConnected = false;
+  private peerConnectionWarning: string | null = null;
 
   constructor(config: BridgeConfig) {
-    this.config = config;
+    this.config = applyDefaultTimeouts(config);
     this.discoveryCache = new DiscoveryCache();
-    this.gatewayConnection = new GatewayConnection(config);
-    this.peerConnection = new PeerConnection(config, this.discoveryCache);
   }
 
-  async connect(): Promise<Result<void, ConfigurationError | TimeoutError>> {
-    // Connect to fabric-gateway (always needed)
+  async connect(): Promise<Result<void, ConfigurationError | TimeoutError | FileResolveError>> {
+    const resolvedResult = await this.resolveConfigResult(this.config);
+    
+    if (!resolvedResult.isOk()) {
+      return Result.err(resolvedResult.error);
+    }
+    
+    const resolved = resolvedResult.value;
+    this.resolvedConfig = resolved;
+
+    this.gatewayConnection = new GatewayConnection(resolved);
+    this.peerConnection = new PeerConnection(resolved, this.discoveryCache);
+
     const gatewayResult = await this.gatewayConnection.connect();
     if (!gatewayResult.isOk()) {
       return Result.err(gatewayResult.error);
     }
 
-    // Connect to fabric-network (if discovery is enabled)
-    if (this.config.discovery !== false) {
+    if (resolved.discovery !== false) {
       const peerResult = await this.peerConnection.connect();
       if (!peerResult.isOk()) {
-        // Log warning but don't fail - we can still use gateway mode
-        console.warn(
-          "Peer connection failed, falling back to gateway mode only:",
-          peerResult.error,
-        );
+        this.peerConnectionWarning = `Peer connection failed, falling back to gateway mode only: ${peerResult.error.message}`;
       }
     }
 
@@ -51,50 +113,87 @@ export class FabricBridge {
     return Result.ok(undefined);
   }
 
-  disconnect(): void {
-    this.gatewayConnection.disconnect();
-    this.peerConnection.disconnect();
-    this.discoveryCache.clear();
-    this.isConnected = false;
+  private async resolveConfigResult(
+    config: BridgeConfig,
+  ): Promise<Result<ResolvedBridgeConfig, FileResolveError>> {
+    const [credentialsResult, privateKeyResult, trustedRootsResult] = await Promise.all([
+      resolveFileOrBufferResultAsync(config.identity.credentials),
+      config.identity.privateKey
+        ? resolveFileOrBufferResultAsync(config.identity.privateKey)
+        : Promise.resolve(Result.ok<Buffer | undefined, FileResolveError>(undefined)),
+      config.tlsOptions?.trustedRoots
+        ? resolveFileOrBufferResultAsync(config.tlsOptions.trustedRoots)
+        : Promise.resolve(Result.ok<Buffer | undefined, FileResolveError>(undefined)),
+    ]);
+
+    if (!credentialsResult.isOk()) return Result.err(credentialsResult.error);
+    if (!privateKeyResult.isOk()) return Result.err(privateKeyResult.error);
+    if (!trustedRootsResult.isOk()) return Result.err(trustedRootsResult.error);
+
+    return Result.ok({
+      ...config,
+      identity: {
+        ...config.identity,
+        credentials: credentialsResult.value,
+        privateKey: privateKeyResult.value,
+      },
+      tlsOptions: config.tlsOptions
+        ? {
+            ...config.tlsOptions,
+            trustedRoots: trustedRootsResult.value,
+          }
+        : undefined,
+    });
   }
 
-  getNetwork(channelName: string): BridgeNetwork {
-    if (!this.isConnected) {
-      throw new Error("FabricBridge not connected. Call connect() first.");
+  disconnect(): void {
+    this.gatewayConnection?.disconnect();
+    this.peerConnection?.disconnect();
+    this.discoveryCache.clear();
+    this.isConnected = false;
+    this.peerConnectionWarning = null;
+  }
+
+  async getNetwork(channelName: string): Promise<Result<BridgeNetwork, NotConnectedError>> {
+    if (!this.isConnected || !this.resolvedConfig || !this.gatewayConnection || !this.peerConnection) {
+      return Result.err(new NotConnectedError({
+        component: 'FabricBridge',
+        action: 'connect',
+      }));
     }
 
-    return new BridgeNetworkImpl(
+    return Result.ok(new BridgeNetworkImpl(
       channelName,
-      this.config,
+      this.resolvedConfig,
       this.gatewayConnection,
       this.peerConnection,
       this.discoveryCache,
-    );
+    ));
+  }
+
+  getConnectionWarning(): string | null {
+    return this.peerConnectionWarning;
   }
 }
 
 class BridgeNetworkImpl implements BridgeNetwork {
   private channelName: string;
-  private config: BridgeConfig;
-  private gatewayConnection: GatewayConnection;
+  private config: ResolvedBridgeConfig;
+  private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
-  private gatewayNetwork: GatewayNetwork;
 
   constructor(
     channelName: string,
-    config: BridgeConfig,
+    config: ResolvedBridgeConfig,
     gatewayConnection: GatewayConnection,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
   ) {
     this.channelName = channelName;
     this.config = config;
-    this.gatewayConnection = gatewayConnection;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
-
-    // Create gateway network instance (default mode)
     this.gatewayNetwork = new GatewayNetwork(
       gatewayConnection.getGateway(),
       channelName,
@@ -103,7 +202,6 @@ class BridgeNetworkImpl implements BridgeNetwork {
   }
 
   getContract(chaincodeName: string, contractName?: string): BridgeContract {
-    // Return a BridgeContract that can switch modes
     return new BridgeContractImpl(
       chaincodeName,
       contractName ?? "",
@@ -120,7 +218,7 @@ class BridgeContractImpl implements BridgeContract {
   private chaincodeName: string;
   private contractName: string;
   private channelName: string;
-  private config: BridgeConfig;
+  private config: ResolvedBridgeConfig;
   private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
@@ -129,7 +227,7 @@ class BridgeContractImpl implements BridgeContract {
     chaincodeName: string,
     contractName: string,
     channelName: string,
-    config: BridgeConfig,
+    config: ResolvedBridgeConfig,
     gatewayNetwork: GatewayNetwork,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
@@ -155,8 +253,7 @@ class BridgeContractImpl implements BridgeContract {
     name: string,
     ...args: unknown[]
   ): Promise<BridgeResult<Buffer>> {
-    // Default mode: use gateway
-    const gatewayContract = this.gatewayNetwork.getContract(
+    const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
       this.contractName,
     );
@@ -167,8 +264,7 @@ class BridgeContractImpl implements BridgeContract {
     name: string,
     ...args: unknown[]
   ): Promise<BridgeResult<Buffer>> {
-    // Default mode: use gateway
-    const gatewayContract = this.gatewayNetwork.getContract(
+    const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
       this.contractName,
     );
@@ -176,7 +272,6 @@ class BridgeContractImpl implements BridgeContract {
   }
 
   createTransaction(name: string): BridgeTransaction {
-    // Create a BridgeTransaction that can switch modes when setEndorsingPeers is called
     return new BridgeTransactionImpl(
       name,
       this.chaincodeName,
@@ -195,7 +290,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private chaincodeName: string;
   private contractName: string;
   private channelName: string;
-  private config: BridgeConfig;
+  private config: ResolvedBridgeConfig;
   private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
@@ -208,7 +303,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
     chaincodeName: string,
     contractName: string,
     channelName: string,
-    config: BridgeConfig,
+    config: ResolvedBridgeConfig,
     gatewayNetwork: GatewayNetwork,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
@@ -248,11 +343,9 @@ class BridgeTransactionImpl implements BridgeTransaction {
 
   async submit(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
     if (this.usePeerMode && this.config.discovery !== false) {
-      // Use fabric-network peer mode
       return this.submitWithPeers(args);
     } else {
-      // Use fabric-gateway mode
-      const gatewayContract = this.gatewayNetwork.getContract(
+      const gatewayContract = await this.gatewayNetwork.getContract(
         this.chaincodeName,
         this.contractName,
       );
@@ -267,9 +360,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   }
 
   async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    // Evaluation always uses gateway mode for simplicity
-    // (peer targeting doesn't make much sense for queries)
-    const gatewayContract = this.gatewayNetwork.getContract(
+    const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
       this.contractName,
     );
@@ -313,12 +404,11 @@ class BridgeTransactionImpl implements BridgeTransaction {
       // Submit via peer mode
       return tx.submit(...args);
     } catch (error) {
-      // Fall back to gateway mode if peer mode fails
       console.warn(
         "Peer mode submission failed, falling back to gateway mode:",
         error,
       );
-      const gatewayContract = this.gatewayNetwork.getContract(
+      const gatewayContract = await this.gatewayNetwork.getContract(
         this.chaincodeName,
         this.contractName,
       );

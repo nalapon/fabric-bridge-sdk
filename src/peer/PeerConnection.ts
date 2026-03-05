@@ -1,6 +1,6 @@
 import * as fabricNetwork from "fabric-network";
 import type { X509Identity } from "fabric-network/lib/impl/wallet/x509identity";
-import type { BridgeConfig } from "../types/config";
+import type { ResolvedBridgeConfig } from "../types/config";
 import {
   ConfigurationError,
   DiscoveryError,
@@ -17,74 +17,68 @@ import { DiscoveryCache } from "../cache/DiscoveryCache";
 
 export class PeerConnection {
   private gateway: fabricNetwork.Gateway | null = null;
-  private config: BridgeConfig;
+  private config: ResolvedBridgeConfig;
   private discoveryCache: DiscoveryCache;
 
-  constructor(config: BridgeConfig, discoveryCache: DiscoveryCache) {
+  constructor(config: ResolvedBridgeConfig, discoveryCache: DiscoveryCache) {
     this.config = config;
     this.discoveryCache = discoveryCache;
   }
 
   async connect(): Promise<Result<void, ConfigurationError | TimeoutError>> {
-    try {
-      const { identity, tlsOptions } = this.config;
+    const { identity, tlsOptions, timeouts } = this.config;
+    const connectTimeout = timeouts?.discovery ?? 5000;
 
-      // Create wallet with identity
-      const wallet = await fabricNetwork.Wallets.newInMemoryWallet();
-      const cert = Buffer.isBuffer(identity.credentials)
-        ? identity.credentials.toString()
-        : identity.credentials;
+    return Result.tryPromise({
+      try: async () => {
+        const wallet = await fabricNetwork.Wallets.newInMemoryWallet();
 
-      // fabric-network X509Identity requires credentials with certificate and privateKey
-      // We need the private key for fabric-network's wallet
-      const privateKey = identity.privateKey
-        ? identity.privateKey.toString()
-        : "";
+        if (!identity.privateKey) {
+          throw new Error(
+            "Private key is required for peer-targeted mode. Please provide identity.privateKey in BridgeConfig",
+          );
+        }
 
-      if (!privateKey) {
-        throw new Error(
-          "Private key is required for peer-targeted mode. Please provide identity.privateKey in BridgeConfig",
-        );
-      }
+        const x509Identity: X509Identity = {
+          type: "X.509",
+          mspId: identity.mspId,
+          credentials: {
+            certificate: identity.credentials.toString(),
+            privateKey: identity.privateKey.toString(),
+          },
+        };
 
-      const x509Identity: X509Identity = {
-        type: "X.509",
-        mspId: identity.mspId,
-        credentials: {
-          certificate: cert,
-          privateKey: privateKey,
-        },
-      };
+        await wallet.put(identity.mspId, x509Identity as fabricNetwork.Identity);
 
-      await wallet.put(identity.mspId, x509Identity as fabricNetwork.Identity);
+        const gatewayOptions: fabricNetwork.GatewayOptions = {
+          wallet,
+          identity: identity.mspId,
+          discovery: {
+            enabled: this.config.discovery ?? true,
+            asLocalhost: true,
+          },
+          clientTlsIdentity: tlsOptions ? identity.mspId : undefined,
+        };
 
-      // Create gateway connection options
-      const gatewayOptions: fabricNetwork.GatewayOptions = {
-        wallet,
-        identity: identity.mspId,
-        discovery: {
-          enabled: this.config.discovery ?? true,
-          asLocalhost: true, // Convert discovered hostnames to localhost for local test-network
-        },
-        clientTlsIdentity: tlsOptions ? identity.mspId : undefined,
-      };
+        this.gateway = new fabricNetwork.Gateway();
 
-      this.gateway = new fabricNetwork.Gateway();
+        const connectionProfile = this.createMinimalConnectionProfile();
 
-      // Note: fabric-network requires a connection profile
-      // We'll use minimal connection profile with just the gateway peer
-      const connectionProfile = this.createMinimalConnectionProfile();
-
-      await this.gateway.connect(connectionProfile, gatewayOptions);
-
-      return Result.ok(undefined);
-    } catch (error) {
-      return Result.err(
-        new ConfigurationError({
-          message: `Failed to connect to peer network: ${error instanceof Error ? error.message : String(error)}`,
-        }),
-      );
-    }
+        await this.gateway.connect(connectionProfile, gatewayOptions);
+      },
+      catch: (e) => {
+        if (e instanceof Error && e.message.includes('timeout')) {
+          return new TimeoutError({
+            message: `Failed to connect to peer network: ${e.message}`,
+            operation: 'connect',
+            timeout: connectTimeout,
+          });
+        }
+        return new ConfigurationError({
+          message: `Failed to connect to peer network: ${e instanceof Error ? e.message : String(e)}`,
+        });
+      },
+    });
   }
 
   getGateway(): fabricNetwork.Gateway {
