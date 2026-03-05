@@ -1,0 +1,43 @@
+{
+  "name": "fabric-bridge-sdk",
+  "version": "0.1.0",
+  "description": "Bridge SDK combining fabric-gateway and fabric-network with peer targeting support",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/integration/initLedger.test.ts",
+    "test:integration": "bun test test/integration/",
+    "example": "bun run examples/app.ts",
+    "example:app": "bun run examples/app.ts"
+  },
+  "keywords": [
+    "hyperledger",
+    "fabric",
+    "blockchain",
+    "gateway",
+    "network",
+    "sdk"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@hyperledger/fabric-gateway": "^1.10.1",
+    "better-result": "^2.7.0",
+    "fabric-network": "^2.2.20"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}

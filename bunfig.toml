@@ -1,0 +1,22 @@
+# Bun configuration for fabric-bridge-sdk
+
+[test]
+# Only run tests in our test directory, exclude dependency source code
+include = [
+  "test/**/*.test.ts"
+]
+exclude = [
+  "opensrc/**",
+  "fabric-gateway/**",
+  "fabric-sdk-node/**",
+  "node_modules/**",
+  "dist/**"
+]
+
+# Increase default timeout for integration tests (30 seconds)
+timeout = 30000
+
+[run]
+# Environment variables for running tests
+# Can be overridden with .env.test file
+env = "BUN_ENV=test"
