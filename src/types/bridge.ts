@@ -8,7 +8,6 @@ import type {
   EvaluationError,
   ConfigurationError,
   TimeoutError,
-  FileResolveError,
   NotConnectedError,
 } from '../errors/index';
 
@@ -21,13 +20,12 @@ export type BridgeError =
   | EvaluationError
   | ConfigurationError
   | TimeoutError
-  | FileResolveError
   | NotConnectedError;
 
 export type BridgeResult<T> = Result<T, BridgeError>;
 
 export interface BridgeNetwork {
-  getContract(chaincodeName: string, contractName?: string): BridgeContract | Promise<BridgeContract>;
+  getContract(chaincodeName: string, contractName?: string): Promise<BridgeContract>;
 }
 
 export interface BridgeContract {

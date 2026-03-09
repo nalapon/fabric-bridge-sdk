@@ -8,7 +8,7 @@ import type {
   BridgeSubmittedTx,
   CommitStatus,
 } from "../types/bridge";
-import type { ResolvedBridgeConfig, TimeoutConfig } from "../types/config";
+import type { BridgeConfig, TimeoutConfig } from "../types/config";
 import type { DiscoveryResult } from "../types/discovery";
 import {
   EndorsementError,
@@ -28,11 +28,12 @@ export class PeerNetwork implements BridgeNetwork {
   private timeouts: Required<TimeoutConfig>;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
+  private networkPromise: Promise<fabricNetwork.Network> | null = null;
 
   constructor(
     gateway: fabricNetwork.Gateway,
     channelName: string,
-    config: ResolvedBridgeConfig,
+    config: BridgeConfig,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
   ) {
@@ -41,30 +42,24 @@ export class PeerNetwork implements BridgeNetwork {
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
+    this.networkPromise = this.gateway.getNetwork(channelName);
   }
 
-  getContract(
+  async getContract(
     chaincodeName: string,
     contractName?: string,
   ): Promise<BridgeContract> {
-    return (async () => {
-      const network = await this.gateway.getNetwork(this.channelName);
-
-      // Note: fabric-network automatically initializes the network with discovery
-      // when the gateway is connected with discovery.enabled = true
-      // No need for manual initialization here
-
-      const contract = network.getContract(chaincodeName, contractName);
-      return new PeerContract(
-        contract as any,
-        chaincodeName,
-        contractName ?? "",
-        this.timeouts,
-        this.peerConnection,
-        this.discoveryCache,
-        this.channelName,
-      );
-    })();
+    const network = await this.networkPromise!;
+    const contract = network.getContract(chaincodeName, contractName);
+    return new PeerContract(
+      contract as any,
+      chaincodeName,
+      contractName ?? "",
+      this.timeouts,
+      this.peerConnection,
+      this.discoveryCache,
+      this.channelName,
+    );
   }
 }
 

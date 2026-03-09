@@ -1,6 +1,6 @@
 import * as fabricNetwork from "fabric-network";
 import type { X509Identity } from "fabric-network/lib/impl/wallet/x509identity";
-import type { ResolvedBridgeConfig } from "../types/config";
+import type { BridgeConfig } from "../types/config";
 import {
   ConfigurationError,
   DiscoveryError,
@@ -17,10 +17,10 @@ import { DiscoveryCache } from "../cache/DiscoveryCache";
 
 export class PeerConnection {
   private gateway: fabricNetwork.Gateway | null = null;
-  private config: ResolvedBridgeConfig;
+  private config: BridgeConfig;
   private discoveryCache: DiscoveryCache;
 
-  constructor(config: ResolvedBridgeConfig, discoveryCache: DiscoveryCache) {
+  constructor(config: BridgeConfig, discoveryCache: DiscoveryCache) {
     this.config = config;
     this.discoveryCache = discoveryCache;
   }

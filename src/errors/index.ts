@@ -42,12 +42,6 @@ export class TimeoutError extends TaggedError('TimeoutError')<{
   timeout: number;
 }>() {}
 
-export class FileResolveError extends TaggedError('FileResolveError')<{
-  path: string;
-  message: string;
-  cause?: Error;
-}>() {}
-
 export class NotConnectedError extends TaggedError('NotConnectedError')<{
   component: string;
   action: string;

@@ -44,32 +44,42 @@ const ORG2 = {
   ),
 };
 
-async function createSigner(keyPath: string) {
-  const keys = await fs.readdir(keyPath);
-  const key = await fs.readFile(
-    path.join(keyPath, keys.find((f) => f.endsWith("_sk"))!),
-  );
-  return signers.newPrivateKeySigner(createPrivateKey(key));
+async function loadCredentials(org: typeof ORG1) {
+  const [certificate, privateKey, tlsCert] = await Promise.all([
+    fs.readFile(org.certPath),
+    (async () => {
+      const keys = await fs.readdir(org.keyPath);
+      const keyFile = keys.find((f) => f.endsWith("_sk"))!;
+      return fs.readFile(path.join(org.keyPath, keyFile));
+    })(),
+    fs.readFile(org.tlsPath),
+  ]);
+  return { certificate, privateKey, tlsCert };
 }
 
-function createBridge(org: typeof ORG1, signer: any) {
+async function createSigner(privateKey: Buffer) {
+  return signers.newPrivateKeySigner(createPrivateKey(privateKey));
+}
+
+async function createBridge(org: typeof ORG1, signer: any, cert: Buffer, key: Buffer, tls: Buffer) {
   return new FabricBridge({
     gatewayPeer: org.gateway,
     identity: {
       mspId: org.mspId,
-      credentials: org.certPath,
-      privateKey: org.keyPath,
+      credentials: cert,
+      privateKey: key,
     },
     signer,
-    tlsOptions: { trustedRoots: org.tlsPath, verify: false },
+    tlsOptions: { trustedRoots: tls, verify: false },
     discovery: true,
   });
 }
 
 async function usingOrg1Gateway() {
   console.log("\n[ORG1 - GATEWAY MODE]");
-  const signer = await createSigner(ORG1.keyPath);
-  const bridge = createBridge(ORG1, signer);
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -104,8 +114,9 @@ async function usingOrg1Gateway() {
 
 async function usingOrg2Gateway() {
   console.log("\n[ORG2 - GATEWAY MODE]");
-  const signer = await createSigner(ORG2.keyPath);
-  const bridge = createBridge(ORG2, signer);
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG2);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG2, signer, certificate, privateKey, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -140,8 +151,9 @@ async function usingOrg2Gateway() {
 
 async function usingOrg1Peer() {
   console.log("\n[ORG1 - PEER-TARGETED MODE]");
-  const signer = await createSigner(ORG1.keyPath);
-  const bridge = createBridge(ORG1, signer);
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -172,8 +184,9 @@ async function usingOrg1Peer() {
 
 async function usingOrg2Peer() {
   console.log("\n[ORG2 - PEER-TARGETED MODE]");
-  const signer = await createSigner(ORG2.keyPath);
-  const bridge = createBridge(ORG2, signer);
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG2);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG2, signer, certificate, privateKey, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);

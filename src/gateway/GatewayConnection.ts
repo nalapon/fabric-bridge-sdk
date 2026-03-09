@@ -1,15 +1,15 @@
 import * as grpc from '@grpc/grpc-js';
 import * as fabricGateway from '@hyperledger/fabric-gateway';
-import type { ResolvedBridgeConfig, Signer } from '../types/config';
+import type { BridgeConfig, Signer } from '../types/config';
 import { ConfigurationError, TimeoutError } from '../errors/index';
 import { Result } from 'better-result';
 
 export class GatewayConnection {
   private client: grpc.Client | null = null;
   private gateway: fabricGateway.Gateway | null = null;
-  private config: ResolvedBridgeConfig;
+  private config: BridgeConfig;
 
-  constructor(config: ResolvedBridgeConfig) {
+  constructor(config: BridgeConfig) {
     this.config = config;
   }
 
