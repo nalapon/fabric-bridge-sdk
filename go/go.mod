@@ -5,9 +5,10 @@ go 1.26
 require (
 	github.com/hyperledger/fabric-gateway v1.10.1
 	github.com/hyperledger/fabric-protos-go-apiv2 v0.3.7
-	github.com/hyperledger/fabric-sdk-go v1.0.1-0.20250425082355-315f4e048501
 	google.golang.org/grpc v1.78.0
 )
+
+require github.com/cespare/xxhash/v2 v2.3.0 // indirect
 
 require (
 	github.com/Knetic/govaluate v3.0.1-0.20171022003610-9aa49832a739+incompatible // indirect
@@ -21,10 +22,9 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/certificate-transparency-go v1.0.21 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
-	github.com/hyperledger/fabric-config v0.0.5 // indirect
+	github.com/hyperledger/fabric-config v0.3.0 // indirect
 	github.com/hyperledger/fabric-lib-go v1.0.0 // indirect
-	github.com/hyperledger/fabric-protos-go v0.0.0-20211118165945-23d738fc3553 // indirect
-	github.com/kr/logfmt v0.0.0-20140226030751-b84e30acd515 // indirect
+	github.com/hyperledger/fabric-sdk-go v1.2.1
 	github.com/magiconair/properties v1.8.5 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/miekg/pkcs11 v1.1.2 // indirect
@@ -54,3 +54,5 @@ require (
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/hyperledger/fabric-sdk-go => github.com/nalapon/fabric-sdk-go v0.0.0-20260320130735-803a32d38800
