@@ -2,18 +2,32 @@
   "name": "fabric-bridge-sdk",
   "version": "0.1.0",
   "description": "Bridge SDK combining fabric-gateway and fabric-network with peer targeting support",
-  "main": "dist/index.js",
-  "module": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsup",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build",
     "test": "bun test test/integration/initLedger.test.ts",
     "test:integration": "bun test test/integration/",
     "example": "bun run examples/app.ts",
@@ -30,6 +44,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/bun": "latest",
+    "tsup": "^8.5.1",
     "typescript": "^5"
   },
   "dependencies": {
