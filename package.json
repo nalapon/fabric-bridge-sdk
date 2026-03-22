@@ -48,6 +48,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.10.0",
     "@hyperledger/fabric-gateway": "^1.10.1",
     "better-result": "^2.7.0",
     "fabric-network": "^2.2.20"
