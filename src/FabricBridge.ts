@@ -35,7 +35,6 @@ export class FabricBridge {
   private peerConnection: PeerConnection | null = null;
   private discoveryCache: DiscoveryCache;
   private isConnected = false;
-  private peerConnectionWarning: string | null = null;
 
   constructor(config: BridgeConfig) {
     this.config = applyDefaultTimeouts(config);
@@ -51,14 +50,30 @@ export class FabricBridge {
       return Result.err(gatewayResult.error);
     }
 
-    if (this.config.discovery !== false) {
-      const peerResult = await this.peerConnection.connect();
-      if (!peerResult.isOk()) {
-        this.peerConnectionWarning = `Peer connection failed, falling back to gateway mode only: ${peerResult.error.message}`;
-      }
+    this.isConnected = true;
+    return Result.ok(undefined);
+  }
+
+  async switchToPeerMode(): Promise<Result<void, ConfigurationError | TimeoutError>> {
+    this.gatewayConnection?.disconnect();
+
+    const peerResult = await this.peerConnection!.connect();
+    if (!peerResult.isOk()) {
+      await this.gatewayConnection!.connect();
+      return Result.err(peerResult.error);
     }
 
-    this.isConnected = true;
+    return Result.ok(undefined);
+  }
+
+  async restoreGatewayMode(): Promise<Result<void, ConfigurationError | TimeoutError>> {
+    this.peerConnection?.disconnect();
+
+    const gatewayResult = await this.gatewayConnection!.connect();
+    if (!gatewayResult.isOk()) {
+      return Result.err(gatewayResult.error);
+    }
+
     return Result.ok(undefined);
   }
 
@@ -67,7 +82,6 @@ export class FabricBridge {
     this.peerConnection?.disconnect();
     this.discoveryCache.clear();
     this.isConnected = false;
-    this.peerConnectionWarning = null;
   }
 
   async getNetwork(channelName: string): Promise<Result<BridgeNetwork, NotConnectedError>> {
@@ -84,11 +98,8 @@ export class FabricBridge {
       this.gatewayConnection,
       this.peerConnection,
       this.discoveryCache,
+      this,
     ));
-  }
-
-  getConnectionWarning(): string | null {
-    return this.peerConnectionWarning;
   }
 }
 
@@ -98,6 +109,7 @@ class BridgeNetworkImpl implements BridgeNetwork {
   private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
+  private fabricBridge: FabricBridge;
 
   constructor(
     channelName: string,
@@ -105,11 +117,13 @@ class BridgeNetworkImpl implements BridgeNetwork {
     gatewayConnection: GatewayConnection,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
+    fabricBridge: FabricBridge,
   ) {
     this.channelName = channelName;
     this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
+    this.fabricBridge = fabricBridge;
     this.gatewayNetwork = new GatewayNetwork(
       gatewayConnection.getGateway(),
       channelName,
@@ -126,6 +140,7 @@ class BridgeNetworkImpl implements BridgeNetwork {
       this.gatewayNetwork,
       this.peerConnection,
       this.discoveryCache,
+      this.fabricBridge,
     );
   }
 }
@@ -138,6 +153,7 @@ class BridgeContractImpl implements BridgeContract {
   private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
+  private fabricBridge: FabricBridge;
 
   constructor(
     chaincodeName: string,
@@ -147,6 +163,7 @@ class BridgeContractImpl implements BridgeContract {
     gatewayNetwork: GatewayNetwork,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
+    fabricBridge: FabricBridge,
   ) {
     this.chaincodeName = chaincodeName;
     this.contractName = contractName;
@@ -155,6 +172,7 @@ class BridgeContractImpl implements BridgeContract {
     this.gatewayNetwork = gatewayNetwork;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
+    this.fabricBridge = fabricBridge;
   }
 
   getChaincodeName(): string {
@@ -197,6 +215,7 @@ class BridgeContractImpl implements BridgeContract {
       this.gatewayNetwork,
       this.peerConnection,
       this.discoveryCache,
+      this.fabricBridge,
     );
   }
 }
@@ -210,6 +229,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private gatewayNetwork: GatewayNetwork;
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
+  private fabricBridge: FabricBridge;
   private endorsingPeerNames: string[] = [];
   private transientData: Record<string, Buffer> = {};
   private usePeerMode = false;
@@ -223,6 +243,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
     gatewayNetwork: GatewayNetwork,
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
+    fabricBridge: FabricBridge,
   ) {
     this.name = name;
     this.chaincodeName = chaincodeName;
@@ -232,6 +253,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
     this.gatewayNetwork = gatewayNetwork;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
+    this.fabricBridge = fabricBridge;
   }
 
   getName(): string {
@@ -258,29 +280,45 @@ class BridgeTransactionImpl implements BridgeTransaction {
   }
 
   async submit(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    if (this.usePeerMode && this.config.discovery !== false) {
-      const peerNetwork = new PeerNetwork(
-        this.peerConnection.getGateway(),
-        this.channelName,
-        this.config,
-        this.peerConnection,
-        this.discoveryCache,
-      );
-
-      const peerContract = await peerNetwork.getContract(
-        this.chaincodeName,
-        this.contractName,
-      );
-
-      const tx = peerContract.createTransaction(this.name);
-
-      if (Object.keys(this.transientData).length > 0) {
-        tx.setTransientData(this.transientData);
+    if (this.usePeerMode) {
+      if (!this.config.identity.privateKey) {
+        return Result.err(new ConfigurationError({
+          message: 'identity.privateKey is required for setEndorsingPeers()',
+          field: 'identity.privateKey',
+        }));
       }
 
-      tx.setEndorsingPeers(this.endorsingPeerNames);
+      const switchResult = await this.fabricBridge.switchToPeerMode();
+      if (!switchResult.isOk()) {
+        return Result.err(switchResult.error);
+      }
 
-      return tx.submit(...args);
+      try {
+        const peerNetwork = new PeerNetwork(
+          this.peerConnection.getGateway(),
+          this.channelName,
+          this.config,
+          this.peerConnection,
+          this.discoveryCache,
+        );
+
+        const peerContract = await peerNetwork.getContract(
+          this.chaincodeName,
+          this.contractName,
+        );
+
+        const tx = peerContract.createTransaction(this.name);
+
+        if (Object.keys(this.transientData).length > 0) {
+          tx.setTransientData(this.transientData);
+        }
+
+        tx.setEndorsingPeers(this.endorsingPeerNames);
+
+        return tx.submit(...args);
+      } finally {
+        await this.fabricBridge.restoreGatewayMode();
+      }
     } else {
       const gatewayContract = await this.gatewayNetwork.getContract(
         this.chaincodeName,
