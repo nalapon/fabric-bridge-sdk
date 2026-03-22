@@ -25,12 +25,11 @@ export type BridgeError =
 export type BridgeResult<T> = Result<T, BridgeError>;
 
 export interface BridgeNetwork {
-  getContract(chaincodeName: string, contractName?: string): Promise<BridgeContract>;
+  getContract(chaincodeName: string): Promise<BridgeContract>;
 }
 
 export interface BridgeContract {
   getChaincodeName(): string;
-  getContractName(): string;
   
   submitTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<Buffer>>;
   evaluateTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<Buffer>>;
@@ -41,7 +40,6 @@ export interface BridgeContract {
 export interface BridgeTransaction {
   getName(): string;
   getChaincodeName(): string;
-  getContractName(): string;
   
   setEndorsingPeers(peerNames: string[]): BridgeTransaction;
   setTransientData(transientData: Record<string, Buffer>): BridgeTransaction;

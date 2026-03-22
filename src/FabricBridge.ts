@@ -14,6 +14,7 @@ import type {
 } from "./types/bridge";
 import { ConfigurationError, TimeoutError, NotConnectedError } from "./errors/index";
 import { Result } from "better-result";
+import { log } from "./utils/logger";
 
 function applyDefaultTimeouts(config: BridgeConfig): BridgeConfig {
   if (!config.timeouts) {
@@ -39,45 +40,78 @@ export class FabricBridge {
   constructor(config: BridgeConfig) {
     this.config = applyDefaultTimeouts(config);
     this.discoveryCache = new DiscoveryCache();
+    
+    log().debug('FabricBridge creado', {
+      gatewayPeer: config.gatewayPeer,
+      mspId: config.identity.mspId,
+      hasTlsOptions: !!config.tlsOptions,
+      hasTrustedRoots: !!config.tlsOptions?.trustedRoots,
+      hasClientCert: !!config.tlsOptions?.clientCert,
+      hasClientKey: !!config.tlsOptions?.clientKey,
+      hasPrivateKey: !!config.identity.privateKey,
+      discovery: config.discovery,
+    });
   }
 
   async connect(): Promise<Result<void, ConfigurationError | TimeoutError>> {
+    log().info('FabricBridge.connect() - Iniciando conexión en modo GATEWAY');
+    
     this.gatewayConnection = new GatewayConnection(this.config);
     this.peerConnection = new PeerConnection(this.config, this.discoveryCache);
 
+    log().debug('FabricBridge.connect() - Llamando a GatewayConnection.connect()');
     const gatewayResult = await this.gatewayConnection.connect();
+    
     if (!gatewayResult.isOk()) {
+      log().error('FabricBridge.connect() - Error en GatewayConnection.connect():', gatewayResult.error);
       return Result.err(gatewayResult.error);
     }
 
     this.isConnected = true;
+    log().info('FabricBridge.connect() - Conexión GATEWAY exitosa');
     return Result.ok(undefined);
   }
 
   async switchToPeerMode(): Promise<Result<void, ConfigurationError | TimeoutError>> {
+    log().info('FabricBridge.switchToPeerMode() - Cambiando a modo PEER');
+    
     this.gatewayConnection?.disconnect();
+    log().debug('FabricBridge.switchToPeerMode() - GatewayConnection desconectado');
 
+    log().debug('FabricBridge.switchToPeerMode() - Llamando a PeerConnection.connect()');
     const peerResult = await this.peerConnection!.connect();
+    
     if (!peerResult.isOk()) {
+      log().error('FabricBridge.switchToPeerMode() - Error en PeerConnection.connect():', peerResult.error);
+      log().debug('FabricBridge.switchToPeerMode() - Intentando restaurar conexión GATEWAY');
       await this.gatewayConnection!.connect();
       return Result.err(peerResult.error);
     }
 
+    log().info('FabricBridge.switchToPeerMode() - Conexión PEER exitosa');
     return Result.ok(undefined);
   }
 
   async restoreGatewayMode(): Promise<Result<void, ConfigurationError | TimeoutError>> {
-    this.peerConnection?.disconnect();
+    log().info('FabricBridge.restoreGatewayMode() - Restaurando modo GATEWAY');
+    
+    await this.peerConnection?.disconnect();
+    log().debug('FabricBridge.restoreGatewayMode() - PeerConnection desconectado');
 
+    log().debug('FabricBridge.restoreGatewayMode() - Llamando a GatewayConnection.connect()');
     const gatewayResult = await this.gatewayConnection!.connect();
+    
     if (!gatewayResult.isOk()) {
+      log().error('FabricBridge.restoreGatewayMode() - Error:', gatewayResult.error);
       return Result.err(gatewayResult.error);
     }
 
+    log().info('FabricBridge.restoreGatewayMode() - Modo GATEWAY restaurado exitosamente');
     return Result.ok(undefined);
   }
 
   disconnect(): void {
+    log().info('FabricBridge.disconnect() - Desconectando');
     this.gatewayConnection?.disconnect();
     this.peerConnection?.disconnect();
     this.discoveryCache.clear();
@@ -86,12 +120,14 @@ export class FabricBridge {
 
   async getNetwork(channelName: string): Promise<Result<BridgeNetwork, NotConnectedError>> {
     if (!this.isConnected || !this.config || !this.gatewayConnection || !this.peerConnection) {
+      log().error('FabricBridge.getNetwork() - No conectado');
       return Result.err(new NotConnectedError({
         component: 'FabricBridge',
         action: 'connect',
       }));
     }
 
+    log().debug('FabricBridge.getNetwork() - Creando BridgeNetwork para canal:', channelName);
     return Result.ok(new BridgeNetworkImpl(
       channelName,
       this.config,
@@ -131,10 +167,9 @@ class BridgeNetworkImpl implements BridgeNetwork {
     );
   }
 
-  async getContract(chaincodeName: string, contractName?: string): Promise<BridgeContract> {
+  async getContract(chaincodeName: string): Promise<BridgeContract> {
     return new BridgeContractImpl(
       chaincodeName,
-      contractName ?? "",
       this.channelName,
       this.config,
       this.gatewayNetwork,
@@ -147,7 +182,6 @@ class BridgeNetworkImpl implements BridgeNetwork {
 
 class BridgeContractImpl implements BridgeContract {
   private chaincodeName: string;
-  private contractName: string;
   private channelName: string;
   private config: BridgeConfig;
   private gatewayNetwork: GatewayNetwork;
@@ -157,7 +191,6 @@ class BridgeContractImpl implements BridgeContract {
 
   constructor(
     chaincodeName: string,
-    contractName: string,
     channelName: string,
     config: BridgeConfig,
     gatewayNetwork: GatewayNetwork,
@@ -166,7 +199,6 @@ class BridgeContractImpl implements BridgeContract {
     fabricBridge: FabricBridge,
   ) {
     this.chaincodeName = chaincodeName;
-    this.contractName = contractName;
     this.channelName = channelName;
     this.config = config;
     this.gatewayNetwork = gatewayNetwork;
@@ -179,17 +211,12 @@ class BridgeContractImpl implements BridgeContract {
     return this.chaincodeName;
   }
 
-  getContractName(): string {
-    return this.contractName;
-  }
-
   async submitTransaction(
     name: string,
     ...args: unknown[]
   ): Promise<BridgeResult<Buffer>> {
     const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
-      this.contractName,
     );
     return gatewayContract.submitTransaction(name, ...args);
   }
@@ -200,7 +227,6 @@ class BridgeContractImpl implements BridgeContract {
   ): Promise<BridgeResult<Buffer>> {
     const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
-      this.contractName,
     );
     return gatewayContract.evaluateTransaction(name, ...args);
   }
@@ -209,7 +235,6 @@ class BridgeContractImpl implements BridgeContract {
     return new BridgeTransactionImpl(
       name,
       this.chaincodeName,
-      this.contractName,
       this.channelName,
       this.config,
       this.gatewayNetwork,
@@ -223,7 +248,6 @@ class BridgeContractImpl implements BridgeContract {
 class BridgeTransactionImpl implements BridgeTransaction {
   private name: string;
   private chaincodeName: string;
-  private contractName: string;
   private channelName: string;
   private config: BridgeConfig;
   private gatewayNetwork: GatewayNetwork;
@@ -237,7 +261,6 @@ class BridgeTransactionImpl implements BridgeTransaction {
   constructor(
     name: string,
     chaincodeName: string,
-    contractName: string,
     channelName: string,
     config: BridgeConfig,
     gatewayNetwork: GatewayNetwork,
@@ -247,7 +270,6 @@ class BridgeTransactionImpl implements BridgeTransaction {
   ) {
     this.name = name;
     this.chaincodeName = chaincodeName;
-    this.contractName = contractName;
     this.channelName = channelName;
     this.config = config;
     this.gatewayNetwork = gatewayNetwork;
@@ -262,10 +284,6 @@ class BridgeTransactionImpl implements BridgeTransaction {
 
   getChaincodeName(): string {
     return this.chaincodeName;
-  }
-
-  getContractName(): string {
-    return this.contractName;
   }
 
   setEndorsingPeers(peerNames: string[]): BridgeTransaction {
@@ -294,6 +312,14 @@ class BridgeTransactionImpl implements BridgeTransaction {
       }
 
       try {
+        log().debug('=== PEER MODE FLOW START ===');
+        log().debug('BridgeTransactionImpl.submit() - Creating PeerNetwork with:');
+        log().debug('  - peerConnection.getGateway():', typeof this.peerConnection.getGateway(), this.peerConnection.getGateway()?.constructor?.name);
+        log().debug('  - channelName:', this.channelName);
+        log().debug('  - config.gatewayPeer:', this.config.gatewayPeer);
+        log().debug('  - config.identity.mspId:', this.config.identity.mspId);
+        log().debug('  - discoveryCache:', typeof this.discoveryCache);
+        
         const peerNetwork = new PeerNetwork(
           this.peerConnection.getGateway(),
           this.channelName,
@@ -302,9 +328,12 @@ class BridgeTransactionImpl implements BridgeTransaction {
           this.discoveryCache,
         );
 
+        log().debug('BridgeTransactionImpl.submit() - Calling peerNetwork.getContract():');
+        log().debug('  - chaincodeName:', this.chaincodeName);
+        log().debug('  - chaincodeName type:', typeof this.chaincodeName);
+        log().debug('  - chaincodeName length:', this.chaincodeName?.length);
         const peerContract = await peerNetwork.getContract(
           this.chaincodeName,
-          this.contractName,
         );
 
         const tx = peerContract.createTransaction(this.name);
@@ -315,14 +344,14 @@ class BridgeTransactionImpl implements BridgeTransaction {
 
         tx.setEndorsingPeers(this.endorsingPeerNames);
 
-        return tx.submit(...args);
+        const result = await tx.submit(...args);
+        return result;
       } finally {
         await this.fabricBridge.restoreGatewayMode();
       }
     } else {
       const gatewayContract = await this.gatewayNetwork.getContract(
         this.chaincodeName,
-        this.contractName,
       );
       const tx = gatewayContract.createTransaction(this.name);
 
@@ -337,7 +366,6 @@ class BridgeTransactionImpl implements BridgeTransaction {
   async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
     const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
-      this.contractName,
     );
     const tx = gatewayContract.createTransaction(this.name);
 

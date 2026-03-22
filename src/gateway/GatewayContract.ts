@@ -29,37 +29,30 @@ export class GatewayNetwork implements BridgeNetwork {
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
   }
 
-  async getContract(chaincodeName: string, contractName?: string): Promise<BridgeContract> {
+  async getContract(chaincodeName: string): Promise<BridgeContract> {
     const network = this.gateway.getNetwork(this.channelName);
-    const contract = network.getContract(chaincodeName, contractName);
-    return new GatewayContract(contract, chaincodeName, contractName ?? '', this.timeouts);
+    const contract = network.getContract(chaincodeName);
+    return new GatewayContract(contract, chaincodeName, this.timeouts);
   }
 }
 
 class GatewayContract implements BridgeContract {
   private contract: fabricGateway.Contract;
   private chaincodeName: string;
-  private contractName: string;
   private timeouts: Required<TimeoutConfig>;
 
   constructor(
     contract: fabricGateway.Contract,
     chaincodeName: string,
-    contractName: string,
     timeouts: Required<TimeoutConfig>
   ) {
     this.contract = contract;
     this.chaincodeName = chaincodeName;
-    this.contractName = contractName;
     this.timeouts = timeouts;
   }
 
   getChaincodeName(): string {
     return this.chaincodeName;
-  }
-
-  getContractName(): string {
-    return this.contractName;
   }
 
   async submitTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<Buffer>> {
@@ -92,7 +85,6 @@ class GatewayContract implements BridgeContract {
     return new GatewayTransaction(
       name,
       this.chaincodeName,
-      this.contractName,
       this.contract,
       this.timeouts
     );
@@ -136,7 +128,6 @@ class GatewayContract implements BridgeContract {
 class GatewayTransaction implements BridgeTransaction {
   private name: string;
   private chaincodeName: string;
-  private contractName: string;
   private contract: fabricGateway.Contract;
   private timeouts: Required<TimeoutConfig>;
   private transientData: Record<string, Buffer> = {};
@@ -144,13 +135,11 @@ class GatewayTransaction implements BridgeTransaction {
   constructor(
     name: string,
     chaincodeName: string,
-    contractName: string,
     contract: fabricGateway.Contract,
     timeouts: Required<TimeoutConfig>
   ) {
     this.name = name;
     this.chaincodeName = chaincodeName;
-    this.contractName = contractName;
     this.contract = contract;
     this.timeouts = timeouts;
   }
@@ -161,10 +150,6 @@ class GatewayTransaction implements BridgeTransaction {
 
   getChaincodeName(): string {
     return this.chaincodeName;
-  }
-
-  getContractName(): string {
-    return this.contractName;
   }
 
   setEndorsingPeers(_peerNames: string[]): BridgeTransaction {

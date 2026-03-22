@@ -14,6 +14,27 @@ import type {
   MSPInfo,
 } from "../types/discovery";
 import { DiscoveryCache } from "../cache/DiscoveryCache";
+import { log } from "../utils/logger";
+
+/**
+ * Detects if the endpoint is localhost based on the hostname.
+ * Automatically sets asLocalhost for fabric-network discovery.
+ * 
+ * Returns true for:
+ * - localhost
+ * - 127.0.0.1
+ * - ::1
+ * - Any 127.x.x.x address
+ * 
+ * Returns false for production DNS names.
+ */
+function isLocalhostEndpoint(endpoint: string): boolean {
+  const [host] = endpoint.split(':');
+  return host === 'localhost' || 
+         host === '127.0.0.1' || 
+         host === '::1' ||
+         (!!host && host.startsWith('127.'));
+}
 
 export class PeerConnection {
   private gateway: fabricNetwork.Gateway | null = null;
@@ -29,16 +50,34 @@ export class PeerConnection {
     const { identity, tlsOptions, timeouts } = this.config;
     const connectTimeout = timeouts?.discovery ?? 5000;
 
+    log().info('PeerConnection.connect() - Iniciando conexión');
+    log().debug('PeerConnection.connect() - Config:', {
+      gatewayPeer: this.config.gatewayPeer,
+      mspId: identity.mspId,
+      hasTrustedRoots: !!tlsOptions?.trustedRoots,
+      trustedRootsLength: tlsOptions?.trustedRoots?.length,
+      hasClientCert: !!tlsOptions?.clientCert,
+      clientCertLength: tlsOptions?.clientCert?.length,
+      hasClientKey: !!tlsOptions?.clientKey,
+      clientKeyLength: tlsOptions?.clientKey?.length,
+      hasPrivateKey: !!identity.privateKey,
+      discovery: this.config.discovery,
+      connectTimeout,
+    });
+
     return Result.tryPromise({
       try: async () => {
+        log().debug('PeerConnection.connect() - Creando wallet in-memory');
         const wallet = await fabricNetwork.Wallets.newInMemoryWallet();
 
         if (!identity.privateKey) {
+          log().error('PeerConnection.connect() - Private key no proporcionada');
           throw new Error(
             "Private key is required for peer-targeted mode. Please provide identity.privateKey in BridgeConfig",
           );
         }
 
+        log().debug('PeerConnection.connect() - Creando identidad X.509');
         const x509Identity: X509Identity = {
           type: "X.509",
           mspId: identity.mspId,
@@ -49,13 +88,17 @@ export class PeerConnection {
         };
 
         await wallet.put(identity.mspId, x509Identity as fabricNetwork.Identity);
+        log().debug('PeerConnection.connect() - Identidad X.509 guardada en wallet');
+
+        const asLocalhost = isLocalhostEndpoint(this.config.gatewayPeer);
+        log().debug(`PeerConnection.connect() - Auto-detected asLocalhost: ${asLocalhost} (from ${this.config.gatewayPeer})`);
 
         const gatewayOptions: fabricNetwork.GatewayOptions = {
           wallet,
           identity: identity.mspId,
           discovery: {
             enabled: this.config.discovery ?? true,
-            asLocalhost: true,
+            asLocalhost,
           },
           tlsInfo: tlsOptions?.clientCert && tlsOptions?.clientKey
             ? {
@@ -65,13 +108,31 @@ export class PeerConnection {
             : undefined,
         };
 
+        log().debug('PeerConnection.connect() - GatewayOptions:', {
+          identity: identity.mspId,
+          discoveryEnabled: gatewayOptions.discovery?.enabled,
+          discoveryAsLocalhost: gatewayOptions.discovery?.asLocalhost,
+          hasTlsInfo: !!gatewayOptions.tlsInfo,
+        });
+
         this.gateway = new fabricNetwork.Gateway();
 
+        log().debug('PeerConnection.connect() - Creando connection profile');
         const connectionProfile = this.createMinimalConnectionProfile();
+        log().debug('PeerConnection.connect() - Connection profile:', JSON.stringify({
+          name: connectionProfile.name,
+          version: connectionProfile.version,
+          organization: connectionProfile.client?.organization,
+          peerCount: connectionProfile.peers ? Object.keys(connectionProfile.peers).length : 0,
+        }, null, 2));
 
+        log().debug('PeerConnection.connect() - Llamando a gateway.connect()');
         await this.gateway.connect(connectionProfile, gatewayOptions);
+        
+        log().info('PeerConnection.connect() - Conexión exitosa');
       },
       catch: (e) => {
+        log().error('PeerConnection.connect() - Error:', e instanceof Error ? e.message : String(e));
         if (e instanceof Error && e.message.includes('timeout')) {
           return new TimeoutError({
             message: `Failed to connect to peer network: ${e.message}`,
@@ -93,48 +154,59 @@ export class PeerConnection {
     return this.gateway;
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
+    log().info('PeerConnection.disconnect() - Desconectando');
     this.gateway?.disconnect();
     this.gateway = null;
+    // Allow fabric-network to complete its async cleanup
+    await new Promise(resolve => setImmediate(resolve));
   }
 
   async discover(
     channelName: string,
   ): Promise<Result<DiscoveryResult, DiscoveryError>> {
-    // Check cache first
+    log().debug('PeerConnection.discover() - Iniciando discovery para canal:', channelName);
+    
     const cached = this.discoveryCache.get(channelName);
     if (cached && !this.discoveryCache.isStale(channelName)) {
+      log().debug('PeerConnection.discover() - Usando cache para canal:', channelName);
       return Result.ok(cached);
     }
 
     try {
       if (!this.gateway) {
+        log().error('PeerConnection.discover() - Gateway no conectado');
         throw new Error("Not connected");
       }
 
-      // Get network - this triggers initialization which performs discovery automatically
+      log().debug('PeerConnection.discover() - Obteniendo network para canal:', channelName);
       const network = await this.gateway.getNetwork(channelName);
 
-      // Get discovery service from NETWORK (fabric-network NetworkImpl), not from channel
-      // fabric-network automatically creates and uses discovery service during network initialization
       const discoveryService = (network as any).discoveryService;
 
       if (!discoveryService) {
+        log().error('PeerConnection.discover() - Discovery service no disponible');
         throw new Error("Discovery service not available");
       }
 
-      // Discovery was already performed during network initialization
-      // Just parse the results that are already available
+      log().debug('PeerConnection.discover() - Parseando resultados de discovery');
       const result = this.parseDiscoveryResults(discoveryService, channelName);
+      
+      log().info('PeerConnection.discover() - Discovery exitoso:', {
+        channelName,
+        peerCount: result.peers.size,
+        ordererCount: result.orderers.length,
+        mspCount: result.msps.size,
+      });
 
-      // Update cache
       this.discoveryCache.set(channelName, result);
 
       return Result.ok(result);
     } catch (error) {
-      // If we have stale cached data, return it as fallback
+      log().error('PeerConnection.discover() - Error:', error instanceof Error ? error.message : String(error));
+      
       if (cached) {
-        // Trigger background refresh for next time
+        log().debug('PeerConnection.discover() - Usando cache stale como fallback');
         setTimeout(() => this.discover(channelName).catch(() => {}), 0);
         return Result.ok(cached);
       }
@@ -153,6 +225,7 @@ export class PeerConnection {
     const [hostPart] = gatewayPeer.split(":");
     const host: string = hostPart || "localhost";
     const mspId: string = identity.mspId;
+    const peerName = tlsOptions?.sslTargetNameOverride ?? host;
 
     const profile: any = {
       name: "bridge-network",
@@ -173,10 +246,10 @@ export class PeerConnection {
 
     profile.organizations[mspId] = {
       mspid: mspId,
-      peers: [host],
+      peers: [peerName],
     };
 
-    profile.peers[host] = {
+    profile.peers[peerName] = {
       url: `${tlsOptions ? "grpcs" : "grpc"}://${gatewayPeer}`,
       tlsCACerts: tlsOptions?.trustedRoots
         ? {
@@ -184,7 +257,7 @@ export class PeerConnection {
           }
         : undefined,
       grpcOptions: {
-        "ssl-target-name-override": host,
+        "ssl-target-name-override": peerName,
       },
     };
 
