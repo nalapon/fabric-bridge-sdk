@@ -12,6 +12,8 @@ export interface BridgeConfig {
   tlsOptions?: {
     trustedRoots?: Buffer;
     verify?: boolean;
+    clientCert?: Buffer;
+    clientKey?: Buffer;
   };
   
   discovery?: boolean;

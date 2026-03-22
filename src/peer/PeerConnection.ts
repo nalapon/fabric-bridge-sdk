@@ -57,7 +57,12 @@ export class PeerConnection {
             enabled: this.config.discovery ?? true,
             asLocalhost: true,
           },
-          clientTlsIdentity: tlsOptions ? identity.mspId : undefined,
+          tlsInfo: tlsOptions?.clientCert && tlsOptions?.clientKey
+            ? {
+                certificate: tlsOptions.clientCert.toString(),
+                key: tlsOptions.clientKey.toString(),
+              }
+            : undefined,
         };
 
         this.gateway = new fabricNetwork.Gateway();

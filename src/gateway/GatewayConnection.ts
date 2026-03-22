@@ -20,7 +20,11 @@ export class GatewayConnection {
     return Result.tryPromise({
       try: async () => {
         const tlsCredentials = tlsOptions?.trustedRoots
-          ? grpc.credentials.createSsl(tlsOptions.trustedRoots)
+          ? grpc.credentials.createSsl(
+              tlsOptions.trustedRoots,
+              tlsOptions.clientKey ?? null,
+              tlsOptions.clientCert ?? null
+            )
           : grpc.credentials.createInsecure();
 
         const hostname = this.extractHostname(gatewayPeer);
