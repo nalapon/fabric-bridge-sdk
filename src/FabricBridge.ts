@@ -110,10 +110,10 @@ export class FabricBridge {
     return Result.ok(undefined);
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
     log().info('FabricBridge.disconnect() - Desconectando');
     this.gatewayConnection?.disconnect();
-    this.peerConnection?.disconnect();
+    await this.peerConnection?.disconnect();
     this.discoveryCache.clear();
     this.isConnected = false;
   }
@@ -312,13 +312,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
       }
 
       try {
-        log().debug('=== PEER MODE FLOW START ===');
-        log().debug('BridgeTransactionImpl.submit() - Creating PeerNetwork with:');
-        log().debug('  - peerConnection.getGateway():', typeof this.peerConnection.getGateway(), this.peerConnection.getGateway()?.constructor?.name);
-        log().debug('  - channelName:', this.channelName);
-        log().debug('  - config.gatewayPeer:', this.config.gatewayPeer);
-        log().debug('  - config.identity.mspId:', this.config.identity.mspId);
-        log().debug('  - discoveryCache:', typeof this.discoveryCache);
+        log().debug('BridgeTransactionImpl.submit() - switching to peer mode for:', this.chaincodeName);
         
         const peerNetwork = new PeerNetwork(
           this.peerConnection.getGateway(),
@@ -328,10 +322,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
           this.discoveryCache,
         );
 
-        log().debug('BridgeTransactionImpl.submit() - Calling peerNetwork.getContract():');
-        log().debug('  - chaincodeName:', this.chaincodeName);
-        log().debug('  - chaincodeName type:', typeof this.chaincodeName);
-        log().debug('  - chaincodeName length:', this.chaincodeName?.length);
+        log().debug('BridgeTransactionImpl.submit() - calling peerNetwork.getContract():', this.chaincodeName);
         const peerContract = await peerNetwork.getContract(
           this.chaincodeName,
         );

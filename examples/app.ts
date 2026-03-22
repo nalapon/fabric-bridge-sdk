@@ -109,7 +109,7 @@ async function usingOrg1Gateway() {
     console.error("Failed:", result.error.message);
   }
 
-  bridge.disconnect();
+  await bridge.disconnect();
 }
 
 async function usingOrg2Gateway() {
@@ -146,7 +146,7 @@ async function usingOrg2Gateway() {
     console.error("Failed:", result.error.message);
   }
 
-  bridge.disconnect();
+  await bridge.disconnect();
 }
 
 async function usingOrg1Peer() {
@@ -179,7 +179,7 @@ async function usingOrg1Peer() {
     console.error("Failed:", result.error.message);
   }
 
-  bridge.disconnect();
+  await bridge.disconnect();
 }
 
 async function usingOrg2Peer() {
@@ -212,7 +212,7 @@ async function usingOrg2Peer() {
     console.error("Failed:", result.error.message);
   }
 
-  bridge.disconnect();
+  await bridge.disconnect();
 }
 
 async function main() {

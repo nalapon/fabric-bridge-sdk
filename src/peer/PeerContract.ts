@@ -38,67 +38,24 @@ export class PeerNetwork implements BridgeNetwork {
     peerConnection: PeerConnection,
     discoveryCache: DiscoveryCache,
   ) {
-    log().debug('PeerNetwork constructor - Received:');
-    log().debug('  - gateway type:', typeof gateway, 'constructor:', gateway?.constructor?.name);
-    log().debug('  - gateway methods:', Object.keys(gateway || {}));
-    log().debug('  - channelName:', channelName);
-    log().debug('  - config.gatewayPeer:', config.gatewayPeer);
-    log().debug('  - config.identity.mspId:', config.identity.mspId);
-    log().debug('  - timeouts:', { ...DEFAULT_TIMEOUTS, ...config.timeouts });
-    
     this.gateway = gateway;
     this.channelName = channelName;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
-    
-    log().debug('PeerNetwork constructor - Calling gateway.getNetwork():');
+
+    log().debug('PeerNetwork - initializing network for channel:', channelName);
     this.networkPromise = this.gateway.getNetwork(channelName);
-    log().debug('  - networkPromise created:', typeof this.networkPromise);
   }
 
   async getContract(
     chaincodeName: string,
   ): Promise<BridgeContract> {
-    log().debug('PeerNetwork.getContract() - Input:');
-    log().debug('  - chaincodeName:', chaincodeName);
-    log().debug('  - chaincodeName type:', typeof chaincodeName);
-    log().debug('  - chaincodeName length:', chaincodeName?.length);
-    log().debug('  - Awaiting networkPromise...');
-    
+    log().debug('PeerNetwork.getContract() - chaincodeName:', chaincodeName);
+
     const network = await this.networkPromise!;
-    log().debug('  - network received:', typeof network, 'constructor:', network?.constructor?.name);
-    log().debug('  - network methods:', Object.keys(network || {}));
-    
-    log().debug('  - Calling network.getContract() with:', chaincodeName);
     const contract = network.getContract(chaincodeName);
-    log().debug('  - contract received:', typeof contract, 'constructor:', contract?.constructor?.name);
-    log().debug('  - contract methods:', Object.keys(contract || {}));
-    
-    // Inspect ContractImpl properties - cast to any to access internal properties
-    const contractAny = contract as any;
-    log().debug('=== ContractImpl INSPECTION ===');
-    log().debug('ContractImpl.chaincodeId:', contractAny.chaincodeId);
-    log().debug('ContractImpl.namespace:', contractAny.namespace);
-    log().debug('ContractImpl.discoveryInterests:', JSON.stringify(contractAny.discoveryInterests));
-    log().debug('ContractImpl.gateway:', typeof contractAny.gateway, contractAny.gateway?.constructor?.name);
-    log().debug('ContractImpl.network:', typeof contractAny.network, contractAny.network?.constructor?.name);
-    log().debug('ContractImpl.contractListeners:', contractAny.contractListeners);
-    
-    // Try to get all properties
-    const contractProps = Object.getOwnPropertyNames(contractAny);
-    log().debug('ContractImpl all properties:', contractProps);
-    
-    // Check if it has _chaincodeId or private properties
-    const allProps = Object.keys(contractAny);
-    log().debug('ContractImpl Object.keys:', allProps);
-    
-    // Inspect prototype
-    const proto = Object.getPrototypeOf(contractAny);
-    log().debug('ContractImpl prototype:', proto?.constructor?.name);
-    log().debug('ContractImpl prototype methods:', Object.getOwnPropertyNames(proto || {}));
-    log().debug('=== ContractImpl INSPECTION END ===');
-    
+
     return new PeerContract(
       contract as any,
       chaincodeName,
@@ -126,24 +83,12 @@ class PeerContract implements BridgeContract {
     discoveryCache: DiscoveryCache,
     channelName: string,
   ) {
-    log().debug('PeerContract constructor - Received:');
-    log().debug('  - contract type:', typeof contract, 'constructor:', contract?.constructor?.name);
-    log().debug('  - contract methods:', Object.keys(contract || {}));
-    log().debug('  - chaincodeName:', chaincodeName);
-    log().debug('  - chaincodeName type:', typeof chaincodeName);
-    log().debug('  - chaincodeName length:', chaincodeName?.length);
-    log().debug('  - chaincodeName empty:', chaincodeName === '');
-    log().debug('  - timeouts:', timeouts);
-    log().debug('  - channelName:', channelName);
-    
     this.contract = contract;
     this.chaincodeName = chaincodeName;
     this.timeouts = timeouts;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
-    
-    log().debug('PeerContract constructor - Instance created successfully');
   }
 
   getChaincodeName(): string {
@@ -187,17 +132,7 @@ class PeerContract implements BridgeContract {
   }
 
   createTransaction(name: string): BridgeTransaction {
-    log().debug('PeerContract.createTransaction() - Called with:');
-    log().debug('  - name:', name);
-    log().debug('  - this.chaincodeName:', this.chaincodeName);
-    log().debug('  - this.contract type:', typeof this.contract, 'constructor:', this.contract?.constructor?.name);
-    log().debug('  - this.contract methods:', Object.keys(this.contract || {}));
-    
-    log().debug('PeerContract.createTransaction() - Creating PeerTransaction with:');
-    log().debug('  - name:', name);
-    log().debug('  - chaincodeName:', this.chaincodeName);
-    log().debug('  - contract:', typeof this.contract);
-    
+    log().debug('PeerContract.createTransaction() - name:', name);
     return new PeerTransaction(
       name,
       this.chaincodeName,
@@ -266,17 +201,6 @@ class PeerTransaction implements BridgeTransaction {
     discoveryCache: DiscoveryCache,
     channelName: string,
   ) {
-    log().debug('PeerTransaction constructor - Received:');
-    log().debug('  - name:', name);
-    log().debug('  - name type:', typeof name);
-    log().debug('  - name length:', name?.length);
-    log().debug('  - chaincodeName:', chaincodeName);
-    log().debug('  - chaincodeName type:', typeof chaincodeName);
-    log().debug('  - chaincodeName length:', chaincodeName?.length);
-    log().debug('  - contract type:', typeof contract, 'constructor:', contract?.constructor?.name);
-    log().debug('  - contract methods:', Object.keys(contract || {}));
-    log().debug('  - channelName:', channelName);
-    
     this.name = name;
     this.chaincodeName = chaincodeName;
     this.contract = contract;
@@ -284,8 +208,6 @@ class PeerTransaction implements BridgeTransaction {
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
-    
-    log().debug('PeerTransaction constructor - Instance created');
   }
 
   getName(): string {
@@ -307,52 +229,14 @@ class PeerTransaction implements BridgeTransaction {
   }
 
   async submit(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    log().debug('=== PeerTransaction.submit() START ===');
-    log().debug('PeerTransaction.submit() - Instance data:');
-    log().debug('  - this.name:', this.name);
-    log().debug('  - this.name type:', typeof this.name);
-    log().debug('  - this.chaincodeName:', this.chaincodeName);
-    log().debug('  - this.chaincodeName type:', typeof this.chaincodeName);
-    log().debug('  - this.contract:', typeof this.contract, 'constructor:', this.contract?.constructor?.name);
-    log().debug('  - this.contract methods:', Object.keys(this.contract || {}));
-    log().debug('  - args:', args);
-    
+    log().debug('PeerTransaction.submit() - transaction:', this.name, 'chaincode:', this.chaincodeName);
+
     const stringArgs = args.map((arg) =>
       typeof arg === "string" ? arg : JSON.stringify(arg),
     );
 
     try {
-      // Create transaction
-      log().debug('PeerTransaction.submit() - About to call contract.createTransaction():');
-      log().debug('  - Calling object:', typeof this.contract);
-      log().debug('  - Calling method: createTransaction');
-      log().debug('  - With argument:', this.name);
-      log().debug('  - Argument type:', typeof this.name);
-      
-      // Inspect this.contract in detail
-      const contractAny = this.contract as any;
-      log().debug('=== this.contract INSPECTION ===');
-      log().debug('  - chaincodeId:', contractAny.chaincodeId);
-      log().debug('  - namespace:', contractAny.namespace);
-      log().debug('  - discoveryInterests:', JSON.stringify(contractAny.discoveryInterests));
-      log().debug('  - gateway:', typeof contractAny.gateway);
-      log().debug('  - network:', typeof contractAny.network);
-      log().debug('  - contractListeners:', contractAny.contractListeners);
-      log().debug('=== this.contract INSPECTION END ===');
-      
       const transaction = this.contract.createTransaction(this.name);
-      
-      log().debug('  - transaction returned:', typeof transaction, 'constructor:', transaction?.constructor?.name);
-      log().debug('  - transaction methods:', Object.keys(transaction || {}));
-      
-      // Inspect Transaction object
-      const txAny = transaction as any;
-      log().debug('=== Transaction INSPECTION ===');
-      log().debug('  - transaction.name:', txAny.name);
-      log().debug('  - transaction.contract:', typeof txAny.contract, txAny.contract?.constructor?.name);
-      log().debug('  - transaction.gatewayOptions:', JSON.stringify(txAny.gatewayOptions));
-      log().debug('  - transaction.identityContext:', typeof txAny.identityContext);
-      log().debug('=== Transaction INSPECTION END ===');
 
       // Set transient data if provided
       if (Object.keys(this.transientData).length > 0) {
@@ -384,15 +268,7 @@ class PeerTransaction implements BridgeTransaction {
         }
       }
 
-      // Submit transaction
-      log().debug('PeerTransaction.submit() - About to call transaction.submit():');
-      log().debug('  - stringArgs:', stringArgs);
-      
       const result = await transaction.submit(...stringArgs);
-      
-      log().debug('PeerTransaction.submit() - transaction.submit() returned:', typeof result);
-      log().debug('  - result length:', result?.length);
-      log().debug('=== PeerTransaction.submit() END ===');
 
       return Result.ok(
         new PeerSubmittedTx(
@@ -402,8 +278,7 @@ class PeerTransaction implements BridgeTransaction {
         ),
       );
     } catch (error) {
-      log().debug('PeerTransaction.submit() - ERROR:', (error as Error).message);
-      log().debug('=== PeerTransaction.submit() END WITH ERROR ===');
+      log().error('PeerTransaction.submit() - error:', (error as Error).message);
       return Result.err(
         new EndorsementError({
           message: (error as Error).message,
