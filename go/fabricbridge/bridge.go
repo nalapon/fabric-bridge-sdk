@@ -12,31 +12,51 @@ import (
 	insecureCredentials "google.golang.org/grpc/credentials/insecure"
 )
 
-// Bridge is the main entry point for the SDK
+// Bridge is the main entry point for the SDK.
+// By default it connects via fabric-gateway (Gateway gRPC service).
+// When setEndorsingPeers is used, it switches to fabric-sdk-go (Endorser gRPC service)
+// using a sequential pattern: disconnect gateway → connect peer → execute → disconnect peer → reconnect gateway.
 type Bridge struct {
 	config          Config
 	gatewayClient   *fabricGateway.Gateway
 	grpcConnection  *grpc.ClientConn
 	connected       bool
 	gatewayEndpoint string
-	peerConnections map[string]*PeerConnection // channel -> peer connection
+	peerConnection  *PeerConnection
 }
 
-// Connect establishes a connection to the Fabric network
+// Connect establishes a connection to the Fabric network via the Gateway service
 func Connect(ctx context.Context, config Config) (*Bridge, error) {
 	if err := config.Validate(); err != nil {
 		return nil, &ConfigurationError{Field: "", Message: err.Error()}
 	}
 
+	gw, grpcConn, err := connectGateway(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Bridge{
+		config:          config,
+		gatewayClient:   gw,
+		grpcConnection:  grpcConn,
+		connected:       true,
+		gatewayEndpoint: config.GatewayPeer,
+	}, nil
+}
+
+// connectGateway creates a gRPC connection and connects to the fabric-gateway Gateway service.
+// This is extracted so it can be reused by restoreGatewayMode().
+func connectGateway(config Config) (*fabricGateway.Gateway, *grpc.ClientConn, error) {
 	grpcConn, err := createGRPCConnection(config)
 	if err != nil {
-		return nil, &ConnectionError{Message: "failed to create gRPC connection", Cause: err}
+		return nil, nil, &ConnectionError{Message: "failed to create gRPC connection", Cause: err}
 	}
 
 	id, err := config.IdentityProvider()
 	if err != nil {
 		grpcConn.Close()
-		return nil, &ConnectionError{Message: "failed to create identity", Cause: err}
+		return nil, nil, &ConnectionError{Message: "failed to create identity", Cause: err}
 	}
 
 	gw, err := fabricGateway.Connect(
@@ -50,17 +70,10 @@ func Connect(ctx context.Context, config Config) (*Bridge, error) {
 	)
 	if err != nil {
 		grpcConn.Close()
-		return nil, &ConnectionError{Message: "failed to connect to gateway", Cause: err}
+		return nil, nil, &ConnectionError{Message: "failed to connect to gateway", Cause: err}
 	}
 
-	return &Bridge{
-		config:          config,
-		gatewayClient:   gw,
-		grpcConnection:  grpcConn,
-		connected:       true,
-		gatewayEndpoint: config.GatewayPeer,
-		peerConnections: make(map[string]*PeerConnection),
-	}, nil
+	return gw, grpcConn, nil
 }
 
 // Disconnect closes all connections
@@ -71,18 +84,22 @@ func (b *Bridge) Disconnect() error {
 
 	var firstErr error
 
-	// Close all peer connections
-	for _, pc := range b.peerConnections {
-		pc.Close()
+	if b.peerConnection != nil {
+		b.peerConnection.Close()
+		b.peerConnection = nil
 	}
 
-	if err := b.gatewayClient.Close(); err != nil {
-		firstErr = err
-	}
-
-	if err := b.grpcConnection.Close(); err != nil {
-		if firstErr == nil {
+	if b.gatewayClient != nil {
+		if err := b.gatewayClient.Close(); err != nil {
 			firstErr = err
+		}
+	}
+
+	if b.grpcConnection != nil {
+		if err := b.grpcConnection.Close(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -95,7 +112,8 @@ func (b *Bridge) IsConnected() bool {
 	return b.connected
 }
 
-// Network returns a Network for the specified channel
+// Network returns a Network for the specified channel.
+// The bridge must be connected (in gateway mode) before calling this.
 func (b *Bridge) Network(ctx context.Context, channelName string) (*Network, error) {
 	if !b.connected {
 		return nil, &NotConnectedError{Component: "Bridge", Action: "get network"}
@@ -106,31 +124,58 @@ func (b *Bridge) Network(ctx context.Context, channelName string) (*Network, err
 		return nil, fmt.Errorf("failed to get network for channel %s", channelName)
 	}
 
-	// Initialize peer connection if discovery is enabled
-	var peerConn *PeerConnection
-	if b.config.Discovery {
-		if pc, ok := b.peerConnections[channelName]; ok {
-			peerConn = pc
-		} else {
-			// Create peer connection for this channel
-			pc, err := NewPeerConnection(ctx, b.config, channelName)
-			if err != nil {
-				// Log warning but continue - peer targeting won't work
-				peerConn = nil
-			} else {
-				b.peerConnections[channelName] = pc
-				peerConn = pc
-			}
-		}
+	return &Network{
+		network: network,
+		channel: channelName,
+		bridge:  b,
+		config:  b.config,
+	}, nil
+}
+
+// switchToPeerMode disconnects from the Gateway service and connects to peers
+// via fabric-sdk-go. channelName is used to build the connection profile.
+func (b *Bridge) switchToPeerMode(channelName string) error {
+	// Close gateway connection
+	if b.gatewayClient != nil {
+		b.gatewayClient.Close()
+		b.gatewayClient = nil
+	}
+	if b.grpcConnection != nil {
+		b.grpcConnection.Close()
+		b.grpcConnection = nil
 	}
 
-	return &Network{
-		network:        network,
-		channel:        channelName,
-		bridge:         b,
-		config:         b.config,
-		peerConnection: peerConn,
-	}, nil
+	// Connect via fabric-sdk-go (direct peer Endorser gRPC)
+	pc, err := NewPeerConnection(b.config, channelName)
+	if err != nil {
+		// Attempt to restore gateway connection on failure
+		if gw, grpcConn, gwErr := connectGateway(b.config); gwErr == nil {
+			b.gatewayClient = gw
+			b.grpcConnection = grpcConn
+		}
+		return &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
+	}
+
+	b.peerConnection = pc
+	return nil
+}
+
+// restoreGatewayMode disconnects the peer connection and reconnects to the Gateway service.
+// This is called internally after a peer-targeted transaction completes.
+func (b *Bridge) restoreGatewayMode() error {
+	if b.peerConnection != nil {
+		b.peerConnection.Close()
+		b.peerConnection = nil
+	}
+
+	gw, grpcConn, err := connectGateway(b.config)
+	if err != nil {
+		return err
+	}
+
+	b.gatewayClient = gw
+	b.grpcConnection = grpcConn
+	return nil
 }
 
 // createGRPCConnection creates the gRPC connection with TLS

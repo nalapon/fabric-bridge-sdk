@@ -25,12 +25,13 @@ func main() {
 	// Create signer
 	signer := &SimpleSigner{privateKey: []byte("dummy-key")}
 
-	// Create config
+	// Create config for gateway mode
 	config := fabricbridge.NewConfig(
-		"peer0.org1.example.com:7051",
+		"localhost:7051",
 		fabricbridge.Identity{
 			MSPId:       "Org1MSP",
-			Certificate: []byte("dummy-cert"), // In production, load real certificate
+			Certificate: []byte("-----BEGIN CERTIFICATE-----\ndummy-cert\n-----END CERTIFICATE-----"),
+			PrivateKey:  []byte("-----BEGIN PRIVATE KEY-----\ndummy-key\n-----END PRIVATE KEY-----"),
 		},
 		signer,
 		fabricbridge.WithDiscovery(true),
@@ -40,16 +41,24 @@ func main() {
 			Commit:   60 * time.Second,
 			Evaluate: 30 * time.Second,
 		}),
+		// Optional: TLS config
+		// fabricbridge.WithTLS(fabricbridge.TLSOptions{
+		// 	TrustedRoots:        tlsRootCert,
+		// 	Verify:              true,
+		// 	SslTargetNameOverride: "peer0.org1.example.com",
+		// }),
+		// Optional: orderer for full commit flow in peer mode
+		// fabricbridge.WithOrderer("orderer.example.com:7050"),
 	)
 
-	// Connect to the network
+	// Connect to the network (gateway mode by default)
 	bridge, err := fabricbridge.Connect(ctx, config)
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer bridge.Disconnect()
 
-	fmt.Println("Connected to Fabric network!")
+	fmt.Println("Connected to Fabric network via Gateway!")
 
 	// Get network for a channel
 	network, err := bridge.Network(ctx, "mychannel")
@@ -63,32 +72,41 @@ func main() {
 	contract := network.Contract("mycc")
 	fmt.Printf("Got contract: %s\n", contract.ChaincodeName())
 
-	// Example: Evaluate a query
-	// result, err := contract.Evaluate(ctx, "GetAllAssets")
-	// if err != nil {
-	//     log.Printf("Query failed: %v", err)
-	// }
-	// fmt.Printf("Query result: %s\n", result)
-
-	// Example: Submit a transaction (gateway mode)
+	// Example 1: Simple submit (gateway mode - default)
 	// tx, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
 	// if err != nil {
 	//     log.Fatalf("Transaction failed: %v", err)
 	// }
 	// fmt.Printf("Transaction submitted: %s\n", tx.TransactionID())
-	// fmt.Printf("Result: %s\n", tx.Result())
 
-	// Example: Submit with peer targeting (peer mode)
-	// txBuilder := contract.Transaction("CreateAsset")
-	// txBuilder.SetEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com")
-	// txBuilder.SetTransientData(map[string][]byte{
-	//     "privateData": []byte("secret"),
-	// })
+	// Example 2: Submit with peer targeting
+	// This triggers the sequential pattern:
+	//   1. Disconnect from Gateway service
+	//   2. Connect to peers via fabric-sdk-go (Endorser gRPC)
+	//   3. Endorse/execute on specified peers
+	//   4. Disconnect from peers
+	//   5. Reconnect to Gateway service
+	txBuilder := contract.Transaction("CreateAsset")
+	txBuilder.SetEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com")
+	txBuilder.SetTransientData(map[string][]byte{
+		"privateData": []byte("secret"),
+	})
 	// tx, err := txBuilder.Submit(ctx, "asset1", "blue", "5", "Tom", "100")
 	// if err != nil {
 	//     log.Fatalf("Peer-targeted transaction failed: %v", err)
 	// }
-	// fmt.Printf("Transaction submitted: %s\n", tx.TransactionID())
+	// fmt.Printf("Peer-targeted tx submitted: %s\n", tx.TransactionID())
+
+	// Example 3: Evaluate with peer targeting
+	// queryBuilder := contract.Transaction("ReadAsset")
+	// queryBuilder.SetEndorsingPeers("peer0.org1.example.com")
+	// result, err := queryBuilder.Evaluate(ctx, "asset1")
+	// if err != nil {
+	//     log.Fatalf("Peer-targeted query failed: %v", err)
+	// }
+	// fmt.Printf("Query result: %s\n", result)
+
+	_ = txBuilder // suppress unused variable warning
 
 	fmt.Println("Example completed successfully!")
 }

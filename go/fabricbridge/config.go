@@ -22,10 +22,11 @@ type Identity struct {
 
 // TLSOptions for TLS configuration
 type TLSOptions struct {
-	TrustedRoots []byte
-	Verify       bool
-	ClientCert   []byte
-	ClientKey    []byte
+	TrustedRoots          []byte
+	Verify                bool
+	ClientCert            []byte
+	ClientKey             []byte
+	SslTargetNameOverride string
 }
 
 // TimeoutConfig contains timeout settings for operations
@@ -48,12 +49,13 @@ var DefaultTimeouts = TimeoutConfig{
 
 // Config for the bridge connection
 type Config struct {
-	GatewayPeer string
-	Identity    Identity
-	Signer      Signer
-	TLSOptions  *TLSOptions
-	Discovery   bool
-	Timeouts    TimeoutConfig
+	GatewayPeer     string
+	Identity        Identity
+	Signer          Signer
+	TLSOptions      *TLSOptions
+	Discovery       bool
+	Timeouts        TimeoutConfig
+	OrdererEndpoint string // Optional: orderer endpoint for commit in peer mode (e.g., "orderer.example.com:7050")
 }
 
 // Option configures a Config
@@ -77,6 +79,13 @@ func WithDiscovery(enabled bool) Option {
 func WithTLS(opts TLSOptions) Option {
 	return func(c *Config) {
 		c.TLSOptions = &opts
+	}
+}
+
+// WithOrderer sets the orderer endpoint for commit in peer mode
+func WithOrderer(endpoint string) Option {
+	return func(c *Config) {
+		c.OrdererEndpoint = endpoint
 	}
 }
 
@@ -120,4 +129,9 @@ func (c Config) IdentityProvider() (*identity.X509Identity, error) {
 		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return identity.NewX509Identity(c.Identity.MSPId, cert)
+}
+
+// HasPrivateKey returns true if the config has a private key (required for peer mode)
+func (c Config) HasPrivateKey() bool {
+	return len(c.Identity.PrivateKey) > 0
 }

@@ -6,15 +6,15 @@ import (
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
 )
 
 // Network represents a Fabric channel and provides access to contracts
 type Network struct {
-	network        *fabricGateway.Network
-	channel        string
-	bridge         *Bridge
-	config         Config
-	peerConnection *PeerConnection
+	network *fabricGateway.Network
+	channel string
+	bridge  *Bridge
+	config  Config
 }
 
 // ChannelName returns the channel name
@@ -32,24 +32,20 @@ func (n *Network) Contract(chaincodeName string, contractName ...string) *Contra
 	}
 
 	return &Contract{
-		contract:       fc,
-		chaincodeName:  chaincodeName,
-		network:        n,
-		config:         n.config,
-		transientData:  make(map[string][]byte),
-		peerConnection: n.peerConnection,
+		contract:      fc,
+		chaincodeName: chaincodeName,
+		network:       n,
+		config:        n.config,
+		transientData: make(map[string][]byte),
 	}
 }
 
 // Contract represents a smart contract on the network
 type Contract struct {
-	contract       *fabricGateway.Contract
-	chaincodeName  string
-	network        *Network
-	config         Config
-	peerConnection *PeerConnection
-
-	// For peer-targeted transactions
+	contract      *fabricGateway.Contract
+	chaincodeName string
+	network       *Network
+	config        Config
 	transientData map[string][]byte
 }
 
@@ -58,7 +54,7 @@ func (c *Contract) ChaincodeName() string {
 	return c.chaincodeName
 }
 
-// Evaluate executes a query on the contract (read-only)
+// Evaluate executes a query on the contract (read-only, gateway mode)
 func (c *Contract) Evaluate(ctx context.Context, transactionName string, args ...string) ([]byte, error) {
 	proposal, err := c.contract.NewProposal(transactionName, fabricGateway.WithArguments(args...))
 	if err != nil {
@@ -73,14 +69,12 @@ func (c *Contract) Evaluate(ctx context.Context, transactionName string, args ..
 	return result, nil
 }
 
-// Submit executes a transaction on the contract (write)
+// Submit executes a transaction on the contract (write, gateway mode)
 func (c *Contract) Submit(ctx context.Context, transactionName string, args ...string) (*TransactionResult, error) {
-	// Build proposal options
 	opts := []fabricGateway.ProposalOption{
 		fabricGateway.WithArguments(args...),
 	}
 
-	// Add transient data if present
 	if len(c.transientData) > 0 {
 		opts = append(opts, fabricGateway.WithTransient(c.transientData))
 	}
@@ -90,7 +84,6 @@ func (c *Contract) Submit(ctx context.Context, transactionName string, args ...s
 		return nil, &EndorsementError{Message: fmt.Sprintf("create proposal: %v", err)}
 	}
 
-	// In gateway mode, fabric-gateway handles endorsement and submit
 	transaction, err := proposal.Endorse()
 	if err != nil {
 		return nil, &EndorsementError{Message: fmt.Sprintf("endorse: %v", err)}
@@ -137,8 +130,16 @@ func (r *TransactionResult) TransactionID() string {
 	return r.transactionID
 }
 
-// Status returns the commit status of the transaction
+// Status returns the commit status of the transaction.
+// Returns an error if the transaction was executed in peer mode (no commit tracking).
 func (r *TransactionResult) Status(ctx context.Context) (*CommitStatus, error) {
+	if r.commit == nil {
+		return nil, &CommitError{
+			Message:       "commit status not available in peer mode",
+			TransactionID: r.transactionID,
+		}
+	}
+
 	status, err := r.commit.StatusWithContext(ctx)
 	if err != nil {
 		return nil, &CommitError{Message: fmt.Sprintf("get status: %v", err), TransactionID: r.transactionID}
@@ -158,7 +159,8 @@ type CommitStatus struct {
 	TransactionID string
 }
 
-// Transaction represents a prepared transaction with custom options
+// Transaction represents a prepared transaction with custom options.
+// Use SetEndorsingPeers to target specific peers (triggers sequential gateway→peer→gateway mode).
 type Transaction struct {
 	contract        *Contract
 	transactionName string
@@ -166,7 +168,10 @@ type Transaction struct {
 	transientData   map[string][]byte
 }
 
-// SetEndorsingPeers sets specific peers for endorsement (peer-targeting mode)
+// SetEndorsingPeers sets specific peers for endorsement (peer-targeting mode).
+// When set, the bridge will disconnect from the Gateway service, connect directly
+// to the specified peers via fabric-sdk-go, execute the transaction, and then
+// reconnect to the Gateway service.
 func (t *Transaction) SetEndorsingPeers(peers ...string) *Transaction {
 	t.endorsingPeers = peers
 	return t
@@ -178,41 +183,79 @@ func (t *Transaction) SetTransientData(data map[string][]byte) *Transaction {
 	return t
 }
 
-// Submit executes the transaction with the configured options
+// Submit executes the transaction with the configured options.
+// If endorsing peers are set, it uses the sequential connection pattern:
+//  1. Disconnect from Gateway service
+//  2. Connect to peers via fabric-sdk-go (Endorser gRPC)
+//  3. Execute/endorse the transaction on specified peers
+//  4. Disconnect from peers
+//  5. Reconnect to Gateway service
 func (t *Transaction) Submit(ctx context.Context, args ...string) (*TransactionResult, error) {
-	// If endorsing peers are specified, use peer-targeting mode
-	if len(t.endorsingPeers) > 0 && t.contract.peerConnection != nil {
+	if len(t.endorsingPeers) > 0 {
 		return t.submitWithPeerTargeting(ctx, args)
 	}
 
-	// Otherwise, use gateway mode
 	t.contract.transientData = t.transientData
 	return t.contract.Submit(ctx, t.transactionName, args...)
 }
 
-// submitWithPeerTargeting submits transaction to specific peers using fabric-sdk-go
+// submitWithPeerTargeting executes the sequential connection pattern for peer-targeted transactions
 func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string) (*TransactionResult, error) {
+	bridge := t.contract.network.bridge
+
+	if !bridge.config.HasPrivateKey() {
+		return nil, &ConfigurationError{
+			Field:   "identity.privateKey",
+			Message: "privateKey is required for peer-targeted transactions (setEndorsingPeers)",
+		}
+	}
+
+	// Step 1-2: Disconnect gateway, connect peer
+	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
+		return nil, err
+	}
+
+	// Step 4-5: Always restore gateway, even on error
+	defer bridge.restoreGatewayMode()
+
 	// Convert args to byte arrays
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	// Execute using peer connection
-	resp, err := t.contract.peerConnection.Execute(
-		ctx,
-		t.contract.chaincodeName,
-		t.transactionName,
-		byteArgs,
-		t.endorsingPeers,
-		t.transientData,
-	)
+	var resp *channel.Response
+	var err error
+
+	// Step 3: Execute on peers
+	if bridge.config.OrdererEndpoint != "" {
+		// Full flow: endorse + commit via orderer
+		resp, err = bridge.peerConnection.Execute(
+			ctx,
+			t.contract.network.channel,
+			t.contract.chaincodeName,
+			t.transactionName,
+			byteArgs,
+			t.endorsingPeers,
+			t.transientData,
+		)
+	} else {
+		// Endorsement only: no orderer available
+		resp, err = bridge.peerConnection.Endorse(
+			ctx,
+			t.contract.network.channel,
+			t.contract.chaincodeName,
+			t.transactionName,
+			byteArgs,
+			t.endorsingPeers,
+			t.transientData,
+		)
+	}
+
 	if err != nil {
 		return nil, &SubmitError{Message: fmt.Sprintf("peer-targeted submit failed: %v", err)}
 	}
 
-	// For peer-targeted transactions, we don't get a commit object from fabric-sdk-go
-	// Return a simplified result
 	return &TransactionResult{
 		transactionID: string(resp.TransactionID),
 		result:        resp.Payload,
@@ -221,10 +264,9 @@ func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string
 	}, nil
 }
 
-// Evaluate executes the transaction as a query
+// Evaluate executes the transaction as a query with peer targeting if configured
 func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, error) {
-	// If endorsing peers are specified, use peer-targeting mode for evaluation too
-	if len(t.endorsingPeers) > 0 && t.contract.peerConnection != nil {
+	if len(t.endorsingPeers) > 0 {
 		return t.evaluateWithPeerTargeting(ctx, args)
 	}
 
@@ -232,17 +274,31 @@ func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, err
 	return t.contract.Evaluate(ctx, t.transactionName, args...)
 }
 
-// evaluateWithPeerTargeting queries specific peers using fabric-sdk-go
+// evaluateWithPeerTargeting evaluates on specific peers using the sequential pattern
 func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) ([]byte, error) {
-	// Convert args to byte arrays
+	bridge := t.contract.network.bridge
+
+	if !bridge.config.HasPrivateKey() {
+		return nil, &ConfigurationError{
+			Field:   "identity.privateKey",
+			Message: "privateKey is required for peer-targeted evaluations (setEndorsingPeers)",
+		}
+	}
+
+	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
+		return nil, err
+	}
+
+	defer bridge.restoreGatewayMode()
+
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	// Query using peer connection
-	result, err := t.contract.peerConnection.Query(
+	result, err := bridge.peerConnection.Query(
 		ctx,
+		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
