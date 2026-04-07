@@ -235,56 +235,105 @@ class PeerTransaction implements BridgeTransaction {
       typeof arg === "string" ? arg : JSON.stringify(arg),
     );
 
-    try {
-      const transaction = this.contract.createTransaction(this.name);
+    // Phase 1: Endorsement (discovery + peer matching + create transaction)
+    const endorseResult = await Result.tryPromise({
+      try: async () => {
+        const transaction = this.contract.createTransaction(this.name);
 
-      // Set transient data if provided
-      if (Object.keys(this.transientData).length > 0) {
-        transaction.setTransient(this.transientData);
-      }
-
-      // If specific endorsing peers are set, use peer-targeted mode
-      if (this.endorsingPeerNames.length > 0) {
-        // Ensure discovery is up to date
-        const discoveryResult = await this.ensureDiscovery();
-        if (!discoveryResult.isOk()) {
-          return Result.err(discoveryResult.error);
+        if (Object.keys(this.transientData).length > 0) {
+          transaction.setTransient(this.transientData);
         }
 
-        const discovery = discoveryResult.value;
+        if (this.endorsingPeerNames.length > 0) {
+          const discoveryResult = await this.ensureDiscovery();
+          if (!discoveryResult.isOk()) {
+            throw discoveryResult.error;
+          }
 
-        // Match peer names to actual peer objects
-        const endorsingPeers = this.matchPeersToEndorsers(
-          discovery,
-          this.endorsingPeerNames,
+          const endorsingPeers = this.matchPeersToEndorsers(
+            discoveryResult.value,
+            this.endorsingPeerNames,
+          );
+          if (!endorsingPeers.isOk()) {
+            throw endorsingPeers.error;
+          }
+
+          if (endorsingPeers.value.length > 0) {
+            transaction.setEndorsingPeers(endorsingPeers.value);
+          }
+        }
+
+        return transaction;
+      },
+      catch: (e) => new EndorsementError({ message: (e as Error).message }),
+    });
+
+    if (!endorseResult.isOk()) {
+      return Result.err(endorseResult.error);
+    }
+
+    const transaction = endorseResult.value;
+
+    // Phase 2: Commit (register listener + submit + wait for block confirmation)
+    return Result.tryPromise({
+      try: async () => {
+        const network = (this.contract as any).network;
+        const channel = network.getChannel();
+
+        const peers = this.endorsingPeerNames.length > 0
+          ? (transaction as any).endorsingPeers || channel.getEndorsers()
+          : channel.getEndorsers();
+
+        let commitEvent: fabricNetwork.CommitEvent | undefined;
+        const commitListener: fabricNetwork.CommitListener = (error, event) => {
+          if (event) {
+            commitEvent = event;
+          }
+        };
+
+        await network.addCommitListener(
+          commitListener,
+          peers,
+          transaction.getTransactionId(),
         );
-        if (!endorsingPeers.isOk()) {
-          return Result.err(endorsingPeers.error);
-        }
 
-        // Set endorsing peers on transaction
-        if (endorsingPeers.value.length > 0) {
-          transaction.setEndorsingPeers(endorsingPeers.value);
-        }
-      }
+        const commitTimeout = Math.min(this.timeouts.commit ?? 5000, 5000);
+        const cleanup = () => {
+          try {
+            network.removeCommitListener(commitListener);
+          } catch {
+            // Listener may already be removed
+          }
+        };
 
-      const result = await transaction.submit(...stringArgs);
+        const commitEventPromise = new Promise<Buffer>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            cleanup();
+            reject(new Error('Commit event listener timeout'));
+          }, commitTimeout);
 
-      return Result.ok(
-        new PeerSubmittedTx(
+          transaction.submit(...stringArgs).then((result: Buffer) => {
+            clearTimeout(timeout);
+            cleanup();
+            resolve(result);
+          }, (err: Error) => {
+            clearTimeout(timeout);
+            cleanup();
+            reject(err);
+          });
+        });
+
+        const result = await commitEventPromise;
+
+        return new PeerSubmittedTx(
           result,
           transaction.getTransactionId(),
           this.timeouts,
-        ),
-      );
-    } catch (error) {
-      log().error('PeerTransaction.submit() - error:', (error as Error).message);
-      return Result.err(
-        new EndorsementError({
-          message: (error as Error).message,
-        }),
-      );
-    }
+          commitEvent,
+        );
+      },
+      catch: (e) => this.mapSubmitError(e as Error),
+    });
   }
 
   async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
@@ -389,21 +438,42 @@ class PeerTransaction implements BridgeTransaction {
 
     return Result.ok(endorsers);
   }
+
+  private mapSubmitError(error: Error): TimeoutError | SubmitError {
+    if (
+      error.message?.includes("timeout") ||
+      error.message?.includes("Timeout") ||
+      error.message?.includes("TIMEOUT")
+    ) {
+      return new TimeoutError({
+        message: error.message,
+        operation: "commit",
+        timeout: this.timeouts.commit,
+      });
+    }
+
+    return new SubmitError({
+      message: error.message,
+    });
+  }
 }
 
 class PeerSubmittedTx implements BridgeSubmittedTx {
   private result: Buffer;
   private transactionId: string;
   private timeouts: Required<TimeoutConfig>;
+  private commitEvent?: fabricNetwork.CommitEvent;
 
   constructor(
     result: Buffer,
     transactionId: string,
     timeouts: Required<TimeoutConfig>,
+    commitEvent?: fabricNetwork.CommitEvent,
   ) {
     this.result = result;
     this.transactionId = transactionId;
     this.timeouts = timeouts;
+    this.commitEvent = commitEvent;
   }
 
   getResult(): Buffer {
@@ -411,8 +481,15 @@ class PeerSubmittedTx implements BridgeSubmittedTx {
   }
 
   async getStatus(): Promise<BridgeResult<CommitStatus>> {
-    // In fabric-network mode, we don't get a handle to check commit status
-    // Return a mock status indicating the transaction was submitted
+    if (this.commitEvent) {
+      const blockEvent = this.commitEvent.getBlockEvent();
+      return Result.ok({
+        blockNumber: BigInt(blockEvent.blockNumber.toString()),
+        status: this.commitEvent.isValid ? "VALID" : "INVALID",
+        transactionId: this.transactionId,
+      });
+    }
+
     return Result.ok({
       blockNumber: BigInt(0),
       status: "VALID",

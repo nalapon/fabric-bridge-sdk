@@ -126,11 +126,12 @@ export class GatewayConnection {
     return this.gateway;
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
     this.gateway?.close();
     this.client?.close();
     this.gateway = null;
     this.client = null;
+    await new Promise(resolve => setImmediate(resolve));
   }
 
   private adaptSigner(signer: Signer): fabricGateway.Signer {

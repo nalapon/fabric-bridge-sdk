@@ -2,11 +2,12 @@ package fabricbridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
 )
 
 // Network represents a Fabric channel and provides access to contracts
@@ -36,7 +37,6 @@ func (n *Network) Contract(chaincodeName string, contractName ...string) *Contra
 		chaincodeName: chaincodeName,
 		network:       n,
 		config:        n.config,
-		transientData: make(map[string][]byte),
 	}
 }
 
@@ -46,7 +46,6 @@ type Contract struct {
 	chaincodeName string
 	network       *Network
 	config        Config
-	transientData map[string][]byte
 }
 
 // ChaincodeName returns the chaincode name
@@ -56,12 +55,21 @@ func (c *Contract) ChaincodeName() string {
 
 // Evaluate executes a query on the contract (read-only, gateway mode)
 func (c *Contract) Evaluate(ctx context.Context, transactionName string, args ...string) ([]byte, error) {
-	proposal, err := c.contract.NewProposal(transactionName, fabricGateway.WithArguments(args...))
-	if err != nil {
-		return nil, &EvaluationError{Message: fmt.Sprintf("create proposal: %v", err)}
+	return c.evaluate(ctx, transactionName, nil, args...)
+}
+
+func (c *Contract) evaluate(ctx context.Context, transactionName string, transientData map[string][]byte, args ...string) ([]byte, error) {
+	c.network.bridge.modeMu.RLock()
+	defer c.network.bridge.modeMu.RUnlock()
+
+	opts := []fabricGateway.ProposalOption{
+		fabricGateway.WithArguments(args...),
+	}
+	if len(transientData) > 0 {
+		opts = append(opts, fabricGateway.WithTransient(copyTransientData(transientData)))
 	}
 
-	result, err := proposal.Evaluate()
+	result, err := c.contract.EvaluateWithContext(ctx, transactionName, opts...)
 	if err != nil {
 		return nil, &EvaluationError{Message: fmt.Sprintf("evaluate: %v", err)}
 	}
@@ -69,36 +77,53 @@ func (c *Contract) Evaluate(ctx context.Context, transactionName string, args ..
 	return result, nil
 }
 
-// Submit executes a transaction on the contract (write, gateway mode)
-func (c *Contract) Submit(ctx context.Context, transactionName string, args ...string) (*TransactionResult, error) {
+// Submit executes a transaction on the contract and waits for commit by default.
+func (c *Contract) Submit(ctx context.Context, transactionName string, args ...string) (*CommitResult, error) {
+	submitted, err := c.SubmitAsync(ctx, transactionName, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := submitted.WaitForCommit(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CommitResult{
+		transactionID: submitted.TransactionID(),
+		result:        submitted.Result(),
+		commitStatus:  status,
+	}, nil
+}
+
+// SubmitAsync submits a transaction on the contract without waiting for commit.
+func (c *Contract) SubmitAsync(ctx context.Context, transactionName string, args ...string) (*SubmittedTransaction, error) {
+	return c.submitAsync(ctx, transactionName, nil, args...)
+}
+
+func (c *Contract) submitAsync(ctx context.Context, transactionName string, transientData map[string][]byte, args ...string) (*SubmittedTransaction, error) {
+	c.network.bridge.modeMu.RLock()
+	defer c.network.bridge.modeMu.RUnlock()
+
 	opts := []fabricGateway.ProposalOption{
 		fabricGateway.WithArguments(args...),
 	}
 
-	if len(c.transientData) > 0 {
-		opts = append(opts, fabricGateway.WithTransient(c.transientData))
+	if len(transientData) > 0 {
+		opts = append(opts, fabricGateway.WithTransient(copyTransientData(transientData)))
 	}
 
-	proposal, err := c.contract.NewProposal(transactionName, opts...)
+	result, commit, err := c.contract.SubmitAsyncWithContext(ctx, transactionName, opts...)
 	if err != nil {
-		return nil, &EndorsementError{Message: fmt.Sprintf("create proposal: %v", err)}
+		return nil, wrapSubmitAsyncError(err)
 	}
 
-	transaction, err := proposal.Endorse()
-	if err != nil {
-		return nil, &EndorsementError{Message: fmt.Sprintf("endorse: %v", err)}
-	}
-
-	submitted, err := transaction.Submit()
-	if err != nil {
-		return nil, &SubmitError{Message: fmt.Sprintf("submit: %v", err)}
-	}
-
-	return &TransactionResult{
-		transactionID: submitted.TransactionID(),
-		result:        transaction.Result(),
-		commit:        submitted,
-		config:        c.config,
+	return &SubmittedTransaction{
+		transactionID: commit.TransactionID(),
+		result:        result,
+		waitForCommit: func(ctx context.Context) (*CommitStatus, error) {
+			return waitForGatewayCommit(ctx, commit)
+		},
 	}, nil
 }
 
@@ -112,44 +137,56 @@ func (c *Contract) Transaction(transactionName string) *Transaction {
 	}
 }
 
-// TransactionResult represents the result of a submitted transaction
-type TransactionResult struct {
+// CommitResult represents a transaction that has been committed.
+type CommitResult struct {
 	transactionID string
 	result        []byte
-	commit        *fabricGateway.Commit
-	config        Config
+	commitStatus  *CommitStatus
 }
 
-// Result returns the transaction result
-func (r *TransactionResult) Result() []byte {
+// Result returns the transaction result.
+func (r *CommitResult) Result() []byte {
 	return r.result
 }
 
-// TransactionID returns the transaction ID
-func (r *TransactionResult) TransactionID() string {
+// TransactionID returns the transaction ID.
+func (r *CommitResult) TransactionID() string {
 	return r.transactionID
 }
 
-// Status returns the commit status of the transaction.
-// Returns an error if the transaction was executed in peer mode (no commit tracking).
-func (r *TransactionResult) Status(ctx context.Context) (*CommitStatus, error) {
-	if r.commit == nil {
+// CommitStatus returns the commit status captured by Submit().
+func (r *CommitResult) CommitStatus() *CommitStatus {
+	return r.commitStatus
+}
+
+// SubmittedTransaction represents a transaction that has been sent to the orderer
+// and can be awaited later.
+type SubmittedTransaction struct {
+	transactionID string
+	result        []byte
+	waitForCommit func(ctx context.Context) (*CommitStatus, error)
+}
+
+// Result returns the transaction result.
+func (r *SubmittedTransaction) Result() []byte {
+	return r.result
+}
+
+// TransactionID returns the transaction ID.
+func (r *SubmittedTransaction) TransactionID() string {
+	return r.transactionID
+}
+
+// WaitForCommit blocks until the transaction is committed or the context is cancelled.
+func (r *SubmittedTransaction) WaitForCommit(ctx context.Context) (*CommitStatus, error) {
+	if r.waitForCommit == nil {
 		return nil, &CommitError{
-			Message:       "commit status not available in peer mode",
+			Message:       "commit waiting is not available for this transaction",
 			TransactionID: r.transactionID,
 		}
 	}
 
-	status, err := r.commit.StatusWithContext(ctx)
-	if err != nil {
-		return nil, &CommitError{Message: fmt.Sprintf("get status: %v", err), TransactionID: r.transactionID}
-	}
-
-	return &CommitStatus{
-		BlockNumber:   status.BlockNumber,
-		Status:        status.Code,
-		TransactionID: r.transactionID,
-	}, nil
+	return r.waitForCommit(ctx)
 }
 
 // CommitStatus represents the commit status of a transaction
@@ -183,24 +220,36 @@ func (t *Transaction) SetTransientData(data map[string][]byte) *Transaction {
 	return t
 }
 
-// Submit executes the transaction with the configured options.
-// If endorsing peers are set, it uses the sequential connection pattern:
-//  1. Disconnect from Gateway service
-//  2. Connect to peers via fabric-sdk-go (Endorser gRPC)
-//  3. Execute/endorse the transaction on specified peers
-//  4. Disconnect from peers
-//  5. Reconnect to Gateway service
-func (t *Transaction) Submit(ctx context.Context, args ...string) (*TransactionResult, error) {
-	if len(t.endorsingPeers) > 0 {
-		return t.submitWithPeerTargeting(ctx, args)
+// Submit executes the transaction and waits for commit by default.
+func (t *Transaction) Submit(ctx context.Context, args ...string) (*CommitResult, error) {
+	submitted, err := t.SubmitAsync(ctx, args...)
+	if err != nil {
+		return nil, err
 	}
 
-	t.contract.transientData = t.transientData
-	return t.contract.Submit(ctx, t.transactionName, args...)
+	status, err := submitted.WaitForCommit(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CommitResult{
+		transactionID: submitted.TransactionID(),
+		result:        submitted.Result(),
+		commitStatus:  status,
+	}, nil
 }
 
-// submitWithPeerTargeting executes the sequential connection pattern for peer-targeted transactions
-func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string) (*TransactionResult, error) {
+// SubmitAsync executes the transaction without waiting for commit.
+func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*SubmittedTransaction, error) {
+	if len(t.endorsingPeers) > 0 {
+		return t.submitAsyncWithPeerTargeting(ctx, args)
+	}
+
+	return t.contract.submitAsync(ctx, t.transactionName, t.transientData, args...)
+}
+
+// submitAsyncWithPeerTargeting executes the sequential connection pattern for peer-targeted transactions.
+func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (result *SubmittedTransaction, err error) {
 	bridge := t.contract.network.bridge
 
 	if !bridge.config.HasPrivateKey() {
@@ -209,6 +258,15 @@ func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string
 			Message: "privateKey is required for peer-targeted transactions (setEndorsingPeers)",
 		}
 	}
+	if bridge.config.OrdererEndpoint == "" {
+		return nil, &ConfigurationError{
+			Field:   "ordererEndpoint",
+			Message: "ordererEndpoint is required for Submit and SubmitAsync when peer targeting is enabled",
+		}
+	}
+
+	bridge.modeMu.Lock()
+	defer bridge.modeMu.Unlock()
 
 	// Step 1-2: Disconnect gateway, connect peer
 	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
@@ -216,7 +274,11 @@ func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string
 	}
 
 	// Step 4-5: Always restore gateway, even on error
-	defer bridge.restoreGatewayMode()
+	defer func() {
+		if restoreErr := bridge.restoreGatewayMode(); restoreErr != nil && err == nil {
+			err = restoreErr
+		}
+	}()
 
 	// Convert args to byte arrays
 	byteArgs := make([][]byte, len(args))
@@ -225,42 +287,26 @@ func (t *Transaction) submitWithPeerTargeting(ctx context.Context, args []string
 	}
 
 	var resp *channel.Response
-	var err error
 
-	// Step 3: Execute on peers
-	if bridge.config.OrdererEndpoint != "" {
-		// Full flow: endorse + commit via orderer
-		resp, err = bridge.peerConnection.Execute(
-			ctx,
-			t.contract.network.channel,
-			t.contract.chaincodeName,
-			t.transactionName,
-			byteArgs,
-			t.endorsingPeers,
-			t.transientData,
-		)
-	} else {
-		// Endorsement only: no orderer available
-		resp, err = bridge.peerConnection.Endorse(
-			ctx,
-			t.contract.network.channel,
-			t.contract.chaincodeName,
-			t.transactionName,
-			byteArgs,
-			t.endorsingPeers,
-			t.transientData,
-		)
-	}
-
+	resp, err = bridge.peerConnection.SubmitAsync(
+		ctx,
+		t.contract.network.channel,
+		t.contract.chaincodeName,
+		t.transactionName,
+		byteArgs,
+		t.endorsingPeers,
+		t.transientData,
+	)
 	if err != nil {
 		return nil, &SubmitError{Message: fmt.Sprintf("peer-targeted submit failed: %v", err)}
 	}
 
-	return &TransactionResult{
+	return &SubmittedTransaction{
 		transactionID: string(resp.TransactionID),
 		result:        resp.Payload,
-		commit:        nil, // No commit tracking in peer mode
-		config:        t.contract.config,
+		waitForCommit: func(ctx context.Context) (*CommitStatus, error) {
+			return bridge.commitStatus(ctx, t.contract.network.channel, string(resp.TransactionID))
+		},
 	}, nil
 }
 
@@ -270,12 +316,11 @@ func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, err
 		return t.evaluateWithPeerTargeting(ctx, args)
 	}
 
-	t.contract.transientData = t.transientData
-	return t.contract.Evaluate(ctx, t.transactionName, args...)
+	return t.contract.evaluate(ctx, t.transactionName, t.transientData, args...)
 }
 
 // evaluateWithPeerTargeting evaluates on specific peers using the sequential pattern
-func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) ([]byte, error) {
+func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) (result []byte, err error) {
 	bridge := t.contract.network.bridge
 
 	if !bridge.config.HasPrivateKey() {
@@ -285,18 +330,25 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 		}
 	}
 
+	bridge.modeMu.Lock()
+	defer bridge.modeMu.Unlock()
+
 	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
 		return nil, err
 	}
 
-	defer bridge.restoreGatewayMode()
+	defer func() {
+		if restoreErr := bridge.restoreGatewayMode(); restoreErr != nil && err == nil {
+			err = restoreErr
+		}
+	}()
 
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	result, err := bridge.peerConnection.Query(
+	result, err = bridge.peerConnection.Query(
 		ctx,
 		t.contract.network.channel,
 		t.contract.chaincodeName,
@@ -309,4 +361,71 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 	}
 
 	return result, nil
+}
+
+func copyTransientData(input map[string][]byte) map[string][]byte {
+	if len(input) == 0 {
+		return nil
+	}
+
+	out := make(map[string][]byte, len(input))
+	for key, value := range input {
+		if value == nil {
+			out[key] = nil
+			continue
+		}
+		cloned := make([]byte, len(value))
+		copy(cloned, value)
+		out[key] = cloned
+	}
+
+	return out
+}
+
+func wrapSubmitAsyncError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var endorseErr *fabricGateway.EndorseError
+	if errors.As(err, &endorseErr) {
+		return &EndorsementError{Message: endorseErr.Error()}
+	}
+
+	var submitErr *fabricGateway.SubmitError
+	if errors.As(err, &submitErr) {
+		return &SubmitError{Message: submitErr.Error(), TransactionID: submitErr.TransactionID}
+	}
+
+	return &SubmitError{Message: err.Error()}
+}
+
+func waitForGatewayCommit(ctx context.Context, commit *fabricGateway.Commit) (*CommitStatus, error) {
+	if commit == nil {
+		return nil, &CommitError{Message: "commit status handle is nil"}
+	}
+
+	status, err := commit.StatusWithContext(ctx)
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("get status: %v", err),
+			TransactionID: commit.TransactionID(),
+		}
+	}
+
+	commitStatus := &CommitStatus{
+		BlockNumber:   status.BlockNumber,
+		Status:        status.Code,
+		TransactionID: commit.TransactionID(),
+	}
+
+	if status.Code != peer.TxValidationCode_VALID {
+		return commitStatus, &CommitError{
+			Message:       "transaction committed with invalid validation code",
+			TransactionID: commit.TransactionID(),
+			Status:        status.Code.String(),
+		}
+	}
+
+	return commitStatus, nil
 }

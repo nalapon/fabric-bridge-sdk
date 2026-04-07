@@ -75,7 +75,7 @@ export class FabricBridge {
   async switchToPeerMode(): Promise<Result<void, ConfigurationError | TimeoutError>> {
     log().info('FabricBridge.switchToPeerMode() - Cambiando a modo PEER');
     
-    this.gatewayConnection?.disconnect();
+    await this.gatewayConnection?.disconnect();
     log().debug('FabricBridge.switchToPeerMode() - GatewayConnection desconectado');
 
     log().debug('FabricBridge.switchToPeerMode() - Llamando a PeerConnection.connect()');
@@ -112,7 +112,7 @@ export class FabricBridge {
 
   async disconnect(): Promise<void> {
     log().info('FabricBridge.disconnect() - Desconectando');
-    this.gatewayConnection?.disconnect();
+    await this.gatewayConnection?.disconnect();
     await this.peerConnection?.disconnect();
     this.discoveryCache.clear();
     this.isConnected = false;
@@ -161,7 +161,7 @@ class BridgeNetworkImpl implements BridgeNetwork {
     this.discoveryCache = discoveryCache;
     this.fabricBridge = fabricBridge;
     this.gatewayNetwork = new GatewayNetwork(
-      gatewayConnection.getGateway(),
+      gatewayConnection,
       channelName,
       config,
     );

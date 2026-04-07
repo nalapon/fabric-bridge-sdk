@@ -100,6 +100,11 @@ export class PeerConnection {
             enabled: this.config.discovery ?? true,
             asLocalhost,
           },
+          eventHandlerOptions: {
+            commitTimeout: Math.round(
+              Math.min(this.config.timeouts?.commit ?? 5000, 5000) / 1000,
+            ),
+          },
           tlsInfo: tlsOptions?.clientCert && tlsOptions?.clientKey
             ? {
                 certificate: tlsOptions.clientCert.toString(),

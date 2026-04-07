@@ -5,11 +5,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"sync"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
+	"github.com/hyperledger/fabric-gateway/pkg/hash"
+	gatewayProto "github.com/hyperledger/fabric-protos-go-apiv2/gateway"
+	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
+	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	insecureCredentials "google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 // Bridge is the main entry point for the SDK.
@@ -23,10 +29,13 @@ type Bridge struct {
 	connected       bool
 	gatewayEndpoint string
 	peerConnection  *PeerConnection
+	modeMu          sync.RWMutex
 }
 
 // Connect establishes a connection to the Fabric network via the Gateway service
 func Connect(ctx context.Context, config Config) (*Bridge, error) {
+	config = config.normalized()
+
 	if err := config.Validate(); err != nil {
 		return nil, &ConfigurationError{Field: "", Message: err.Error()}
 	}
@@ -78,6 +87,9 @@ func connectGateway(config Config) (*fabricGateway.Gateway, *grpc.ClientConn, er
 
 // Disconnect closes all connections
 func (b *Bridge) Disconnect() error {
+	b.modeMu.Lock()
+	defer b.modeMu.Unlock()
+
 	if !b.connected {
 		return nil
 	}
@@ -115,6 +127,9 @@ func (b *Bridge) IsConnected() bool {
 // Network returns a Network for the specified channel.
 // The bridge must be connected (in gateway mode) before calling this.
 func (b *Bridge) Network(ctx context.Context, channelName string) (*Network, error) {
+	b.modeMu.RLock()
+	defer b.modeMu.RUnlock()
+
 	if !b.connected {
 		return nil, &NotConnectedError{Component: "Bridge", Action: "get network"}
 	}
@@ -190,7 +205,12 @@ func createGRPCConnection(config Config) (*grpc.ClientConn, error) {
 
 		tlsConfig := &tls.Config{
 			RootCAs:            certPool,
-			InsecureSkipVerify: !config.TLSOptions.Verify,
+			InsecureSkipVerify: config.TLSOptions.AllowInsecureTLS,
+			MinVersion:         tls.VersionTLS12,
+		}
+
+		if config.TLSOptions.SslTargetNameOverride != "" {
+			tlsConfig.ServerName = config.TLSOptions.SslTargetNameOverride
 		}
 
 		if len(config.TLSOptions.ClientCert) > 0 && len(config.TLSOptions.ClientKey) > 0 {
@@ -205,6 +225,83 @@ func createGRPCConnection(config Config) (*grpc.ClientConn, error) {
 	}
 
 	return grpc.NewClient(config.GatewayPeer, grpc.WithTransportCredentials(transportCredentials))
+}
+
+func (b *Bridge) commitStatus(ctx context.Context, channelName string, transactionID string) (*CommitStatus, error) {
+	b.modeMu.RLock()
+	defer b.modeMu.RUnlock()
+
+	if !b.connected || b.grpcConnection == nil {
+		return nil, &NotConnectedError{Component: "Bridge", Action: "get commit status"}
+	}
+
+	id, err := b.config.IdentityProvider()
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("create identity: %v", err),
+			TransactionID: transactionID,
+		}
+	}
+
+	creator, err := proto.Marshal(&msp.SerializedIdentity{
+		Mspid:   id.MspID(),
+		IdBytes: id.Credentials(),
+	})
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("serialize identity: %v", err),
+			TransactionID: transactionID,
+		}
+	}
+
+	request := &gatewayProto.CommitStatusRequest{
+		ChannelId:     channelName,
+		TransactionId: transactionID,
+		Identity:      creator,
+	}
+	requestBytes, err := proto.Marshal(request)
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("marshal commit status request: %v", err),
+			TransactionID: transactionID,
+		}
+	}
+
+	signature, err := b.config.Signer.Sign(hash.SHA256(requestBytes))
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("sign commit status request: %v", err),
+			TransactionID: transactionID,
+		}
+	}
+
+	client := gatewayProto.NewGatewayClient(b.grpcConnection)
+	response, err := client.CommitStatus(ctx, &gatewayProto.SignedCommitStatusRequest{
+		Request:   requestBytes,
+		Signature: signature,
+	})
+	if err != nil {
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("get status: %v", err),
+			TransactionID: transactionID,
+		}
+	}
+
+	status := &CommitStatus{
+		BlockNumber:   response.GetBlockNumber(),
+		Status:        response.GetResult(),
+		TransactionID: transactionID,
+	}
+
+	if response.GetResult() != peer.TxValidationCode_VALID {
+		return status, &CommitError{
+			Message:       "transaction committed with invalid validation code",
+			TransactionID: transactionID,
+			Status:        response.GetResult().String(),
+		}
+	}
+
+	return status, nil
 }
 
 // adaptSigner converts our Signer to fabric-gateway Sign function

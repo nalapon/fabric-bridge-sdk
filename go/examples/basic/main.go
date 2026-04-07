@@ -72,12 +72,24 @@ func main() {
 	contract := network.Contract("mycc")
 	fmt.Printf("Got contract: %s\n", contract.ChaincodeName())
 
-	// Example 1: Simple submit (gateway mode - default)
-	// tx, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
+	// Example 1: Simple submit (gateway mode - waits for commit)
+	// committed, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
 	// if err != nil {
 	//     log.Fatalf("Transaction failed: %v", err)
 	// }
-	// fmt.Printf("Transaction submitted: %s\n", tx.TransactionID())
+	// fmt.Printf("Transaction committed: %s\n", committed.TransactionID())
+	// fmt.Printf("Block: %d Status: %s\n", committed.CommitStatus().BlockNumber, committed.CommitStatus().Status)
+
+	// Example 1b: Submit async and wait later
+	// submitted, err := contract.SubmitAsync(ctx, "CreateAsset", "asset2", "red", "10", "Ana", "200")
+	// if err != nil {
+	//     log.Fatalf("Async transaction failed: %v", err)
+	// }
+	// status, err := submitted.WaitForCommit(ctx)
+	// if err != nil {
+	//     log.Fatalf("Commit wait failed: %v", err)
+	// }
+	// fmt.Printf("Async transaction committed: %s in block %d\n", submitted.TransactionID(), status.BlockNumber)
 
 	// Example 2: Submit with peer targeting
 	// This triggers the sequential pattern:
@@ -91,11 +103,11 @@ func main() {
 	txBuilder.SetTransientData(map[string][]byte{
 		"privateData": []byte("secret"),
 	})
-	// tx, err := txBuilder.Submit(ctx, "asset1", "blue", "5", "Tom", "100")
+	// committed, err := txBuilder.Submit(ctx, "asset1", "blue", "5", "Tom", "100")
 	// if err != nil {
 	//     log.Fatalf("Peer-targeted transaction failed: %v", err)
 	// }
-	// fmt.Printf("Peer-targeted tx submitted: %s\n", tx.TransactionID())
+	// fmt.Printf("Peer-targeted tx committed: %s\n", committed.TransactionID())
 
 	// Example 3: Evaluate with peer targeting
 	// queryBuilder := contract.Transaction("ReadAsset")

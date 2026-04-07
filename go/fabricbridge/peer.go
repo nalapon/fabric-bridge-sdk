@@ -2,17 +2,17 @@ package fabricbridge
 
 import (
 	"context"
-	"encoding/pem"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
-	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel/invoke"
-	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/core"
-	"github.com/hyperledger/fabric-sdk-go/pkg/core/config"
-	"github.com/hyperledger/fabric-sdk-go/pkg/fabsdk"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel/invoke"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/core"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/core/config"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/fabsdk"
 	"gopkg.in/yaml.v2"
 )
 
@@ -65,6 +65,7 @@ func (p *PeerConnection) Execute(ctx context.Context, channelName string, chainc
 
 	opts := []channel.RequestOption{
 		channel.WithTargetEndpoints(peerEndpoints...),
+		channel.WithParentContext(ctx),
 	}
 
 	resp, err := client.Execute(req, opts...)
@@ -92,6 +93,7 @@ func (p *PeerConnection) Endorse(ctx context.Context, channelName string, chainc
 
 	opts := []channel.RequestOption{
 		channel.WithTargetEndpoints(peerEndpoints...),
+		channel.WithParentContext(ctx),
 	}
 
 	// Use SelectAndEndorseHandler chain: endorsement only, no commit
@@ -124,6 +126,7 @@ func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincod
 
 	opts := []channel.RequestOption{
 		channel.WithTargetEndpoints(peerEndpoints...),
+		channel.WithParentContext(ctx),
 	}
 
 	resp, err := client.Query(req, opts...)
@@ -132,6 +135,39 @@ func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincod
 	}
 
 	return resp.Payload, nil
+}
+
+// SubmitAsync submits a transaction to the orderer without waiting for commit.
+func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string, transientData map[string][]byte) (*channel.Response, error) {
+	client, err := p.getChannelClient(channelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel client: %w", err)
+	}
+
+	req := channel.Request{
+		ChaincodeID:  chaincodeID,
+		Fcn:          fn,
+		Args:         args,
+		TransientMap: transientData,
+	}
+
+	opts := []channel.RequestOption{
+		channel.WithTargetEndpoints(peerEndpoints...),
+		channel.WithParentContext(ctx),
+	}
+
+	handler := invoke.NewSelectAndEndorseHandler(
+		invoke.NewEndorsementValidationHandler(
+			invoke.NewSignatureValidationHandler(&submitTxHandler{}),
+		),
+	)
+
+	resp, err := client.InvokeHandler(handler, req, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("submit async failed: %w", err)
+	}
+
+	return &resp, nil
 }
 
 // getChannelClient returns a channel client for the specified channel
@@ -176,13 +212,10 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 		peerName: peerEntry,
 	}
 
-	// Encode DER certificate to PEM format for the connection profile.
-	// Identity.Certificate is DER (from x509.ParseCertificate in gateway mode),
-	// but fabric-sdk-go expects PEM in the YAML config.
-	certPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: cfg.Identity.Certificate,
-	})
+	certPEM, err := certificatePEM(cfg.Identity.Certificate)
+	if err != nil {
+		panic(fmt.Sprintf("failed to normalize certificate to PEM: %v", err))
+	}
 
 	orgName := strings.ToLower(cfg.Identity.MSPId)
 	orgEntry := map[string]interface{}{
@@ -271,6 +304,26 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 	}
 
 	return config.FromRaw(yamlBytes, "yaml")
+}
+
+type submitTxHandler struct{}
+
+func (h *submitTxHandler) Handle(requestContext *invoke.RequestContext, clientContext *invoke.ClientContext) {
+	txnRequest := fab.TransactionRequest{
+		Proposal:          requestContext.Response.Proposal,
+		ProposalResponses: requestContext.Response.Responses,
+	}
+
+	tx, err := clientContext.Transactor.CreateTransaction(txnRequest)
+	if err != nil {
+		requestContext.Error = fmt.Errorf("create transaction failed: %w", err)
+		return
+	}
+
+	if _, err := clientContext.Transactor.SendTransaction(tx); err != nil {
+		requestContext.Error = fmt.Errorf("send transaction failed: %w", err)
+		return
+	}
 }
 
 // peerName returns the logical name for the peer in the connection profile.

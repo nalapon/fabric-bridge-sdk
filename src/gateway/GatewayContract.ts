@@ -17,20 +17,22 @@ import {
   TimeoutError,
 } from '../errors/index';
 import { DEFAULT_TIMEOUTS } from '../types/config';
+import { GatewayConnection } from './GatewayConnection';
 
 export class GatewayNetwork implements BridgeNetwork {
-  private gateway: fabricGateway.Gateway;
+  private gatewayConnection: GatewayConnection;
   private channelName: string;
   private timeouts: Required<TimeoutConfig>;
 
-  constructor(gateway: fabricGateway.Gateway, channelName: string, config: BridgeConfig) {
-    this.gateway = gateway;
+  constructor(gatewayConnection: GatewayConnection, channelName: string, config: BridgeConfig) {
+    this.gatewayConnection = gatewayConnection;
     this.channelName = channelName;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
   }
 
   async getContract(chaincodeName: string): Promise<BridgeContract> {
-    const network = this.gateway.getNetwork(this.channelName);
+    const gateway = this.gatewayConnection.getGateway();
+    const network = gateway.getNetwork(this.channelName);
     const contract = network.getContract(chaincodeName);
     return new GatewayContract(contract, chaincodeName, this.timeouts);
   }
@@ -95,6 +97,13 @@ class GatewayContract implements BridgeContract {
     const errorDetails = (error as any).details || [];
     const detailMessages = errorDetails.map((d: any) => `${d.message} (${d.endpoint || 'unknown endpoint'})`).join('; ');
     const fullMessage = detailMessages ? `${error.message}: ${detailMessages}` : error.message;
+    
+    if (error.message?.includes('Channel has been shut down')) {
+      return new EvaluationError({
+        message: `Gateway channel closed: ${fullMessage}`,
+        details: detailMessages,
+      });
+    }
     
     if (error.message?.includes('timeout') || error.message?.includes('TIMEOUT')) {
       const timeoutValue = operation === 'submit' ? this.timeouts.endorse : this.timeouts[operation];
@@ -177,6 +186,7 @@ class GatewayTransaction implements BridgeTransaction {
 
       const transaction = await proposal.endorse();
       const submitted = await transaction.submit();
+      await submitted.getStatus();
 
       return Result.ok(new GatewaySubmittedTx(transaction, submitted, this.timeouts));
     } catch (error) {
