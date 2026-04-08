@@ -61,7 +61,11 @@ func NewIdentityManager(orgName string, userStore msp.UserStore, cryptoSuite cor
 			return nil, errors.Wrap(err, "creating a cert store failed")
 		}
 	} else {
-		logger.Warnf("Cryptopath not provided for organization [%s], MSP stores not created", orgName)
+		if len(orgConfig.Users) > 0 {
+			logger.Debugf("Cryptopath not provided for organization [%s], using embedded users only", orgName)
+		} else {
+			logger.Warnf("Cryptopath not provided for organization [%s], MSP stores not created", orgName)
+		}
 	}
 
 	mgr := &IdentityManager{

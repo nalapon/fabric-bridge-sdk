@@ -90,7 +90,7 @@ async function usingOrg1Gateway() {
   const contract = await network.getContract(CHAINCODE);
 
   const id = `org1_gw_${Date.now()}`;
-  const result = await contract.submitTransaction(
+  const result = await contract.Submit(
     "CreateAsset",
     id,
     "blue",
@@ -100,8 +100,9 @@ async function usingOrg1Gateway() {
   );
 
   if (result.isOk()) {
-    console.log(`Created: ${id}`);
-    const read = await contract.evaluateTransaction("ReadAsset", id);
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
     if (read.isOk()) {
       console.log("Verified:", JSON.parse(read.value.toString()));
     }
@@ -127,7 +128,7 @@ async function usingOrg2Gateway() {
   const contract = await network.getContract(CHAINCODE);
 
   const id = `org2_gw_${Date.now()}`;
-  const result = await contract.submitTransaction(
+  const result = await contract.Submit(
     "CreateAsset",
     id,
     "green",
@@ -137,8 +138,9 @@ async function usingOrg2Gateway() {
   );
 
   if (result.isOk()) {
-    console.log(`Created: ${id}`);
-    const read = await contract.evaluateTransaction("ReadAsset", id);
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
     if (read.isOk()) {
       console.log("Verified:", JSON.parse(read.value.toString()));
     }
@@ -164,14 +166,15 @@ async function usingOrg1Peer() {
   const contract = await network.getContract(CHAINCODE);
 
   const id = `org1_pt_${Date.now()}`;
-  const tx = contract.createTransaction("CreateAsset");
-  tx.setEndorsingPeers([ORG1.peer]);
+  const tx = contract.Transaction("CreateAsset");
+  tx.SetEndorsingPeers([ORG1.peer]);
 
-  const result = await tx.submit(id, "red", "15", "Org1Peer", "3000");
+  const result = await tx.Submit(id, "red", "15", "Org1Peer", "3000");
 
   if (result.isOk()) {
-    console.log(`Created: ${id}`);
-    const read = await contract.evaluateTransaction("ReadAsset", id);
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
     if (read.isOk()) {
       console.log("Verified:", JSON.parse(read.value.toString()));
     }
@@ -197,14 +200,15 @@ async function usingOrg2Peer() {
   const contract = await network.getContract(CHAINCODE);
 
   const id = `org2_pt_${Date.now()}`;
-  const tx = contract.createTransaction("CreateAsset");
-  tx.setEndorsingPeers([ORG2.peer]);
+  const tx = contract.Transaction("CreateAsset");
+  tx.SetEndorsingPeers([ORG2.peer]);
 
-  const result = await tx.submit(id, "yellow", "20", "Org2Peer", "4000");
+  const result = await tx.Submit(id, "yellow", "20", "Org2Peer", "4000");
 
   if (result.isOk()) {
-    console.log(`Created: ${id}`);
-    const read = await contract.evaluateTransaction("ReadAsset", id);
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
     if (read.isOk()) {
       console.log("Verified:", JSON.parse(read.value.toString()));
     }

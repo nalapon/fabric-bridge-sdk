@@ -1,7 +1,11 @@
 import * as grpc from '@grpc/grpc-js';
 import * as fabricGateway from '@hyperledger/fabric-gateway';
+import { createHash } from 'crypto';
+import * as gatewayProto from '@hyperledger/fabric-protos/lib/gateway/gateway_pb';
+import { SerializedIdentity } from '@hyperledger/fabric-protos/lib/msp/identities_pb';
 import type { BridgeConfig, Signer } from '../types/config';
-import { ConfigurationError, TimeoutError } from '../errors/index';
+import type { CommitStatus } from '../types/bridge';
+import { CommitError, ConfigurationError, NotConnectedError, TimeoutError } from '../errors/index';
 import { Result } from 'better-result';
 import { log } from '../utils/logger';
 
@@ -124,6 +128,98 @@ export class GatewayConnection {
       throw new Error('Gateway not connected. Call connect() first.');
     }
     return this.gateway;
+  }
+
+  async getCommitStatus(
+    channelName: string,
+    transactionId: string,
+  ): Promise<Result<CommitStatus, CommitError | NotConnectedError | TimeoutError | ConfigurationError>> {
+    if (!this.client) {
+      return Result.err(new NotConnectedError({
+        component: 'GatewayConnection',
+        action: 'get commit status',
+      }));
+    }
+
+    const commitTimeout = this.config.timeouts?.commit ?? 60000;
+    const serializedIdentity = new SerializedIdentity();
+    serializedIdentity.setMspid(this.config.identity.mspId);
+    serializedIdentity.setIdBytes(this.config.identity.credentials);
+
+    const request = new gatewayProto.CommitStatusRequest();
+    request.setChannelId(channelName);
+    request.setTransactionId(transactionId);
+    request.setIdentity(serializedIdentity.serializeBinary());
+
+    const requestBytes = request.serializeBinary();
+    const signature = await this.config.signer(createHash('sha256').update(requestBytes).digest());
+
+    const signedRequest = new gatewayProto.SignedCommitStatusRequest();
+    signedRequest.setRequest(requestBytes);
+    signedRequest.setSignature(signature);
+
+    return Result.tryPromise({
+      try: async () => {
+        const response = await new Promise<gatewayProto.CommitStatusResponse>((resolve, reject) => {
+          this.client!.makeUnaryRequest(
+            '/gateway.Gateway/CommitStatus',
+            (value: gatewayProto.SignedCommitStatusRequest) => Buffer.from(value.serializeBinary()),
+            (bytes: Buffer) => gatewayProto.CommitStatusResponse.deserializeBinary(new Uint8Array(bytes)),
+            signedRequest,
+            {
+              deadline: Date.now() + commitTimeout,
+            },
+            (error, value) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+
+              if (!value) {
+                reject(new Error('Empty commit status response'));
+                return;
+              }
+
+              resolve(value);
+            },
+          );
+        });
+
+        const status: CommitStatus = {
+          blockNumber: BigInt(response.getBlockNumber()),
+          status: response.getResult() === 0 ? 'VALID' : 'INVALID',
+          transactionId,
+        };
+
+        if (status.status !== 'VALID') {
+          throw new CommitError({
+            message: 'transaction committed with invalid validation code',
+            transactionId,
+            status: status.status,
+          });
+        }
+
+        return status;
+      },
+      catch: (error) => {
+        if (error instanceof CommitError) {
+          return error;
+        }
+
+        if (error instanceof Error && error.message.toLowerCase().includes('deadline')) {
+          return new TimeoutError({
+            message: `Failed to get commit status for transaction ${transactionId}`,
+            operation: 'commit',
+            timeout: commitTimeout,
+          });
+        }
+
+        return new CommitError({
+          message: error instanceof Error ? error.message : String(error),
+          transactionId,
+        });
+      },
+    });
   }
 
   async disconnect(): Promise<void> {

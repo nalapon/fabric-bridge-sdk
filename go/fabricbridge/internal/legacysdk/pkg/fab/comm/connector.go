@@ -79,7 +79,7 @@ func (cc *CachingConnector) Close() {
 	// bug in the calling code, but it's not good to panic here.
 	if cc.janitorDone == nil {
 		cc.lock.RUnlock()
-		logger.Warn("Trying to close connector after already closed")
+		logger.Debug("Trying to close connector after already closed")
 		return
 	}
 	cc.lock.RUnlock()
@@ -142,12 +142,12 @@ func (cc *CachingConnector) ReleaseConn(conn *grpc.ClientConn) {
 	// Safety check to see if the connector has been closed. This represents a
 	// bug in the calling code, but it's not good to panic here.
 	if cc.janitorDone == nil {
-		logger.Warn("Trying to release connection after connector closed")
+		logger.Debug("Trying to release connection after connector closed")
 
 		if conn.GetState() != connectivity.Shutdown {
-			logger.Warn("Connection is not shutdown, trying to close ...")
+			logger.Debug("Connection is not shutdown, trying to close ...")
 			if err := conn.Close(); err != nil {
-				logger.Warnf("conn close failed err %s", err)
+				logger.Debugf("conn close failed err %s", err)
 			}
 		}
 		return
@@ -293,12 +293,14 @@ func (cc *CachingConnector) ensureJanitorStarted() {
 // "connRemove" notifier is called.
 //
 // The caching connector:
-//    notifies the janitor of close by closing the "done" go channel.
+//
+//	notifies the janitor of close by closing the "done" go channel.
 //
 // The janitor:
-//    calls "connRemove" callback when closing a connection.
-//    decrements the "wg" waitgroup when exiting.
-//    writes to the "done" go channel when closing due to becoming empty.
+//
+//	calls "connRemove" callback when closing a connection.
+//	decrements the "wg" waitgroup when exiting.
+//	writes to the "done" go channel when closing due to becoming empty.
 func (cc *CachingConnector) janitor() {
 	logger.Debug("starting connection janitor")
 	defer cc.waitgroup.Done()

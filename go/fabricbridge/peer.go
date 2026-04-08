@@ -7,12 +7,16 @@ import (
 	"sync"
 	"time"
 
+	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel/invoke"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/common/discovery/staticdiscovery"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/core"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/core/config"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/fab/events/deliverclient"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/fabsdk"
+	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/fabsdk/provider/chpvdr"
 	"gopkg.in/yaml.v2"
 )
 
@@ -23,6 +27,89 @@ type PeerConnection struct {
 	channel string
 	config  Config
 	mu      sync.RWMutex
+}
+
+type peerSubmittedTransaction struct {
+	response      *channel.Response
+	waitForCommit func(ctx context.Context) (*CommitStatus, error)
+}
+
+type pendingPeerCommit struct {
+	eventService   fab.EventService
+	registration   fab.Registration
+	statusNotifier <-chan *fab.TxStatusEvent
+	closeFunc      func()
+	once           sync.Once
+}
+
+func (p *pendingPeerCommit) close() {
+	if p == nil || p.eventService == nil {
+		return
+	}
+
+	p.once.Do(func() {
+		p.eventService.Unregister(p.registration)
+		if p.closeFunc != nil {
+			p.closeFunc()
+		}
+	})
+}
+
+type legacyCommitMonitor struct {
+	txID   string
+	done   chan struct{}
+	status *CommitStatus
+	err    error
+}
+
+func newLegacyCommitMonitor(pc *PeerConnection, txID string, pending *pendingPeerCommit) *legacyCommitMonitor {
+	monitor := &legacyCommitMonitor{
+		txID: txID,
+		done: make(chan struct{}),
+	}
+
+	go func() {
+		defer close(monitor.done)
+		defer pending.close()
+		defer pc.Close()
+
+		txStatus, ok := <-pending.statusNotifier
+		if !ok {
+			monitor.err = &CommitError{
+				Message:       "transaction status notifier closed before commit event was received",
+				TransactionID: txID,
+			}
+			return
+		}
+
+		monitor.status = &CommitStatus{
+			BlockNumber:   txStatus.BlockNumber,
+			Status:        txStatus.TxValidationCode,
+			TransactionID: txID,
+		}
+
+		if txStatus.TxValidationCode != peerProto.TxValidationCode_VALID {
+			monitor.err = &CommitError{
+				Message:       "transaction committed with invalid validation code",
+				TransactionID: txID,
+				Status:        txStatus.TxValidationCode.String(),
+			}
+		}
+	}()
+
+	return monitor
+}
+
+func (m *legacyCommitMonitor) Wait(ctx context.Context) (*CommitStatus, error) {
+	select {
+	case <-m.done:
+		return m.status, m.err
+	case <-ctx.Done():
+		return nil, &CommitError{
+			Message:       fmt.Sprintf("wait for commit: %v", ctx.Err()),
+			TransactionID: m.txID,
+		}
+	}
 }
 
 // NewPeerConnection creates a new peer connection using fabric-sdk-go.
@@ -112,7 +199,7 @@ func (p *PeerConnection) Endorse(ctx context.Context, channelName string, chainc
 }
 
 // Query queries chaincode on specific peers (read-only, endorsement only)
-func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string) ([]byte, error) {
+func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string, transientData ...map[string][]byte) ([]byte, error) {
 	client, err := p.getChannelClient(channelName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get channel client: %w", err)
@@ -122,6 +209,10 @@ func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincod
 		ChaincodeID: chaincodeID,
 		Fcn:         fn,
 		Args:        args,
+	}
+
+	if len(transientData) > 0 && len(transientData[0]) > 0 {
+		req.TransientMap = transientData[0]
 	}
 
 	opts := []channel.RequestOption{
@@ -137,11 +228,17 @@ func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincod
 	return resp.Payload, nil
 }
 
-// SubmitAsync submits a transaction to the orderer without waiting for commit.
-func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string, transientData map[string][]byte) (*channel.Response, error) {
+// SubmitAsync submits a transaction to the orderer and returns a legacy commit waiter.
+func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string, transientData map[string][]byte) (*peerSubmittedTransaction, error) {
 	client, err := p.getChannelClient(channelName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get channel client: %w", err)
+	}
+
+	eventService, closeEventService, err := p.getTxStatusEventService(channelName)
+	if err != nil {
+		p.Close()
+		return nil, fmt.Errorf("failed to create tx status event service: %w", err)
 	}
 
 	req := channel.Request{
@@ -156,18 +253,36 @@ func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, ch
 		channel.WithParentContext(ctx),
 	}
 
+	submitHandler := &submitTxHandler{
+		eventService: eventService,
+		closeFunc:    closeEventService,
+	}
 	handler := invoke.NewSelectAndEndorseHandler(
 		invoke.NewEndorsementValidationHandler(
-			invoke.NewSignatureValidationHandler(&submitTxHandler{}),
+			invoke.NewSignatureValidationHandler(submitHandler),
 		),
 	)
 
 	resp, err := client.InvokeHandler(handler, req, opts...)
 	if err != nil {
+		if submitHandler.pending != nil {
+			submitHandler.pending.close()
+		}
+		p.Close()
 		return nil, fmt.Errorf("submit async failed: %w", err)
 	}
 
-	return &resp, nil
+	if submitHandler.pending == nil {
+		p.Close()
+		return nil, fmt.Errorf("submit async failed: commit event registration was not initialized")
+	}
+
+	monitor := newLegacyCommitMonitor(p, string(resp.TransactionID), submitHandler.pending)
+
+	return &peerSubmittedTransaction{
+		response:      &resp,
+		waitForCommit: monitor.Wait,
+	}, nil
 }
 
 // getChannelClient returns a channel client for the specified channel
@@ -182,6 +297,36 @@ func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, 
 	}
 
 	return client, nil
+}
+
+func (p *PeerConnection) getTxStatusEventService(channelName string) (fab.EventService, func(), error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithUser("BridgeUser"))
+	channelContext, err := channelProvider()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create channel context: %w", err)
+	}
+
+	chConfig, err := channelContext.ChannelService().ChannelConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get channel config: %w", err)
+	}
+
+	discoveryService, err := staticdiscovery.NewService(channelContext.EndpointConfig(), channelContext.InfraProvider(), channelName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create static discovery service: %w", err)
+	}
+
+	eventClientRef := chpvdr.NewEventClientRef(
+		p.config.Timeouts.Commit,
+		func() (fab.EventClient, error) {
+			return deliverclient.New(channelContext, chConfig, discoveryService)
+		},
+	)
+
+	return eventClientRef, eventClientRef.Close, nil
 }
 
 // buildConfigProvider creates a minimal connection profile for fabric-sdk-go.
@@ -252,22 +397,23 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 	if cfg.OrdererEndpoint != "" {
 		ordName = ordererName(cfg)
 		ordererURLOrder := ordererURL(cfg)
+		ordererTLSOptions := ordererTLSOptions(cfg)
 
 		ordererEntry := map[string]interface{}{
 			"url": ordererURLOrder,
 		}
 
 		ordererGrpcOptions := map[string]interface{}{}
-		if cfg.TLSOptions != nil && cfg.TLSOptions.SslTargetNameOverride != "" {
-			ordererGrpcOptions["ssl-target-name-override"] = cfg.TLSOptions.SslTargetNameOverride
+		if ordererTLSOptions != nil && ordererTLSOptions.SslTargetNameOverride != "" {
+			ordererGrpcOptions["ssl-target-name-override"] = ordererTLSOptions.SslTargetNameOverride
 		}
 		if len(ordererGrpcOptions) > 0 {
 			ordererEntry["grpcOptions"] = ordererGrpcOptions
 		}
 
-		if cfg.TLSOptions != nil && len(cfg.TLSOptions.TrustedRoots) > 0 {
+		if ordererTLSOptions != nil && len(ordererTLSOptions.TrustedRoots) > 0 {
 			ordererEntry["tlsCACerts"] = map[string]interface{}{
-				"pem": string(cfg.TLSOptions.TrustedRoots),
+				"pem": string(ordererTLSOptions.TrustedRoots),
 			}
 		}
 
@@ -306,7 +452,11 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 	return config.FromRaw(yamlBytes, "yaml")
 }
 
-type submitTxHandler struct{}
+type submitTxHandler struct {
+	eventService fab.EventService
+	closeFunc    func()
+	pending      *pendingPeerCommit
+}
 
 func (h *submitTxHandler) Handle(requestContext *invoke.RequestContext, clientContext *invoke.ClientContext) {
 	txnRequest := fab.TransactionRequest{
@@ -314,16 +464,38 @@ func (h *submitTxHandler) Handle(requestContext *invoke.RequestContext, clientCo
 		ProposalResponses: requestContext.Response.Responses,
 	}
 
+	txnID := string(requestContext.Response.TransactionID)
+
+	reg, statusNotifier, err := h.eventService.RegisterTxStatusEvent(txnID)
+	if err != nil {
+		if h.closeFunc != nil {
+			h.closeFunc()
+		}
+		requestContext.Error = fmt.Errorf("register tx status event failed: %w", err)
+		return
+	}
+
+	pending := &pendingPeerCommit{
+		eventService:   h.eventService,
+		registration:   reg,
+		statusNotifier: statusNotifier,
+		closeFunc:      h.closeFunc,
+	}
+
 	tx, err := clientContext.Transactor.CreateTransaction(txnRequest)
 	if err != nil {
+		pending.close()
 		requestContext.Error = fmt.Errorf("create transaction failed: %w", err)
 		return
 	}
 
 	if _, err := clientContext.Transactor.SendTransaction(tx); err != nil {
+		pending.close()
 		requestContext.Error = fmt.Errorf("send transaction failed: %w", err)
 		return
 	}
+
+	h.pending = pending
 }
 
 // peerName returns the logical name for the peer in the connection profile.
@@ -352,8 +524,8 @@ func peerURL(cfg Config) string {
 
 // ordererName returns the logical name for the orderer in the connection profile.
 func ordererName(cfg Config) string {
-	if cfg.TLSOptions != nil && cfg.TLSOptions.SslTargetNameOverride != "" {
-		return cfg.TLSOptions.SslTargetNameOverride
+	if ordererTLSOptions := ordererTLSOptions(cfg); ordererTLSOptions != nil && ordererTLSOptions.SslTargetNameOverride != "" {
+		return ordererTLSOptions.SslTargetNameOverride
 	}
 	return extractHost(cfg.OrdererEndpoint)
 }
@@ -361,7 +533,7 @@ func ordererName(cfg Config) string {
 // ordererURL returns the full URL for the orderer with protocol prefix.
 func ordererURL(cfg Config) string {
 	host := cfg.OrdererEndpoint
-	if cfg.TLSOptions != nil && len(cfg.TLSOptions.TrustedRoots) > 0 {
+	if ordererTLSOptions := ordererTLSOptions(cfg); ordererTLSOptions != nil && len(ordererTLSOptions.TrustedRoots) > 0 {
 		if !strings.HasPrefix(host, "grpcs://") && !strings.HasPrefix(host, "grpc://") {
 			return "grpcs://" + host
 		}
@@ -371,6 +543,14 @@ func ordererURL(cfg Config) string {
 		}
 	}
 	return host
+}
+
+func ordererTLSOptions(cfg Config) *TLSOptions {
+	if cfg.OrdererTLSOptions != nil {
+		return cfg.OrdererTLSOptions
+	}
+
+	return cfg.TLSOptions
 }
 
 // extractHost extracts the hostname from a host:port string

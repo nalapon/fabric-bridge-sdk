@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 
-	"google.golang.org/protobuf/proto"
 	cb "github.com/hyperledger/fabric-protos-go-apiv2/common"
 	ab "github.com/hyperledger/fabric-protos-go-apiv2/orderer"
 	pb "github.com/hyperledger/fabric-protos-go-apiv2/peer"
@@ -25,6 +24,9 @@ import (
 	clientdisp "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/fab/events/client/dispatcher"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	grpcCodes "google.golang.org/grpc/codes"
+	grpcStatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var logger = logging.NewLogger("fabsdk/fab")
@@ -132,6 +134,10 @@ func (c *DeliverConnection) Receive(eventch chan<- interface{}) {
 		}
 
 		if err != nil {
+			if status, ok := grpcStatus.FromError(err); ok && status.Code() == grpcCodes.Canceled {
+				logger.Debugf("Received canceled error from stream while closing connection: [%s]", err)
+				break
+			}
 			logger.Warnf("Received error from stream: [%s]. Sending disconnected event.", err)
 			eventch <- clientdisp.NewDisconnectedEvent(err)
 			break

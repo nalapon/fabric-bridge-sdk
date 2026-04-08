@@ -185,7 +185,7 @@ func (c *Client) close(stopHandler func()) {
 	err := <-errch
 
 	if err != nil {
-		logger.Warnf("Received error from disconnect request: %s", err)
+		logger.Debugf("Received error from disconnect request: %s", err)
 	} else {
 		logger.Debug("Received success from disconnect request")
 	}
@@ -263,7 +263,7 @@ func (c *Client) t(handlerImp handler, errch chan error) error {
 		select {
 		case disconnErr := <-errch:
 			if disconnErr != nil {
-				logger.Warnf("Received error from disconnect request: %s", disconnErr)
+				logger.Debugf("Received error from disconnect request: %s", disconnErr)
 			} else {
 				logger.Debug("Received success from disconnect request")
 			}

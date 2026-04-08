@@ -7,9 +7,6 @@ SPDX-License-Identifier: Apache-2.0
 package discovery
 
 import (
-	"reflect"
-	"strings"
-
 	discclient "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/internal/github.com/hyperledger/fabric/discovery/client"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 )
@@ -25,18 +22,10 @@ func GetProperties(endpoint *discclient.Peer) fab.Properties {
 		return nil
 	}
 
-	properties := make(fab.Properties)
-
-	val := reflect.ValueOf(stateInfo.Properties).Elem()
-
-	for i := 0; i < val.NumField(); i++ {
-		fType := val.Type().Field(i)
-
-		// Exclude protobuf fields
-		if !strings.HasPrefix(fType.Name, "XXX_") {
-			properties[fType.Name] = val.Field(i).Interface()
-		}
-	}
+	properties := make(fab.Properties, 3)
+	properties[fab.PropertyLedgerHeight] = stateInfo.Properties.LedgerHeight
+	properties[fab.PropertyChaincodes] = stateInfo.Properties.Chaincodes
+	properties[fab.PropertyLeftChannel] = stateInfo.Properties.LeftChannel
 
 	return properties
 }

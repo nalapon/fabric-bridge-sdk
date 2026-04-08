@@ -123,7 +123,7 @@ var (
 	}
 )
 
-//ConfigFromBackend returns endpoint config implementation for given backend
+// ConfigFromBackend returns endpoint config implementation for given backend
 func ConfigFromBackend(coreBackend ...core.ConfigBackend) (fab.EndpointConfig, error) {
 
 	config := &EndpointConfig{
@@ -161,7 +161,7 @@ type EndpointConfig struct {
 	defaultChannel           *fab.ChannelEndpointConfig
 }
 
-//endpointConfigEntity contains endpoint config elements needed by endpointconfig
+// endpointConfigEntity contains endpoint config elements needed by endpointconfig
 type endpointConfigEntity struct {
 	Client        ClientConfig
 	Channels      map[string]ChannelEndpointConfig
@@ -170,12 +170,12 @@ type endpointConfigEntity struct {
 	Peers         map[string]PeerConfig
 }
 
-//entityMatchers for endpoint configuration
+// entityMatchers for endpoint configuration
 type entityMatchers struct {
 	matchers map[string][]MatchConfig
 }
 
-//matcher entry mapping regex to match config
+// matcher entry mapping regex to match config
 type matcherEntry struct {
 	regex       *regexp.Regexp
 	matchConfig MatchConfig
@@ -1126,7 +1126,7 @@ func (c *EndpointConfig) loadDefaultPeer(configEntity *endpointConfigEntity) err
 	return nil
 }
 
-//loadAllTLSConfig pre-loads all network TLS Configs
+// loadAllTLSConfig pre-loads all network TLS Configs
 func (c *EndpointConfig) loadAllTLSConfig(configEntity *endpointConfigEntity) error {
 	//resolve path and load bytes
 	err := c.loadClientTLSConfig(configEntity)
@@ -1155,7 +1155,7 @@ func (c *EndpointConfig) loadAllTLSConfig(configEntity *endpointConfigEntity) er
 	return nil
 }
 
-//loadClientTLSConfig pre-loads all TLSConfig bytes in client config
+// loadClientTLSConfig pre-loads all TLSConfig bytes in client config
 func (c *EndpointConfig) loadClientTLSConfig(configEntity *endpointConfigEntity) error {
 	//Clients Config
 	//resolve paths and org name
@@ -1177,7 +1177,7 @@ func (c *EndpointConfig) loadClientTLSConfig(configEntity *endpointConfigEntity)
 	return nil
 }
 
-//loadOrgTLSConfig pre-loads all TLSConfig bytes in organizations
+// loadOrgTLSConfig pre-loads all TLSConfig bytes in organizations
 func (c *EndpointConfig) loadOrgTLSConfig(configEntity *endpointConfigEntity) error {
 
 	//Organizations Config
@@ -1204,7 +1204,7 @@ func (c *EndpointConfig) loadOrgTLSConfig(configEntity *endpointConfigEntity) er
 	return nil
 }
 
-//loadTLSConfig pre-loads all TLSConfig bytes in Orderer and Peer configs
+// loadTLSConfig pre-loads all TLSConfig bytes in Orderer and Peer configs
 func (c *EndpointConfig) loadOrdererPeerTLSConfig(configEntity *endpointConfigEntity) error {
 
 	//Orderers Config
@@ -1515,7 +1515,7 @@ func (c *EndpointConfig) matchPeer(peerSearchKey string, matcher matcherEntry) (
 	return matchedPeer, true
 }
 
-//getDefaultMatchingURL if search key is a URL then returns search key as URL otherwise returns empty
+// getDefaultMatchingURL if search key is a URL then returns search key as URL otherwise returns empty
 func (c *EndpointConfig) getDefaultMatchingURL(searchKey string) string {
 	if strings.Contains(searchKey, ":") {
 		return searchKey
@@ -1731,7 +1731,7 @@ func (c *EndpointConfig) loadTLSCerts() ([]*x509.Certificate, error) {
 	return certs, errs.ToError()
 }
 
-//ResetNetworkConfig clears network config cache
+// ResetNetworkConfig clears network config cache
 func (c *EndpointConfig) ResetNetworkConfig() error {
 	c.networkConfig = nil
 	return c.loadEndpointConfiguration()
@@ -1777,7 +1777,7 @@ func (c *EndpointConfig) findMatchingPeer(peerName string) (string, bool) {
 	return "", false
 }
 
-//regexMatchAndReplace if 'repl' has $ then perform regex.ReplaceAllString otherwise return 'repl'
+// regexMatchAndReplace if 'repl' has $ then perform regex.ReplaceAllString otherwise return 'repl'
 func (c *EndpointConfig) regexMatchAndReplace(regex *regexp.Regexp, src, repl string) string {
 	if strings.Contains(repl, "$") {
 		return regex.ReplaceAllString(src, repl)
@@ -1785,7 +1785,7 @@ func (c *EndpointConfig) regexMatchAndReplace(regex *regexp.Regexp, src, repl st
 	return repl
 }
 
-//peerChannelConfigHookFunc returns hook function for unmarshalling 'fab.PeerChannelConfig'
+// peerChannelConfigHookFunc returns hook function for unmarshalling 'fab.PeerChannelConfig'
 // Rule : default set to 'true' if not provided in config
 func peerChannelConfigHookFunc() mapstructure.DecodeHookFunc {
 	return func(
@@ -1825,7 +1825,7 @@ func peerChannelConfigHookFunc() mapstructure.DecodeHookFunc {
 	}
 }
 
-//setDefault sets default value provided to map if given key not found
+// setDefault sets default value provided to map if given key not found
 func setDefault(dataMap map[string]interface{}, key string, defaultVal interface{}) {
 	_, ok := dataMap[key]
 	if !ok {
@@ -1833,20 +1833,7 @@ func setDefault(dataMap map[string]interface{}, key string, defaultVal interface
 	}
 }
 
-//detectDeprecatedConfigOptions detects deprecated config options and prints warnings
+// detectDeprecatedConfigOptions detects deprecated config options and prints warnings
 // currently detects: if channels.orderers are defined
 func detectDeprecatedNetworkConfig(endpointConfig *EndpointConfig) {
-
-	if endpointConfig.networkConfig == nil {
-		return
-	}
-
-	//detect if channels orderers are mentioned
-	for _, v := range endpointConfig.networkConfig.Channels {
-		if len(v.Orderers) > 0 {
-			logger.Warn("Getting orderers from endpoint config channels.orderer is deprecated, use entity matchers to override orderer configuration")
-			logger.Warn("visit https://github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/blob/master/test/fixtures/config/overrides/local_entity_matchers.yaml for samples")
-			break
-		}
-	}
 }

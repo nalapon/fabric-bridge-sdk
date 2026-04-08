@@ -7,7 +7,6 @@ import (
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
 )
 
 // Network represents a Fabric channel and provides access to contracts
@@ -197,7 +196,7 @@ type CommitStatus struct {
 }
 
 // Transaction represents a prepared transaction with custom options.
-// Use SetEndorsingPeers to target specific peers (triggers sequential gateway→peer→gateway mode).
+// Use SetEndorsingPeers to target specific peers via the legacy peer path.
 type Transaction struct {
 	contract        *Contract
 	transactionName string
@@ -206,9 +205,6 @@ type Transaction struct {
 }
 
 // SetEndorsingPeers sets specific peers for endorsement (peer-targeting mode).
-// When set, the bridge will disconnect from the Gateway service, connect directly
-// to the specified peers via fabric-sdk-go, execute the transaction, and then
-// reconnect to the Gateway service.
 func (t *Transaction) SetEndorsingPeers(peers ...string) *Transaction {
 	t.endorsingPeers = peers
 	return t
@@ -248,8 +244,8 @@ func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*Submitt
 	return t.contract.submitAsync(ctx, t.transactionName, t.transientData, args...)
 }
 
-// submitAsyncWithPeerTargeting executes the sequential connection pattern for peer-targeted transactions.
-func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (result *SubmittedTransaction, err error) {
+// submitAsyncWithPeerTargeting executes a peer-targeted submit using the legacy SDK path.
+func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
 
 	if !bridge.config.HasPrivateKey() {
@@ -265,20 +261,10 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		}
 	}
 
-	bridge.modeMu.Lock()
-	defer bridge.modeMu.Unlock()
-
-	// Step 1-2: Disconnect gateway, connect peer
-	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
-		return nil, err
+	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	if err != nil {
+		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
-
-	// Step 4-5: Always restore gateway, even on error
-	defer func() {
-		if restoreErr := bridge.restoreGatewayMode(); restoreErr != nil && err == nil {
-			err = restoreErr
-		}
-	}()
 
 	// Convert args to byte arrays
 	byteArgs := make([][]byte, len(args))
@@ -286,9 +272,7 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		byteArgs[i] = []byte(arg)
 	}
 
-	var resp *channel.Response
-
-	resp, err = bridge.peerConnection.SubmitAsync(
+	submitted, err := pc.SubmitAsync(
 		ctx,
 		t.contract.network.channel,
 		t.contract.chaincodeName,
@@ -298,15 +282,14 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		t.transientData,
 	)
 	if err != nil {
+		pc.Close()
 		return nil, &SubmitError{Message: fmt.Sprintf("peer-targeted submit failed: %v", err)}
 	}
 
 	return &SubmittedTransaction{
-		transactionID: string(resp.TransactionID),
-		result:        resp.Payload,
-		waitForCommit: func(ctx context.Context) (*CommitStatus, error) {
-			return bridge.commitStatus(ctx, t.contract.network.channel, string(resp.TransactionID))
-		},
+		transactionID: string(submitted.response.TransactionID),
+		result:        submitted.response.Payload,
+		waitForCommit: submitted.waitForCommit,
 	}, nil
 }
 
@@ -319,8 +302,8 @@ func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, err
 	return t.contract.evaluate(ctx, t.transactionName, t.transientData, args...)
 }
 
-// evaluateWithPeerTargeting evaluates on specific peers using the sequential pattern
-func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) (result []byte, err error) {
+// evaluateWithPeerTargeting evaluates on specific peers using the legacy SDK path.
+func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) ([]byte, error) {
 	bridge := t.contract.network.bridge
 
 	if !bridge.config.HasPrivateKey() {
@@ -330,31 +313,25 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 		}
 	}
 
-	bridge.modeMu.Lock()
-	defer bridge.modeMu.Unlock()
-
-	if err := bridge.switchToPeerMode(t.contract.network.channel); err != nil {
-		return nil, err
+	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	if err != nil {
+		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
-
-	defer func() {
-		if restoreErr := bridge.restoreGatewayMode(); restoreErr != nil && err == nil {
-			err = restoreErr
-		}
-	}()
+	defer pc.Close()
 
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	result, err = bridge.peerConnection.Query(
+	result, err := pc.Query(
 		ctx,
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
 		t.endorsingPeers,
+		t.transientData,
 	)
 	if err != nil {
 		return nil, &EvaluationError{Message: fmt.Sprintf("peer-targeted query failed: %v", err)}

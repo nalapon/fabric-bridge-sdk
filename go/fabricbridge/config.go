@@ -53,13 +53,14 @@ var DefaultTimeouts = TimeoutConfig{
 
 // Config for the bridge connection
 type Config struct {
-	GatewayPeer     string
-	Identity        Identity
-	Signer          Signer
-	TLSOptions      *TLSOptions
-	Discovery       bool
-	Timeouts        TimeoutConfig
-	OrdererEndpoint string // Optional: orderer endpoint for commit in peer mode (e.g., "orderer.example.com:7050")
+	GatewayPeer       string
+	Identity          Identity
+	Signer            Signer
+	TLSOptions        *TLSOptions
+	OrdererTLSOptions *TLSOptions
+	Discovery         bool
+	Timeouts          TimeoutConfig
+	OrdererEndpoint   string // Optional: orderer endpoint for commit in peer mode (e.g., "orderer.example.com:7050")
 }
 
 // Option configures a Config
@@ -86,6 +87,16 @@ func WithTLS(opts TLSOptions) Option {
 			opts.Verify = true
 		}
 		c.TLSOptions = &opts
+	}
+}
+
+// WithOrdererTLS sets dedicated TLS options for the orderer used in peer mode.
+func WithOrdererTLS(opts TLSOptions) Option {
+	return func(c *Config) {
+		if len(opts.TrustedRoots) > 0 && !opts.AllowInsecureTLS {
+			opts.Verify = true
+		}
+		c.OrdererTLSOptions = &opts
 	}
 }
 
@@ -135,6 +146,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("tlsOptions.TrustedRoots is invalid: %w", err)
 		}
 	}
+	if c.OrdererTLSOptions != nil && len(c.OrdererTLSOptions.TrustedRoots) > 0 {
+		if _, err := createCertPool(c.OrdererTLSOptions.TrustedRoots); err != nil {
+			return fmt.Errorf("ordererTlsOptions.TrustedRoots is invalid: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -162,6 +178,13 @@ func (c Config) normalized() Config {
 			tlsOptions.Verify = true
 		}
 		out.TLSOptions = &tlsOptions
+	}
+	if out.OrdererTLSOptions != nil {
+		ordererTLSOptions := *out.OrdererTLSOptions
+		if len(ordererTLSOptions.TrustedRoots) > 0 && !ordererTLSOptions.AllowInsecureTLS {
+			ordererTLSOptions.Verify = true
+		}
+		out.OrdererTLSOptions = &ordererTLSOptions
 	}
 
 	return out

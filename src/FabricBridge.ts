@@ -6,13 +6,15 @@ import { DiscoveryCache } from "./cache/DiscoveryCache";
 import type { BridgeConfig, TimeoutConfig } from "./types/config";
 import { DEFAULT_TIMEOUTS } from "./types/config";
 import type {
+  BridgeCommitResult,
   BridgeNetwork,
   BridgeContract,
   BridgeTransaction,
   BridgeResult,
   BridgeSubmittedTx,
+  CommitStatus,
 } from "./types/bridge";
-import { ConfigurationError, TimeoutError, NotConnectedError } from "./errors/index";
+import { ConfigurationError, EvaluationError, NotConnectedError, SubmitError, TimeoutError } from "./errors/index";
 import { Result } from "better-result";
 import { log } from "./utils/logger";
 
@@ -118,6 +120,20 @@ export class FabricBridge {
     this.isConnected = false;
   }
 
+  async waitForCommit(
+    channelName: string,
+    transactionId: string,
+  ): Promise<BridgeResult<CommitStatus>> {
+    if (!this.gatewayConnection) {
+      return Result.err(new NotConnectedError({
+        component: 'FabricBridge',
+        action: 'wait for commit',
+      }));
+    }
+
+    return this.gatewayConnection.getCommitStatus(channelName, transactionId);
+  }
+
   async getNetwork(channelName: string): Promise<Result<BridgeNetwork, NotConnectedError>> {
     if (!this.isConnected || !this.config || !this.gatewayConnection || !this.peerConnection) {
       log().error('FabricBridge.getNetwork() - No conectado');
@@ -211,27 +227,37 @@ class BridgeContractImpl implements BridgeContract {
     return this.chaincodeName;
   }
 
-  async submitTransaction(
+  async Submit(
+    name: string,
+    ...args: unknown[]
+  ): Promise<BridgeResult<BridgeCommitResult>> {
+    const gatewayContract = await this.gatewayNetwork.getContract(
+      this.chaincodeName,
+    );
+    return gatewayContract.Submit(name, ...args);
+  }
+
+  async SubmitAsync(
+    name: string,
+    ...args: unknown[]
+  ): Promise<BridgeResult<BridgeSubmittedTx>> {
+    const gatewayContract = await this.gatewayNetwork.getContract(
+      this.chaincodeName,
+    );
+    return gatewayContract.SubmitAsync(name, ...args);
+  }
+
+  async Evaluate(
     name: string,
     ...args: unknown[]
   ): Promise<BridgeResult<Buffer>> {
     const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
     );
-    return gatewayContract.submitTransaction(name, ...args);
+    return gatewayContract.Evaluate(name, ...args);
   }
 
-  async evaluateTransaction(
-    name: string,
-    ...args: unknown[]
-  ): Promise<BridgeResult<Buffer>> {
-    const gatewayContract = await this.gatewayNetwork.getContract(
-      this.chaincodeName,
-    );
-    return gatewayContract.evaluateTransaction(name, ...args);
-  }
-
-  createTransaction(name: string): BridgeTransaction {
+  Transaction(name: string): BridgeTransaction {
     return new BridgeTransactionImpl(
       name,
       this.chaincodeName,
@@ -242,6 +268,24 @@ class BridgeContractImpl implements BridgeContract {
       this.discoveryCache,
       this.fabricBridge,
     );
+  }
+
+  async submitTransaction(
+    name: string,
+    ...args: unknown[]
+  ): Promise<BridgeResult<BridgeCommitResult>> {
+    return this.Submit(name, ...args);
+  }
+
+  async evaluateTransaction(
+    name: string,
+    ...args: unknown[]
+  ): Promise<BridgeResult<Buffer>> {
+    return this.Evaluate(name, ...args);
+  }
+
+  createTransaction(name: string): BridgeTransaction {
+    return this.Transaction(name);
   }
 }
 
@@ -286,95 +330,271 @@ class BridgeTransactionImpl implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  setEndorsingPeers(peerNames: string[]): BridgeTransaction {
+  SetEndorsingPeers(peerNames: string[]): BridgeTransaction {
     this.endorsingPeerNames = peerNames;
     this.usePeerMode = true;
     return this;
   }
 
-  setTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
-    this.transientData = transientData;
+  setEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    return this.SetEndorsingPeers(peerNames);
+  }
+
+  SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
+    this.transientData = copyTransientData(transientData);
     return this;
   }
 
-  async submit(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
+  setTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
+    return this.SetTransientData(transientData);
+  }
+
+  async Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
+    const submitted = await this.SubmitAsync(...args);
+    if (!submitted.isOk()) {
+      return Result.err(submitted.error);
+    }
+
+    const commitStatus = await submitted.value.WaitForCommit();
+    if (!commitStatus.isOk()) {
+      return Result.err(commitStatus.error);
+    }
+
+    return Result.ok(new BridgeCommitResultImpl(submitted.value, commitStatus.value));
+  }
+
+  async submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
+    return this.Submit(...args);
+  }
+
+  async SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
     if (this.usePeerMode) {
       if (!this.config.identity.privateKey) {
         return Result.err(new ConfigurationError({
-          message: 'identity.privateKey is required for setEndorsingPeers()',
+          message: 'identity.privateKey is required for SetEndorsingPeers()',
           field: 'identity.privateKey',
         }));
       }
 
-      const switchResult = await this.fabricBridge.switchToPeerMode();
-      if (!switchResult.isOk()) {
-        return Result.err(switchResult.error);
+      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
+      const connectResult = await peerConnection.connect();
+      if (!connectResult.isOk()) {
+        return Result.err(connectResult.error);
       }
 
       try {
-        log().debug('BridgeTransactionImpl.submit() - switching to peer mode for:', this.chaincodeName);
-        
+        log().debug('BridgeTransactionImpl.SubmitAsync() - using dedicated peer connection for:', this.chaincodeName);
+
         const peerNetwork = new PeerNetwork(
-          this.peerConnection.getGateway(),
+          peerConnection.getGateway(),
           this.channelName,
           this.config,
-          this.peerConnection,
+          peerConnection,
           this.discoveryCache,
         );
 
-        log().debug('BridgeTransactionImpl.submit() - calling peerNetwork.getContract():', this.chaincodeName);
+        log().debug('BridgeTransactionImpl.SubmitAsync() - calling peerNetwork.getContract():', this.chaincodeName);
         const peerContract = await peerNetwork.getContract(
           this.chaincodeName,
         );
 
-        const tx = peerContract.createTransaction(this.name);
+        const tx = peerContract.Transaction(this.name);
 
         if (Object.keys(this.transientData).length > 0) {
-          tx.setTransientData(this.transientData);
+          tx.SetTransientData(this.transientData);
         }
 
-        tx.setEndorsingPeers(this.endorsingPeerNames);
+        tx.SetEndorsingPeers(this.endorsingPeerNames);
 
-        const result = await tx.submit(...args);
-        return result;
-      } finally {
-        await this.fabricBridge.restoreGatewayMode();
+        const submittedResult = await tx.SubmitAsync(...args);
+        if (!submittedResult.isOk()) {
+          await peerConnection.disconnect();
+          return Result.err(submittedResult.error);
+        }
+
+        const commitPromise = submittedResult.value.WaitForCommit()
+          .finally(async () => {
+            await peerConnection.disconnect();
+          });
+        void commitPromise.catch(() => undefined);
+
+        return Result.ok(new DeferredSubmittedTransaction(
+          submittedResult.value.Result(),
+          submittedResult.value.TransactionID(),
+          () => commitPromise,
+        ));
+      } catch (error) {
+        await peerConnection.disconnect();
+        return Result.err(new SubmitError({
+          message: error instanceof Error ? error.message : String(error),
+        }));
       }
-    } else {
-      const gatewayContract = await this.gatewayNetwork.getContract(
-        this.chaincodeName,
-      );
-      const tx = gatewayContract.createTransaction(this.name);
-
-      if (Object.keys(this.transientData).length > 0) {
-        tx.setTransientData(this.transientData);
-      }
-
-      return tx.submit(...args);
     }
-  }
 
-  async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
     const gatewayContract = await this.gatewayNetwork.getContract(
       this.chaincodeName,
     );
-    const tx = gatewayContract.createTransaction(this.name);
+    const tx = gatewayContract.Transaction(this.name);
 
     if (Object.keys(this.transientData).length > 0) {
-      tx.setTransientData(this.transientData);
+      tx.SetTransientData(this.transientData);
     }
 
-    return tx.evaluate(...args);
+    return tx.SubmitAsync(...args);
+  }
+
+  async submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
+    return this.SubmitAsync(...args);
+  }
+
+  async Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
+    if (this.usePeerMode) {
+      if (!this.config.identity.privateKey) {
+        return Result.err(new ConfigurationError({
+          message: 'identity.privateKey is required for SetEndorsingPeers()',
+          field: 'identity.privateKey',
+        }));
+      }
+
+      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
+      const connectResult = await peerConnection.connect();
+      if (!connectResult.isOk()) {
+        return Result.err(connectResult.error);
+      }
+
+      try {
+        const peerNetwork = new PeerNetwork(
+          peerConnection.getGateway(),
+          this.channelName,
+          this.config,
+          peerConnection,
+          this.discoveryCache,
+        );
+
+        const peerContract = await peerNetwork.getContract(this.chaincodeName);
+        const tx = peerContract.Transaction(this.name);
+
+        if (Object.keys(this.transientData).length > 0) {
+          tx.SetTransientData(this.transientData);
+        }
+
+        tx.SetEndorsingPeers(this.endorsingPeerNames);
+        return await tx.Evaluate(...args);
+      } finally {
+        await peerConnection.disconnect();
+      }
+    }
+
+    const gatewayContract = await this.gatewayNetwork.getContract(
+      this.chaincodeName,
+    );
+    const tx = gatewayContract.Transaction(this.name);
+
+    if (Object.keys(this.transientData).length > 0) {
+      tx.SetTransientData(this.transientData);
+    }
+
+    return tx.Evaluate(...args);
+  }
+
+  async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
+    return this.Evaluate(...args);
+  }
+}
+
+class BridgeCommitResultImpl implements BridgeCommitResult {
+  private submitted: BridgeSubmittedTx;
+  private commitStatus: CommitStatus;
+
+  constructor(submitted: BridgeSubmittedTx, commitStatus: CommitStatus) {
+    this.submitted = submitted;
+    this.commitStatus = commitStatus;
+  }
+
+  Result(): Buffer {
+    return this.submitted.Result();
+  }
+
+  getResult(): Buffer {
+    return this.Result();
+  }
+
+  TransactionID(): string {
+    return this.submitted.TransactionID();
+  }
+
+  getTransactionId(): string {
+    return this.TransactionID();
+  }
+
+  CommitStatus(): CommitStatus {
+    return this.commitStatus;
+  }
+
+  getCommitStatus(): CommitStatus {
+    return this.CommitStatus();
+  }
+}
+
+class DeferredSubmittedTransaction implements BridgeSubmittedTx {
+  private result: Buffer;
+  private transactionId: string;
+  private waitForCommitFn: () => Promise<BridgeResult<CommitStatus>>;
+
+  constructor(
+    result: Buffer,
+    transactionId: string,
+    waitForCommitFn: () => Promise<BridgeResult<CommitStatus>>,
+  ) {
+    this.result = result;
+    this.transactionId = transactionId;
+    this.waitForCommitFn = waitForCommitFn;
+  }
+
+  Result(): Buffer {
+    return this.result;
+  }
+
+  getResult(): Buffer {
+    return this.Result();
+  }
+
+  TransactionID(): string {
+    return this.transactionId;
+  }
+
+  getTransactionId(): string {
+    return this.TransactionID();
+  }
+
+  async WaitForCommit(): Promise<BridgeResult<CommitStatus>> {
+    return this.waitForCommitFn();
+  }
+
+  async waitForCommit(): Promise<BridgeResult<CommitStatus>> {
+    return this.WaitForCommit();
+  }
+
+  async getStatus(): Promise<BridgeResult<CommitStatus>> {
+    return this.WaitForCommit();
   }
 }
 
 // Re-export types
 export type { BridgeConfig, TimeoutConfig } from "./types/config";
 export type {
+  BridgeCommitResult,
   BridgeNetwork,
   BridgeContract,
   BridgeTransaction,
   BridgeResult,
   BridgeSubmittedTx,
+  CommitStatus,
 } from "./types/bridge";
 export * from "./errors/index";
+
+function copyTransientData(input: Record<string, Buffer>): Record<string, Buffer> {
+  return Object.fromEntries(
+    Object.entries(input).map(([key, value]) => [key, Buffer.from(value)]),
+  );
+}
