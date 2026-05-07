@@ -9,6 +9,7 @@ import type {
   ConfigurationError,
   TimeoutError,
   NotConnectedError,
+  SinglePeerExecutionError,
 } from '../errors/index';
 
 export type BridgeError =
@@ -20,7 +21,8 @@ export type BridgeError =
   | EvaluationError
   | ConfigurationError
   | TimeoutError
-  | NotConnectedError;
+  | NotConnectedError
+  | SinglePeerExecutionError;
 
 export type BridgeResult<T> = Result<T, BridgeError>;
 
@@ -45,17 +47,27 @@ export interface BridgeTransaction {
   getName(): string;
   getChaincodeName(): string;
 
-  SetEndorsingPeers(peerNames: string[]): BridgeTransaction;
+  UseSinglePeer(options?: SinglePeerOptions): BridgeTransaction;
+  UseEndorsingPeers(peerNames: string[]): BridgeTransaction;
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
   Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
 
-  setEndorsingPeers(peerNames: string[]): BridgeTransaction;
+  useSinglePeer(options?: SinglePeerOptions): BridgeTransaction;
+  useEndorsingPeers(peerNames: string[]): BridgeTransaction;
   setTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
   submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
+}
+
+export type PeerSelectionPolicy = 'round-robin' | 'random';
+
+export interface SinglePeerOptions {
+  candidates?: string[];
+  policy?: PeerSelectionPolicy;
+  failover?: boolean;
 }
 
 export interface BridgeCommitResult {

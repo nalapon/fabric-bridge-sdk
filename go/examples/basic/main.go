@@ -99,7 +99,9 @@ func main() {
 	//   4. Disconnect from peers
 	//   5. Reconnect to Gateway service
 	txBuilder := contract.Transaction("CreateAsset")
-	txBuilder.SetEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com")
+	txBuilder.UseSinglePeer(
+		fabricbridge.WithCandidatePeers("peer0.org1.example.com", "peer0.org2.example.com"),
+	)
 	txBuilder.SetTransientData(map[string][]byte{
 		"privateData": []byte("secret"),
 	})
@@ -111,7 +113,7 @@ func main() {
 
 	// Example 3: Evaluate with peer targeting
 	// queryBuilder := contract.Transaction("ReadAsset")
-	// queryBuilder.SetEndorsingPeers("peer0.org1.example.com")
+	// queryBuilder.UseSinglePeer(fabricbridge.WithCandidatePeers("peer0.org1.example.com"))
 	// result, err := queryBuilder.Evaluate(ctx, "asset1")
 	// if err != nil {
 	//     log.Fatalf("Peer-targeted query failed: %v", err)

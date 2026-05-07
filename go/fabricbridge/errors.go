@@ -122,6 +122,31 @@ func (e *PeerNotFoundError) Error() string {
 	return fmt.Sprintf("peer %s not found", e.PeerName)
 }
 
+// SinglePeerAttempt describes one failed single-peer execution attempt.
+type SinglePeerAttempt struct {
+	Peer  string
+	Cause string
+}
+
+// SinglePeerExecutionError is returned after all eligible single-peer targets fail.
+type SinglePeerExecutionError struct {
+	Message         string
+	Operation       string
+	Channel         string
+	Chaincode       string
+	TransactionName string
+	Candidates      []string
+	EligiblePeers   []string
+	Attempts        []SinglePeerAttempt
+}
+
+func (e *SinglePeerExecutionError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("single-peer transaction failed after trying %d eligible peer(s)", len(e.Attempts))
+}
+
 // TimeoutError is returned when an operation times out
 type TimeoutError struct {
 	Operation string

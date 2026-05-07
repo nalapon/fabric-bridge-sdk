@@ -15,6 +15,17 @@ export class PeerNotFoundError extends TaggedError('PeerNotFoundError')<{
   availablePeers: string[];
 }>() {}
 
+export class SinglePeerExecutionError extends TaggedError('SinglePeerExecutionError')<{
+  message: string;
+  operation: string;
+  channel: string;
+  chaincode: string;
+  transaction: string;
+  candidates?: string[];
+  eligiblePeers: string[];
+  attempts: Array<{ peer: string; cause: string }>;
+}>() {}
+
 export class SubmitError extends TaggedError('SubmitError')<{
   message: string;
   transactionId?: string;

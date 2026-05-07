@@ -9,6 +9,7 @@ import type {
   BridgeSubmittedTx,
   BridgeTransaction,
   CommitStatus,
+  SinglePeerOptions,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
 import type { DiscoveryResult } from '../types/discovery';
@@ -18,6 +19,7 @@ import {
   EndorsementError,
   EvaluationError,
   PeerNotFoundError,
+  SinglePeerExecutionError,
   SubmitError,
   TimeoutError,
 } from '../errors/index';
@@ -25,6 +27,7 @@ import { DEFAULT_TIMEOUTS } from '../types/config';
 import { PeerConnection } from './PeerConnection';
 import { DiscoveryCache } from '../cache/DiscoveryCache';
 import { log } from '../utils/logger';
+import { isFailoverEligibleError, selectSinglePeers } from './peerSelection';
 
 export class PeerNetwork implements BridgeNetwork {
   private gateway: fabricNetwork.Gateway;
@@ -142,6 +145,7 @@ class PeerTransaction implements BridgeTransaction {
   private discoveryCache: DiscoveryCache;
   private channelName: string;
   private endorsingPeerNames: string[] = [];
+  private singlePeerOptions: SinglePeerOptions | null = null;
   private transientData: Record<string, Buffer> = {};
 
   constructor(
@@ -170,13 +174,24 @@ class PeerTransaction implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  SetEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    this.endorsingPeerNames = [...peerNames];
+  UseSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+    this.singlePeerOptions = { failover: true, ...options };
+    this.endorsingPeerNames = [];
     return this;
   }
 
-  setEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    return this.SetEndorsingPeers(peerNames);
+  useSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+    return this.UseSinglePeer(options);
+  }
+
+  UseEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    this.endorsingPeerNames = [...peerNames];
+    this.singlePeerOptions = null;
+    return this;
+  }
+
+  useEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    return this.UseEndorsingPeers(peerNames);
   }
 
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
@@ -213,8 +228,9 @@ class PeerTransaction implements BridgeTransaction {
 
     return Result.tryPromise({
       try: async () => {
-        const transaction = await this.createPreparedTransaction();
-        const submitted = await this.submitAsyncInternal(transaction, stringArgs);
+        const submitted = this.singlePeerOptions
+          ? await this.submitAsyncSinglePeer(stringArgs)
+          : await this.submitAsyncInternal(await this.createPreparedTransaction(), stringArgs);
         return new PeerSubmittedTx(
           submitted.result,
           submitted.transactionId,
@@ -233,10 +249,19 @@ class PeerTransaction implements BridgeTransaction {
     const stringArgs = normalizeArgs(args);
 
     try {
-      const transaction = await this.createPreparedTransaction();
-      const result = await transaction.evaluate(...stringArgs);
+      const result = this.singlePeerOptions
+        ? await this.evaluateSinglePeer(stringArgs)
+        : await (await this.createPreparedTransaction()).evaluate(...stringArgs);
       return Result.ok(Buffer.from(result));
     } catch (error) {
+      if (
+        error instanceof SinglePeerExecutionError ||
+        error instanceof PeerNotFoundError ||
+        error instanceof DiscoveryError ||
+        error instanceof TimeoutError
+      ) {
+        return Result.err(error);
+      }
       return Result.err(
         new EvaluationError({
           message: (error as Error).message,
@@ -276,6 +301,123 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return transaction;
+  }
+
+  private async createPreparedTransactionForPeers(peers: any[]): Promise<fabricNetwork.Transaction> {
+    const transaction = this.contract.createTransaction(this.name);
+
+    if (Object.keys(this.transientData).length > 0) {
+      transaction.setTransient(copyTransientData(this.transientData));
+    }
+
+    if (peers.length > 0) {
+      transaction.setEndorsingPeers(peers);
+    }
+
+    return transaction;
+  }
+
+  private async resolveSinglePeerEndorsers(): Promise<Array<{ peerName: string; endorser: any }>> {
+    const discoveryResult = await this.ensureDiscovery();
+    if (!discoveryResult.isOk()) {
+      throw discoveryResult.error;
+    }
+
+    const selection = selectSinglePeers(
+      discoveryResult.value,
+      this.peerConnection,
+      this.discoveryCache,
+      this.singlePeerOptions ?? undefined,
+    );
+
+    const endorsers = this.matchPeerInfosToEndorsers(discoveryResult.value, selection.orderedPeers);
+    if (!endorsers.isOk()) {
+      throw endorsers.error;
+    }
+
+    return endorsers.value;
+  }
+
+  private async submitAsyncSinglePeer(stringArgs: string[]): Promise<{
+    result: Buffer;
+    transactionId: string;
+    waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
+  }> {
+    const peers = await this.resolveSinglePeerEndorsers();
+    const attempts: Array<{ peer: string; cause: string }> = [];
+    const failover = this.singlePeerOptions?.failover ?? true;
+    const peersToTry = failover ? peers : peers.slice(0, 1);
+
+    for (let index = 0; index < peersToTry.length; index += 1) {
+      const selected = peersToTry[index]!;
+      try {
+        const transaction = await this.createPreparedTransactionForPeers([selected.endorser]);
+        return await this.submitAsyncInternal(transaction, stringArgs);
+      } catch (error) {
+        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error) });
+        if (!isFailoverEligibleError(error)) {
+          throw error;
+        }
+        if (!failover || index === peersToTry.length - 1) {
+          throw this.singlePeerExecutionError('submitAsync', peers, attempts);
+        }
+
+        const next = peersToTry[index + 1]!;
+        log().warn('fabric_bridge.single_peer.failover', {
+          event: 'fabric_bridge.single_peer.failover',
+          operation: 'submitAsync',
+          channel: this.channelName,
+          chaincode: this.chaincodeName,
+          transaction: this.name,
+          failedPeer: selected.peerName,
+          nextPeer: next.peerName,
+          attempt: index + 1,
+          maxAttempts: peersToTry.length,
+          reason: attempts[attempts.length - 1]?.cause,
+        });
+      }
+    }
+
+    throw this.singlePeerExecutionError('submitAsync', peers, attempts);
+  }
+
+  private async evaluateSinglePeer(stringArgs: string[]): Promise<Buffer> {
+    const peers = await this.resolveSinglePeerEndorsers();
+    const attempts: Array<{ peer: string; cause: string }> = [];
+    const failover = this.singlePeerOptions?.failover ?? true;
+    const peersToTry = failover ? peers : peers.slice(0, 1);
+
+    for (let index = 0; index < peersToTry.length; index += 1) {
+      const selected = peersToTry[index]!;
+      try {
+        const transaction = await this.createPreparedTransactionForPeers([selected.endorser]);
+        return Buffer.from(await transaction.evaluate(...stringArgs));
+      } catch (error) {
+        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error) });
+        if (!isFailoverEligibleError(error)) {
+          throw error;
+        }
+        if (!failover || index === peersToTry.length - 1) {
+          throw this.singlePeerExecutionError('evaluate', peers, attempts);
+        }
+
+        const next = peersToTry[index + 1]!;
+        log().warn('fabric_bridge.single_peer.failover', {
+          event: 'fabric_bridge.single_peer.failover',
+          operation: 'evaluate',
+          channel: this.channelName,
+          chaincode: this.chaincodeName,
+          transaction: this.name,
+          failedPeer: selected.peerName,
+          nextPeer: next.peerName,
+          attempt: index + 1,
+          maxAttempts: peersToTry.length,
+          reason: attempts[attempts.length - 1]?.cause,
+        });
+      }
+    }
+
+    throw this.singlePeerExecutionError('evaluate', peers, attempts);
   }
 
   private async submitAsyncInternal(transaction: fabricNetwork.Transaction, stringArgs: string[]): Promise<{
@@ -537,6 +679,63 @@ class PeerTransaction implements BridgeTransaction {
     return Result.ok(endorsers);
   }
 
+  private matchPeerInfosToEndorsers(
+    discovery: DiscoveryResult,
+    peers: Array<{ name: string; endpoint: string }>,
+  ): Result<Array<{ peerName: string; endorser: any }>, PeerNotFoundError> {
+    const endorsers: Array<{ peerName: string; endorser: any }> = [];
+    const notFound: string[] = [];
+    const availablePeers = Array.from(discovery.peers.keys());
+    const network = (this.contract as any).network;
+    const channel = network?.getChannel?.() || (network as any)?.channel;
+
+    if (!channel) {
+      return Result.err(new PeerNotFoundError({
+        peerName: peers.map((peer) => peer.name).join(', '),
+        availablePeers,
+      }));
+    }
+
+    const allEndorsers = channel.getEndorsers?.() || [];
+    for (const peer of peers) {
+      const endorser = channel.getEndorser?.(peer.endpoint) ??
+        allEndorsers.find((candidate: { name?: string }) =>
+          candidate.name?.includes(peer.name) || peer.name.includes(candidate.name || ''),
+        );
+      if (endorser) {
+        endorsers.push({ peerName: peer.name, endorser });
+      } else {
+        notFound.push(peer.name);
+      }
+    }
+
+    if (notFound.length > 0) {
+      return Result.err(new PeerNotFoundError({
+        peerName: notFound.join(', '),
+        availablePeers,
+      }));
+    }
+
+    return Result.ok(endorsers);
+  }
+
+  private singlePeerExecutionError(
+    operation: string,
+    eligiblePeers: Array<{ peerName: string }>,
+    attempts: Array<{ peer: string; cause: string }>,
+  ): SinglePeerExecutionError {
+    return new SinglePeerExecutionError({
+      message: `single-peer transaction failed after trying ${attempts.length} eligible peer(s)`,
+      operation,
+      channel: this.channelName,
+      chaincode: this.chaincodeName,
+      transaction: this.name,
+      candidates: this.singlePeerOptions?.candidates,
+      eligiblePeers: eligiblePeers.map((peer) => peer.peerName),
+      attempts,
+    });
+  }
+
   private getResponsePayload(proposalResponse: any): Buffer {
     const validEndorsementResponse = proposalResponse.responses.find(
       (endorsementResponse: { endorsement?: unknown }) => endorsementResponse.endorsement,
@@ -569,8 +768,15 @@ class PeerTransaction implements BridgeTransaction {
     return asBuffer(payload);
   }
 
-  private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError {
-    if (error instanceof EndorsementError || error instanceof SubmitError || error instanceof TimeoutError) {
+  private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError | SinglePeerExecutionError | PeerNotFoundError | DiscoveryError {
+    if (
+      error instanceof EndorsementError ||
+      error instanceof SubmitError ||
+      error instanceof TimeoutError ||
+      error instanceof SinglePeerExecutionError ||
+      error instanceof PeerNotFoundError ||
+      error instanceof DiscoveryError
+    ) {
       return error;
     }
 

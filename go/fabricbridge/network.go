@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 )
 
 // Network represents a Fabric channel and provides access to contracts
@@ -196,17 +198,27 @@ type CommitStatus struct {
 }
 
 // Transaction represents a prepared transaction with custom options.
-// Use SetEndorsingPeers to target specific peers via the legacy peer path.
+// Use UseSinglePeer or UseEndorsingPeers to target peers via the legacy peer path.
 type Transaction struct {
 	contract        *Contract
 	transactionName string
 	endorsingPeers  []string
+	singlePeer      *singlePeerOptions
 	transientData   map[string][]byte
 }
 
-// SetEndorsingPeers sets specific peers for endorsement (peer-targeting mode).
-func (t *Transaction) SetEndorsingPeers(peers ...string) *Transaction {
+// UseEndorsingPeers sends proposals to every named peer (peer-targeting mode).
+func (t *Transaction) UseEndorsingPeers(peers ...string) *Transaction {
 	t.endorsingPeers = peers
+	t.singlePeer = nil
+	return t
+}
+
+// UseSinglePeer chooses one discovered peer per attempt.
+func (t *Transaction) UseSinglePeer(opts ...SinglePeerOption) *Transaction {
+	options := defaultSinglePeerOptions(opts)
+	t.singlePeer = &options
+	t.endorsingPeers = nil
 	return t
 }
 
@@ -237,6 +249,9 @@ func (t *Transaction) Submit(ctx context.Context, args ...string) (*CommitResult
 
 // SubmitAsync executes the transaction without waiting for commit.
 func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*SubmittedTransaction, error) {
+	if t.singlePeer != nil {
+		return t.submitAsyncWithSinglePeer(ctx, args)
+	}
 	if len(t.endorsingPeers) > 0 {
 		return t.submitAsyncWithPeerTargeting(ctx, args)
 	}
@@ -251,7 +266,7 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 	if !bridge.config.HasPrivateKey() {
 		return nil, &ConfigurationError{
 			Field:   "identity.privateKey",
-			Message: "privateKey is required for peer-targeted transactions (setEndorsingPeers)",
+			Message: "privateKey is required for UseEndorsingPeers",
 		}
 	}
 	if bridge.config.OrdererEndpoint == "" {
@@ -295,11 +310,161 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 
 // Evaluate executes the transaction as a query with peer targeting if configured
 func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, error) {
+	if t.singlePeer != nil {
+		return t.evaluateWithSinglePeer(ctx, args)
+	}
 	if len(t.endorsingPeers) > 0 {
 		return t.evaluateWithPeerTargeting(ctx, args)
 	}
 
 	return t.contract.evaluate(ctx, t.transactionName, t.transientData, args...)
+}
+
+func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []string) (*SubmittedTransaction, error) {
+	bridge := t.contract.network.bridge
+
+	if !bridge.config.HasPrivateKey() {
+		return nil, &ConfigurationError{
+			Field:   "identity.privateKey",
+			Message: "privateKey is required for UseSinglePeer",
+		}
+	}
+	if bridge.config.OrdererEndpoint == "" {
+		return nil, &ConfigurationError{
+			Field:   "ordererEndpoint",
+			Message: "ordererEndpoint is required for Submit and SubmitAsync when UseSinglePeer is enabled",
+		}
+	}
+
+	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	if err != nil {
+		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
+	}
+	defer func() {
+		// SubmitAsync success transfers ownership to the commit monitor.
+	}()
+
+	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
+	if err != nil {
+		pc.Close()
+		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
+	}
+	eligible, err := resolveSinglePeerCandidates(discovered, t.singlePeer.candidates)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, *t.singlePeer, bridge.roundRobin)
+	if !t.singlePeer.failover && len(ordered) > 1 {
+		ordered = ordered[:1]
+	}
+
+	byteArgs := make([][]byte, len(args))
+	for i, arg := range args {
+		byteArgs[i] = []byte(arg)
+	}
+
+	var attempts []SinglePeerAttempt
+	for i, peer := range ordered {
+		submitted, err := pc.SubmitAsyncTargets(
+			ctx,
+			t.contract.network.channel,
+			t.contract.chaincodeName,
+			t.transactionName,
+			byteArgs,
+			[]legacyfab.Peer{peer},
+			t.transientData,
+		)
+		if err == nil {
+			return &SubmittedTransaction{
+				transactionID: string(submitted.response.TransactionID),
+				result:        submitted.response.Payload,
+				waitForCommit: submitted.waitForCommit,
+			}, nil
+		}
+
+		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error()})
+		if !isFailoverEligibleError(err) {
+			pc.Close()
+			return nil, err
+		}
+		if !t.singlePeer.failover || i == len(ordered)-1 {
+			pc.Close()
+			return nil, singlePeerExecutionError("submitAsync", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
+		}
+
+		next := ordered[i+1]
+		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=submitAsync channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d reason=%q",
+			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), err.Error())
+	}
+
+	pc.Close()
+	return nil, singlePeerExecutionError("submitAsync", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
+}
+
+func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string) ([]byte, error) {
+	bridge := t.contract.network.bridge
+
+	if !bridge.config.HasPrivateKey() {
+		return nil, &ConfigurationError{
+			Field:   "identity.privateKey",
+			Message: "privateKey is required for UseSinglePeer",
+		}
+	}
+
+	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	if err != nil {
+		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
+	}
+	defer pc.Close()
+
+	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
+	if err != nil {
+		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
+	}
+	eligible, err := resolveSinglePeerCandidates(discovered, t.singlePeer.candidates)
+	if err != nil {
+		return nil, err
+	}
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, *t.singlePeer, bridge.roundRobin)
+	if !t.singlePeer.failover && len(ordered) > 1 {
+		ordered = ordered[:1]
+	}
+
+	byteArgs := make([][]byte, len(args))
+	for i, arg := range args {
+		byteArgs[i] = []byte(arg)
+	}
+
+	var attempts []SinglePeerAttempt
+	for i, peer := range ordered {
+		result, err := pc.QueryTargets(
+			ctx,
+			t.contract.network.channel,
+			t.contract.chaincodeName,
+			t.transactionName,
+			byteArgs,
+			[]legacyfab.Peer{peer},
+			t.transientData,
+		)
+		if err == nil {
+			return result, nil
+		}
+
+		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error()})
+		if !isFailoverEligibleError(err) {
+			return nil, err
+		}
+		if !t.singlePeer.failover || i == len(ordered)-1 {
+			return nil, singlePeerExecutionError("evaluate", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
+		}
+
+		next := ordered[i+1]
+		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=evaluate channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d reason=%q",
+			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), err.Error())
+	}
+
+	return nil, singlePeerExecutionError("evaluate", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
 }
 
 // evaluateWithPeerTargeting evaluates on specific peers using the legacy SDK path.
@@ -309,7 +474,7 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 	if !bridge.config.HasPrivateKey() {
 		return nil, &ConfigurationError{
 			Field:   "identity.privateKey",
-			Message: "privateKey is required for peer-targeted evaluations (setEndorsingPeers)",
+			Message: "privateKey is required for UseEndorsingPeers",
 		}
 	}
 

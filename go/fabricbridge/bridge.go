@@ -20,7 +20,7 @@ import (
 
 // Bridge is the main entry point for the SDK.
 // By default it connects via fabric-gateway (Gateway gRPC service).
-// When setEndorsingPeers is used, it switches to fabric-sdk-go (Endorser gRPC service)
+// When peer targeting is used, it switches to fabric-sdk-go (Endorser gRPC service)
 // using a sequential pattern: disconnect gateway → connect peer → execute → disconnect peer → reconnect gateway.
 type Bridge struct {
 	config          Config
@@ -30,6 +30,7 @@ type Bridge struct {
 	gatewayEndpoint string
 	peerConnection  *PeerConnection
 	modeMu          sync.RWMutex
+	roundRobin      *roundRobinState
 }
 
 // Connect establishes a connection to the Fabric network via the Gateway service
@@ -51,6 +52,7 @@ func Connect(ctx context.Context, config Config) (*Bridge, error) {
 		grpcConnection:  grpcConn,
 		connected:       true,
 		gatewayEndpoint: config.GatewayPeer,
+		roundRobin:      newRoundRobinState(),
 	}, nil
 }
 

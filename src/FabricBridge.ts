@@ -13,6 +13,7 @@ import type {
   BridgeResult,
   BridgeSubmittedTx,
   CommitStatus,
+  SinglePeerOptions,
 } from "./types/bridge";
 import { ConfigurationError, EvaluationError, NotConnectedError, SubmitError, TimeoutError } from "./errors/index";
 import { Result } from "better-result";
@@ -299,6 +300,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private discoveryCache: DiscoveryCache;
   private fabricBridge: FabricBridge;
   private endorsingPeerNames: string[] = [];
+  private singlePeerOptions: SinglePeerOptions | null = null;
   private transientData: Record<string, Buffer> = {};
   private usePeerMode = false;
 
@@ -330,14 +332,26 @@ class BridgeTransactionImpl implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  SetEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    this.endorsingPeerNames = peerNames;
+  UseSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+    this.singlePeerOptions = { failover: true, ...options };
+    this.endorsingPeerNames = [];
     this.usePeerMode = true;
     return this;
   }
 
-  setEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    return this.SetEndorsingPeers(peerNames);
+  useSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+    return this.UseSinglePeer(options);
+  }
+
+  UseEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    this.endorsingPeerNames = peerNames;
+    this.singlePeerOptions = null;
+    this.usePeerMode = true;
+    return this;
+  }
+
+  useEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    return this.UseEndorsingPeers(peerNames);
   }
 
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
@@ -371,7 +385,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
     if (this.usePeerMode) {
       if (!this.config.identity.privateKey) {
         return Result.err(new ConfigurationError({
-          message: 'identity.privateKey is required for SetEndorsingPeers()',
+          message: 'identity.privateKey is required for peer-targeted transactions',
           field: 'identity.privateKey',
         }));
       }
@@ -404,7 +418,11 @@ class BridgeTransactionImpl implements BridgeTransaction {
           tx.SetTransientData(this.transientData);
         }
 
-        tx.SetEndorsingPeers(this.endorsingPeerNames);
+        if (this.singlePeerOptions) {
+          tx.UseSinglePeer(this.singlePeerOptions);
+        } else {
+          tx.UseEndorsingPeers(this.endorsingPeerNames);
+        }
 
         const submittedResult = await tx.SubmitAsync(...args);
         if (!submittedResult.isOk()) {
@@ -451,7 +469,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
     if (this.usePeerMode) {
       if (!this.config.identity.privateKey) {
         return Result.err(new ConfigurationError({
-          message: 'identity.privateKey is required for SetEndorsingPeers()',
+          message: 'identity.privateKey is required for peer-targeted transactions',
           field: 'identity.privateKey',
         }));
       }
@@ -478,7 +496,11 @@ class BridgeTransactionImpl implements BridgeTransaction {
           tx.SetTransientData(this.transientData);
         }
 
-        tx.SetEndorsingPeers(this.endorsingPeerNames);
+        if (this.singlePeerOptions) {
+          tx.UseSinglePeer(this.singlePeerOptions);
+        } else {
+          tx.UseEndorsingPeers(this.endorsingPeerNames);
+        }
         return await tx.Evaluate(...args);
       } finally {
         await peerConnection.disconnect();

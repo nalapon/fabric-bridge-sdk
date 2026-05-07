@@ -167,7 +167,7 @@ async function usingOrg1Peer() {
 
   const id = `org1_pt_${Date.now()}`;
   const tx = contract.Transaction("CreateAsset");
-  tx.SetEndorsingPeers([ORG1.peer]);
+  tx.UseSinglePeer({ candidates: [ORG1.peer] });
 
   const result = await tx.Submit(id, "red", "15", "Org1Peer", "3000");
 
@@ -201,7 +201,7 @@ async function usingOrg2Peer() {
 
   const id = `org2_pt_${Date.now()}`;
   const tx = contract.Transaction("CreateAsset");
-  tx.SetEndorsingPeers([ORG2.peer]);
+  tx.UseSinglePeer({ candidates: [ORG2.peer] });
 
   const result = await tx.Submit(id, "yellow", "20", "Org2Peer", "4000");
 

@@ -228,6 +228,33 @@ func (p *PeerConnection) Query(ctx context.Context, channelName string, chaincod
 	return resp.Payload, nil
 }
 
+// QueryTargets queries chaincode on specific discovered peer objects.
+func (p *PeerConnection) QueryTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []fab.Peer, transientData map[string][]byte) ([]byte, error) {
+	client, err := p.getChannelClient(channelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel client: %w", err)
+	}
+
+	req := channel.Request{
+		ChaincodeID:  chaincodeID,
+		Fcn:          fn,
+		Args:         args,
+		TransientMap: transientData,
+	}
+
+	opts := []channel.RequestOption{
+		channel.WithTargets(peers...),
+		channel.WithParentContext(ctx),
+	}
+
+	resp, err := client.Query(req, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+
+	return resp.Payload, nil
+}
+
 // SubmitAsync submits a transaction to the orderer and returns a legacy commit waiter.
 func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peerEndpoints []string, transientData map[string][]byte) (*peerSubmittedTransaction, error) {
 	client, err := p.getChannelClient(channelName)
@@ -285,6 +312,65 @@ func (p *PeerConnection) SubmitAsync(ctx context.Context, channelName string, ch
 	}, nil
 }
 
+// SubmitAsyncTargets submits using specific discovered peer objects.
+func (p *PeerConnection) SubmitAsyncTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []fab.Peer, transientData map[string][]byte) (*peerSubmittedTransaction, error) {
+	client, err := p.getChannelClient(channelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel client: %w", err)
+	}
+
+	eventService, closeEventService, err := p.getTxStatusEventService(channelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tx status event service: %w", err)
+	}
+
+	req := channel.Request{
+		ChaincodeID:  chaincodeID,
+		Fcn:          fn,
+		Args:         args,
+		TransientMap: transientData,
+	}
+
+	opts := []channel.RequestOption{
+		channel.WithTargets(peers...),
+		channel.WithParentContext(ctx),
+	}
+
+	submitHandler := &submitTxHandler{
+		eventService: eventService,
+		closeFunc:    closeEventService,
+	}
+	handler := invoke.NewSelectAndEndorseHandler(
+		invoke.NewEndorsementValidationHandler(
+			invoke.NewSignatureValidationHandler(submitHandler),
+		),
+	)
+
+	resp, err := client.InvokeHandler(handler, req, opts...)
+	if err != nil {
+		if submitHandler.pending != nil {
+			submitHandler.pending.close()
+		} else if closeEventService != nil {
+			closeEventService()
+		}
+		return nil, fmt.Errorf("submit async failed: %w", err)
+	}
+
+	if submitHandler.pending == nil {
+		if closeEventService != nil {
+			closeEventService()
+		}
+		return nil, fmt.Errorf("submit async failed: commit event registration was not initialized")
+	}
+
+	monitor := newLegacyCommitMonitor(p, string(resp.TransactionID), submitHandler.pending)
+
+	return &peerSubmittedTransaction{
+		response:      &resp,
+		waitForCommit: monitor.Wait,
+	}, nil
+}
+
 // getChannelClient returns a channel client for the specified channel
 func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, error) {
 	p.mu.RLock()
@@ -297,6 +383,29 @@ func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, 
 	}
 
 	return client, nil
+}
+
+// DiscoverPeers returns channel peers from the legacy SDK discovery service.
+func (p *PeerConnection) DiscoverPeers(channelName string) ([]fab.Peer, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithUser("BridgeUser"))
+	channelContext, err := channelProvider()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create channel context: %w", err)
+	}
+
+	discovery, err := channelContext.ChannelService().Discovery()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery service: %w", err)
+	}
+
+	peers, err := discovery.GetPeers()
+	if err != nil {
+		return nil, err
+	}
+	return peers, nil
 }
 
 func (p *PeerConnection) getTxStatusEventService(channelName string) (fab.EventService, func(), error) {

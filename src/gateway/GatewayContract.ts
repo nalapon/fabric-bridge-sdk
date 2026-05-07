@@ -8,6 +8,7 @@ import type {
   BridgeSubmittedTx,
   BridgeTransaction,
   CommitStatus,
+  SinglePeerOptions,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
 import {
@@ -161,15 +162,26 @@ class GatewayTransaction implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  SetEndorsingPeers(_peerNames: string[]): BridgeTransaction {
+  UseSinglePeer(_options: SinglePeerOptions = {}): BridgeTransaction {
     throw new Error(
-      'SetEndorsingPeers() is not supported in gateway mode. ' +
+      'UseSinglePeer() is not supported in gateway mode. ' +
       'Use FabricBridge with discovery enabled for peer-targeted transactions.',
     );
   }
 
-  setEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    return this.SetEndorsingPeers(peerNames);
+  useSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+    return this.UseSinglePeer(options);
+  }
+
+  UseEndorsingPeers(_peerNames: string[]): BridgeTransaction {
+    throw new Error(
+      'UseEndorsingPeers() is not supported in gateway mode. ' +
+      'Use FabricBridge with discovery enabled for peer-targeted transactions.',
+    );
+  }
+
+  useEndorsingPeers(peerNames: string[]): BridgeTransaction {
+    return this.UseEndorsingPeers(peerNames);
   }
 
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
