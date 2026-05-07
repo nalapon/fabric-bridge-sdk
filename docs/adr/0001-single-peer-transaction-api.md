@@ -16,6 +16,12 @@ Use `UseSinglePeer` for automatic single-peer choice. In Node, candidates and po
 
 Use `UseEndorsingPeers` when the proposal must be sent to every named peer.
 
+Internally, transaction targeting is represented as one transaction-level value with three modes: gateway default, single-peer, and endorsing-peers. The value is internal only; developers continue using the readable `UseSinglePeer` and `UseEndorsingPeers` APIs.
+
+Targeting setters are last-call-wins. Setting single-peer replaces endorsing-peers targeting, and setting endorsing-peers replaces single-peer targeting. Gateway default is the initial state and is not exposed as a public reset API.
+
+Node and Go keep cohesive API names but report local targeting validation errors idiomatically. In Node, targeting setters return `better-result` values and a successful setter returns the same mutable transaction builder inside `Result.ok`. In Go, targeting setters are mutable setters that return only `error`, not fluent builders.
+
 ## Consequences
 
 - `UseSinglePeer` applies to evaluate, submit, and submit-async operations.
@@ -23,5 +29,7 @@ Use `UseEndorsingPeers` when the proposal must be sent to every named peer.
 - The first supported selection policies are round-robin and random.
 - Single-peer failover is enabled by default and tries the next eligible peer only for transport, timeout, or peer availability failures.
 - Failover emits a canonical structured log when moving from one peer to another.
+- `UseEndorsingPeers` requires at least one peer; an empty peer set is invalid transaction targeting.
+- `UseSinglePeer` with empty candidates is equivalent to discovered peer selection and does not fail local validation.
 - If candidates cannot be resolved through discovery, the SDK returns a clear peer-resolution error.
 - If every eligible peer fails during failover, the SDK returns a specific single-peer execution failure containing eligible peers, attempted peers, and causes.

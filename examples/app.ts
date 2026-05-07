@@ -167,9 +167,10 @@ async function usingOrg1Peer() {
 
   const id = `org1_pt_${Date.now()}`;
   const tx = contract.Transaction("CreateAsset");
-  tx.UseSinglePeer({ candidates: [ORG1.peer] });
+  const targeted = tx.UseSinglePeer({ candidates: [ORG1.peer] });
+  if (!targeted.isOk()) throw new Error(targeted.error.message);
 
-  const result = await tx.Submit(id, "red", "15", "Org1Peer", "3000");
+  const result = await targeted.value.Submit(id, "red", "15", "Org1Peer", "3000");
 
   if (result.isOk()) {
     console.log(`Created: ${result.value.TransactionID()}`);
@@ -201,9 +202,10 @@ async function usingOrg2Peer() {
 
   const id = `org2_pt_${Date.now()}`;
   const tx = contract.Transaction("CreateAsset");
-  tx.UseSinglePeer({ candidates: [ORG2.peer] });
+  const targeted = tx.UseSinglePeer({ candidates: [ORG2.peer] });
+  if (!targeted.isOk()) throw new Error(targeted.error.message);
 
-  const result = await tx.Submit(id, "yellow", "20", "Org2Peer", "4000");
+  const result = await targeted.value.Submit(id, "yellow", "20", "Org2Peer", "4000");
 
   if (result.isOk()) {
     console.log(`Created: ${result.value.TransactionID()}`);

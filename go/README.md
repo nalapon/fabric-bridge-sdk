@@ -100,7 +100,9 @@ contract := network.Contract("mycc")
 
 // Create transaction with specific endorsing peers
 tx := contract.Transaction("CreateAsset")
-tx.SetEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com")
+if err := tx.UseEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com"); err != nil {
+    log.Fatalf("Configure peer targeting failed: %v", err)
+}
 tx.SetTransientData(map[string][]byte{
     "privateData": []byte("secret"),
 })
@@ -179,7 +181,9 @@ Builder for transactions with custom options.
 tx := contract.Transaction("CreateAsset")
 
 // Set specific endorsing peers (peer-targeting mode)
-tx.SetEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com")
+if err := tx.UseEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com"); err != nil {
+    log.Fatalf("Configure peer targeting failed: %v", err)
+}
 
 // Set transient data
 tx.SetTransientData(map[string][]byte{
@@ -356,7 +360,7 @@ The SDK has two operational modes:
 - Uses `fabric-sdk-go` SDK (v1.0.0)
 - Deprecated but functional
 - Supports explicit peer selection
-- Used when `SetEndorsingPeers()` is called
+- Used when `UseEndorsingPeers()` or `UseSinglePeer()` is called
 - Requires discovery to be enabled
 - `Submit()` and `SubmitAsync()` require `OrdererEndpoint`
 - Commit waiting is done afterwards through the gateway service using the transaction ID
@@ -371,7 +375,9 @@ contract.Submit(ctx, "func", args...)
 
 // Peer-targeting mode (explicit peers)
 tx := contract.Transaction("func")
-tx.SetEndorsingPeers("peer1", "peer2")
+if err := tx.UseEndorsingPeers("peer1", "peer2"); err != nil {
+    log.Fatalf("Configure peer targeting failed: %v", err)
+}
 tx.Submit(ctx, args...)
 ```
 

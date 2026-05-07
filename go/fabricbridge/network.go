@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
@@ -133,7 +132,7 @@ func (c *Contract) Transaction(transactionName string) *Transaction {
 	return &Transaction{
 		contract:        c,
 		transactionName: transactionName,
-		endorsingPeers:  []string{},
+		targeting:       gatewayDefaultTransactionTargeting(),
 		transientData:   make(map[string][]byte),
 	}
 }
@@ -202,24 +201,28 @@ type CommitStatus struct {
 type Transaction struct {
 	contract        *Contract
 	transactionName string
-	endorsingPeers  []string
-	singlePeer      *singlePeerOptions
+	targeting       transactionTargeting
 	transientData   map[string][]byte
 }
 
 // UseEndorsingPeers sends proposals to every named peer (peer-targeting mode).
-func (t *Transaction) UseEndorsingPeers(peers ...string) *Transaction {
-	t.endorsingPeers = peers
-	t.singlePeer = nil
-	return t
+func (t *Transaction) UseEndorsingPeers(peers ...string) error {
+	targeting, err := newEndorsingPeersTargeting(peers)
+	if err != nil {
+		return err
+	}
+	t.targeting = targeting
+	return nil
 }
 
 // UseSinglePeer chooses one discovered peer per attempt.
-func (t *Transaction) UseSinglePeer(opts ...SinglePeerOption) *Transaction {
-	options := defaultSinglePeerOptions(opts)
-	t.singlePeer = &options
-	t.endorsingPeers = nil
-	return t
+func (t *Transaction) UseSinglePeer(opts ...SinglePeerOption) error {
+	targeting, err := newSinglePeerTargeting(opts)
+	if err != nil {
+		return err
+	}
+	t.targeting = targeting
+	return nil
 }
 
 // SetTransientData sets transient data for the transaction
@@ -249,10 +252,10 @@ func (t *Transaction) Submit(ctx context.Context, args ...string) (*CommitResult
 
 // SubmitAsync executes the transaction without waiting for commit.
 func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*SubmittedTransaction, error) {
-	if t.singlePeer != nil {
+	if _, ok := t.targeting.singlePeerOptions(); ok {
 		return t.submitAsyncWithSinglePeer(ctx, args)
 	}
-	if len(t.endorsingPeers) > 0 {
+	if len(t.targeting.endorsingPeerNames()) > 0 {
 		return t.submitAsyncWithPeerTargeting(ctx, args)
 	}
 
@@ -293,7 +296,7 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
-		t.endorsingPeers,
+		t.targeting.endorsingPeerNames(),
 		t.transientData,
 	)
 	if err != nil {
@@ -310,10 +313,10 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 
 // Evaluate executes the transaction as a query with peer targeting if configured
 func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, error) {
-	if t.singlePeer != nil {
+	if _, ok := t.targeting.singlePeerOptions(); ok {
 		return t.evaluateWithSinglePeer(ctx, args)
 	}
-	if len(t.endorsingPeers) > 0 {
+	if len(t.targeting.endorsingPeerNames()) > 0 {
 		return t.evaluateWithPeerTargeting(ctx, args)
 	}
 
@@ -349,13 +352,14 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		pc.Close()
 		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
 	}
-	eligible, err := resolveSinglePeerCandidates(discovered, t.singlePeer.candidates)
+	singlePeer, _ := t.targeting.singlePeerOptions()
+	eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
 	if err != nil {
 		pc.Close()
 		return nil, err
 	}
-	ordered := orderSinglePeers(t.contract.network.channel, eligible, *t.singlePeer, bridge.roundRobin)
-	if !t.singlePeer.failover && len(ordered) > 1 {
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
+	if !singlePeer.failover && len(ordered) > 1 {
 		ordered = ordered[:1]
 	}
 
@@ -364,43 +368,37 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		byteArgs[i] = []byte(arg)
 	}
 
-	var attempts []SinglePeerAttempt
-	for i, peer := range ordered {
-		submitted, err := pc.SubmitAsyncTargets(
-			ctx,
-			t.contract.network.channel,
-			t.contract.chaincodeName,
-			t.transactionName,
-			byteArgs,
-			[]legacyfab.Peer{peer},
-			t.transientData,
-		)
-		if err == nil {
-			return &SubmittedTransaction{
-				transactionID: string(submitted.response.TransactionID),
-				result:        submitted.response.Payload,
-				waitForCommit: submitted.waitForCommit,
-			}, nil
-		}
-
-		decision := classifyFailover(err)
-		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error(), Failover: decision})
-		if !decision.Eligible {
-			pc.Close()
-			return nil, err
-		}
-		if !t.singlePeer.failover || i == len(ordered)-1 {
-			pc.Close()
-			return nil, singlePeerExecutionError("submitAsync", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
-		}
-
-		next := ordered[i+1]
-		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=submitAsync channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d category=%s reason=%q",
-			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), decision.Category, decision.Reason)
+	submitted, err := executeSinglePeerTargets(
+		"submitAsync",
+		t.contract.network.channel,
+		t.contract.chaincodeName,
+		t.transactionName,
+		singlePeer.candidates,
+		eligible,
+		ordered,
+		singlePeer.failover,
+		func(peer legacyfab.Peer) (*peerSubmittedTransaction, error) {
+			return pc.SubmitAsyncTargets(
+				ctx,
+				t.contract.network.channel,
+				t.contract.chaincodeName,
+				t.transactionName,
+				byteArgs,
+				[]legacyfab.Peer{peer},
+				t.transientData,
+			)
+		},
+	)
+	if err != nil {
+		pc.Close()
+		return nil, err
 	}
 
-	pc.Close()
-	return nil, singlePeerExecutionError("submitAsync", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
+	return &SubmittedTransaction{
+		transactionID: string(submitted.response.TransactionID),
+		result:        submitted.response.Payload,
+		waitForCommit: submitted.waitForCommit,
+	}, nil
 }
 
 func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string) ([]byte, error) {
@@ -423,12 +421,13 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 	if err != nil {
 		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
 	}
-	eligible, err := resolveSinglePeerCandidates(discovered, t.singlePeer.candidates)
+	singlePeer, _ := t.targeting.singlePeerOptions()
+	eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
 	if err != nil {
 		return nil, err
 	}
-	ordered := orderSinglePeers(t.contract.network.channel, eligible, *t.singlePeer, bridge.roundRobin)
-	if !t.singlePeer.failover && len(ordered) > 1 {
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
+	if !singlePeer.failover && len(ordered) > 1 {
 		ordered = ordered[:1]
 	}
 
@@ -437,36 +436,27 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 		byteArgs[i] = []byte(arg)
 	}
 
-	var attempts []SinglePeerAttempt
-	for i, peer := range ordered {
-		result, err := pc.QueryTargets(
-			ctx,
-			t.contract.network.channel,
-			t.contract.chaincodeName,
-			t.transactionName,
-			byteArgs,
-			[]legacyfab.Peer{peer},
-			t.transientData,
-		)
-		if err == nil {
-			return result, nil
-		}
-
-		decision := classifyFailover(err)
-		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error(), Failover: decision})
-		if !decision.Eligible {
-			return nil, err
-		}
-		if !t.singlePeer.failover || i == len(ordered)-1 {
-			return nil, singlePeerExecutionError("evaluate", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
-		}
-
-		next := ordered[i+1]
-		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=evaluate channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d category=%s reason=%q",
-			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), decision.Category, decision.Reason)
-	}
-
-	return nil, singlePeerExecutionError("evaluate", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)
+	return executeSinglePeerTargets(
+		"evaluate",
+		t.contract.network.channel,
+		t.contract.chaincodeName,
+		t.transactionName,
+		singlePeer.candidates,
+		eligible,
+		ordered,
+		singlePeer.failover,
+		func(peer legacyfab.Peer) ([]byte, error) {
+			return pc.QueryTargets(
+				ctx,
+				t.contract.network.channel,
+				t.contract.chaincodeName,
+				t.transactionName,
+				byteArgs,
+				[]legacyfab.Peer{peer},
+				t.transientData,
+			)
+		},
+	)
 }
 
 // evaluateWithPeerTargeting evaluates on specific peers using the legacy SDK path.
@@ -497,7 +487,7 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
-		t.endorsingPeers,
+		t.targeting.endorsingPeerNames(),
 		t.transientData,
 	)
 	if err != nil {

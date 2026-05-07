@@ -47,15 +47,15 @@ export interface BridgeTransaction {
   getName(): string;
   getChaincodeName(): string;
 
-  UseSinglePeer(options?: SinglePeerOptions): BridgeTransaction;
-  UseEndorsingPeers(peerNames: string[]): BridgeTransaction;
+  UseSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
+  UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
   Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
 
-  useSinglePeer(options?: SinglePeerOptions): BridgeTransaction;
-  useEndorsingPeers(peerNames: string[]): BridgeTransaction;
+  useSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
+  useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
   setTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
   submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;

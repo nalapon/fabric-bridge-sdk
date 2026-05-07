@@ -13,6 +13,7 @@ import type {
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
 import {
   CommitError,
+  ConfigurationError,
   EndorsementError,
   EvaluationError,
   SubmitError,
@@ -162,25 +163,23 @@ class GatewayTransaction implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  UseSinglePeer(_options: SinglePeerOptions = {}): BridgeTransaction {
-    throw new Error(
-      'UseSinglePeer() is not supported in gateway mode. ' +
-      'Use FabricBridge with discovery enabled for peer-targeted transactions.',
-    );
+  UseSinglePeer(_options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
+    return Result.err(new ConfigurationError({
+      message: 'UseSinglePeer() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions.',
+    }));
   }
 
-  useSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+  useSinglePeer(options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
     return this.UseSinglePeer(options);
   }
 
-  UseEndorsingPeers(_peerNames: string[]): BridgeTransaction {
-    throw new Error(
-      'UseEndorsingPeers() is not supported in gateway mode. ' +
-      'Use FabricBridge with discovery enabled for peer-targeted transactions.',
-    );
+  UseEndorsingPeers(_peerNames: string[]): BridgeResult<BridgeTransaction> {
+    return Result.err(new ConfigurationError({
+      message: 'UseEndorsingPeers() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions.',
+    }));
   }
 
-  useEndorsingPeers(peerNames: string[]): BridgeTransaction {
+  useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
     return this.UseEndorsingPeers(peerNames);
   }
 

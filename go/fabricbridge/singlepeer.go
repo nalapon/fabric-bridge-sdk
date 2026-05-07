@@ -2,6 +2,7 @@ package fabricbridge
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"strings"
@@ -24,6 +25,60 @@ type singlePeerOptions struct {
 	candidates []string
 	policy     PeerSelectionPolicy
 	failover   bool
+}
+
+type transactionTargetingKind string
+
+const (
+	gatewayDefaultTargeting transactionTargetingKind = "gateway-default"
+	singlePeerTargeting     transactionTargetingKind = "single-peer"
+	endorsingPeersTargeting transactionTargetingKind = "endorsing-peers"
+)
+
+type transactionTargeting struct {
+	kind           transactionTargetingKind
+	singlePeer     singlePeerOptions
+	endorsingPeers []string
+}
+
+func gatewayDefaultTransactionTargeting() transactionTargeting {
+	return transactionTargeting{kind: gatewayDefaultTargeting}
+}
+
+func newSinglePeerTargeting(opts []SinglePeerOption) (transactionTargeting, error) {
+	options := defaultSinglePeerOptions(opts)
+	if !isSupportedPeerSelectionPolicy(options.policy) {
+		return gatewayDefaultTransactionTargeting(), &ConfigurationError{
+			Field:   "singlePeer.policy",
+			Message: fmt.Sprintf("unsupported peer selection policy: %s", options.policy),
+		}
+	}
+	return transactionTargeting{kind: singlePeerTargeting, singlePeer: options}, nil
+}
+
+func newEndorsingPeersTargeting(peers []string) (transactionTargeting, error) {
+	if len(peers) == 0 {
+		return gatewayDefaultTransactionTargeting(), &ConfigurationError{
+			Field:   "endorsingPeers",
+			Message: "UseEndorsingPeers requires at least one peer",
+		}
+	}
+	return transactionTargeting{kind: endorsingPeersTargeting, endorsingPeers: append([]string(nil), peers...)}, nil
+}
+
+func (t transactionTargeting) singlePeerOptions() (*singlePeerOptions, bool) {
+	if t.kind != singlePeerTargeting {
+		return nil, false
+	}
+	options := t.singlePeer
+	return &options, true
+}
+
+func (t transactionTargeting) endorsingPeerNames() []string {
+	if t.kind != endorsingPeersTargeting {
+		return nil
+	}
+	return append([]string(nil), t.endorsingPeers...)
 }
 
 // SinglePeerOption configures UseSinglePeer.
@@ -79,6 +134,10 @@ func defaultSinglePeerOptions(opts []SinglePeerOption) singlePeerOptions {
 		opt(&out)
 	}
 	return out
+}
+
+func isSupportedPeerSelectionPolicy(policy PeerSelectionPolicy) bool {
+	return policy == RoundRobinSelection || policy == RandomSelection
 }
 
 func orderSinglePeers(channelName string, peers []fab.Peer, opts singlePeerOptions, rr *roundRobinState) []fab.Peer {
@@ -156,6 +215,43 @@ func peerURLs(peers []fab.Peer) []string {
 		out = append(out, peer.URL())
 	}
 	return out
+}
+
+func executeSinglePeerTargets[T any](
+	operation string,
+	channelName string,
+	chaincodeName string,
+	transactionName string,
+	candidates []string,
+	eligible []fab.Peer,
+	ordered []fab.Peer,
+	failover bool,
+	execute func(fab.Peer) (T, error),
+) (T, error) {
+	var zero T
+	var attempts []SinglePeerAttempt
+
+	for i, peer := range ordered {
+		result, err := execute(peer)
+		if err == nil {
+			return result, nil
+		}
+
+		decision := classifyFailover(err)
+		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error(), Failover: decision})
+		if !decision.Eligible {
+			return zero, err
+		}
+		if !failover || i == len(ordered)-1 {
+			return zero, singlePeerExecutionError(operation, channelName, chaincodeName, transactionName, candidates, eligible, attempts)
+		}
+
+		next := ordered[i+1]
+		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=%s channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d category=%s reason=%q",
+			operation, channelName, chaincodeName, transactionName, peer.URL(), next.URL(), i+1, len(ordered), decision.Category, decision.Reason)
+	}
+
+	return zero, singlePeerExecutionError(operation, channelName, chaincodeName, transactionName, candidates, eligible, attempts)
 }
 
 func singlePeerExecutionError(operation, channelName, chaincodeName, transactionName string, candidates []string, eligible []fab.Peer, attempts []SinglePeerAttempt) *SinglePeerExecutionError {

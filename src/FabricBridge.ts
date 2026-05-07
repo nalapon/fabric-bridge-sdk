@@ -18,6 +18,7 @@ import type {
 import { ConfigurationError, EvaluationError, NotConnectedError, SubmitError, TimeoutError } from "./errors/index";
 import { Result } from "better-result";
 import { log } from "./utils/logger";
+import { TransactionTargeting } from "./transactionTargeting";
 
 function applyDefaultTimeouts(config: BridgeConfig): BridgeConfig {
   if (!config.timeouts) {
@@ -299,10 +300,8 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private peerConnection: PeerConnection;
   private discoveryCache: DiscoveryCache;
   private fabricBridge: FabricBridge;
-  private endorsingPeerNames: string[] = [];
-  private singlePeerOptions: SinglePeerOptions | null = null;
+  private targeting = TransactionTargeting.gatewayDefault();
   private transientData: Record<string, Buffer> = {};
-  private usePeerMode = false;
 
   constructor(
     name: string,
@@ -332,25 +331,29 @@ class BridgeTransactionImpl implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  UseSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
-    this.singlePeerOptions = { failover: true, ...options };
-    this.endorsingPeerNames = [];
-    this.usePeerMode = true;
-    return this;
+  UseSinglePeer(options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
+    const targeting = TransactionTargeting.singlePeer(options);
+    if (!targeting.isOk()) {
+      return Result.err(targeting.error);
+    }
+    this.targeting = targeting.value;
+    return Result.ok(this);
   }
 
-  useSinglePeer(options: SinglePeerOptions = {}): BridgeTransaction {
+  useSinglePeer(options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
     return this.UseSinglePeer(options);
   }
 
-  UseEndorsingPeers(peerNames: string[]): BridgeTransaction {
-    this.endorsingPeerNames = peerNames;
-    this.singlePeerOptions = null;
-    this.usePeerMode = true;
-    return this;
+  UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
+    const targeting = TransactionTargeting.endorsingPeers(peerNames);
+    if (!targeting.isOk()) {
+      return Result.err(targeting.error);
+    }
+    this.targeting = targeting.value;
+    return Result.ok(this);
   }
 
-  useEndorsingPeers(peerNames: string[]): BridgeTransaction {
+  useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
     return this.UseEndorsingPeers(peerNames);
   }
 
@@ -382,7 +385,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   }
 
   async SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    if (this.usePeerMode) {
+    if (this.targeting.requiresPeerMode()) {
       if (!this.config.identity.privateKey) {
         return Result.err(new ConfigurationError({
           message: 'identity.privateKey is required for peer-targeted transactions',
@@ -418,13 +421,13 @@ class BridgeTransactionImpl implements BridgeTransaction {
           tx.SetTransientData(this.transientData);
         }
 
-        if (this.singlePeerOptions) {
-          tx.UseSinglePeer(this.singlePeerOptions);
-        } else {
-          tx.UseEndorsingPeers(this.endorsingPeerNames);
+        const targetedTx = this.targeting.applyToPeerTransaction(tx);
+        if (!targetedTx.isOk()) {
+          await peerConnection.disconnect();
+          return Result.err(targetedTx.error);
         }
 
-        const submittedResult = await tx.SubmitAsync(...args);
+        const submittedResult = await targetedTx.value.SubmitAsync(...args);
         if (!submittedResult.isOk()) {
           await peerConnection.disconnect();
           return Result.err(submittedResult.error);
@@ -466,7 +469,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   }
 
   async Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    if (this.usePeerMode) {
+    if (this.targeting.requiresPeerMode()) {
       if (!this.config.identity.privateKey) {
         return Result.err(new ConfigurationError({
           message: 'identity.privateKey is required for peer-targeted transactions',
@@ -496,12 +499,11 @@ class BridgeTransactionImpl implements BridgeTransaction {
           tx.SetTransientData(this.transientData);
         }
 
-        if (this.singlePeerOptions) {
-          tx.UseSinglePeer(this.singlePeerOptions);
-        } else {
-          tx.UseEndorsingPeers(this.endorsingPeerNames);
+        const targetedTx = this.targeting.applyToPeerTransaction(tx);
+        if (!targetedTx.isOk()) {
+          return Result.err(targetedTx.error);
         }
-        return await tx.Evaluate(...args);
+        return await targetedTx.value.Evaluate(...args);
       } finally {
         await peerConnection.disconnect();
       }
