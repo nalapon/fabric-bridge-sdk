@@ -80,7 +80,7 @@ func main() {
         log.Printf("Query failed: %v", err)
     }
     
-    // Submit transaction (gateway mode)
+    // Submit transaction (gateway mode, waits for commit)
     tx, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
     if err != nil {
         log.Fatalf("Transaction failed: %v", err)
@@ -88,14 +88,7 @@ func main() {
     
     log.Printf("Transaction ID: %s", tx.TransactionID())
     log.Printf("Result: %s", tx.Result())
-    
-    // Check commit status
-    status, err := tx.Status(ctx)
-    if err != nil {
-        log.Printf("Failed to get status: %v", err)
-    } else {
-        log.Printf("Block: %d, Status: %v", status.BlockNumber, status.Status)
-    }
+    log.Printf("Block: %d, Status: %v", tx.CommitStatus().BlockNumber, tx.CommitStatus().Status)
 }
 ```
 
@@ -112,13 +105,14 @@ tx.SetTransientData(map[string][]byte{
     "privateData": []byte("secret"),
 })
 
-// Submit to specific peers
+// Submit to specific peers (requires OrdererEndpoint in config)
 result, err := tx.Submit(ctx, "asset1", "blue", "5", "Tom", "100")
 if err != nil {
     log.Fatalf("Peer-targeted transaction failed: %v", err)
 }
 
 log.Printf("Transaction ID: %s", result.TransactionID())
+log.Printf("Block: %d", result.CommitStatus().BlockNumber)
 ```
 
 ## API Reference
@@ -167,8 +161,11 @@ name := contract.ChaincodeName()
 // Evaluate (query) - read-only
 result, err := contract.Evaluate(ctx, "GetAsset", "asset1")
 
-// Submit transaction - write
+// Submit transaction - write, waits for commit
 result, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5")
+
+// Submit transaction - write, do not wait for commit yet
+submitted, err := contract.SubmitAsync(ctx, "CreateAsset", "asset1", "blue", "5")
 
 // Create transaction builder for advanced options
 tx := contract.Transaction("CreateAsset")
@@ -189,16 +186,20 @@ tx.SetTransientData(map[string][]byte{
     "privateData": []byte("secret"),
 })
 
-// Submit
+// Submit and wait for commit
 result, err := tx.Submit(ctx, "asset1", "blue", "5")
+
+// Or submit async and wait later
+submitted, err := tx.SubmitAsync(ctx, "asset1", "blue", "5")
+status, err := submitted.WaitForCommit(ctx)
 
 // Or evaluate
 result, err := tx.Evaluate(ctx, "asset1")
 ```
 
-### TransactionResult
+### CommitResult
 
-Result of a submitted transaction.
+Result of a transaction returned by `Submit()`.
 
 ```go
 // Get transaction ID
@@ -207,11 +208,24 @@ txID := result.TransactionID()
 // Get result payload
 data := result.Result()
 
-// Check commit status
-status, err := result.Status(ctx)
-if err != nil {
-    log.Printf("Status: Block %d, Code %v", status.BlockNumber, status.Status)
-}
+// Access commit status
+status := result.CommitStatus()
+log.Printf("Status: Block %d, Code %v", status.BlockNumber, status.Status)
+```
+
+### SubmittedTransaction
+
+Result of a transaction returned by `SubmitAsync()`.
+
+```go
+// Get transaction ID
+txID := submitted.TransactionID()
+
+// Get result payload
+data := submitted.Result()
+
+// Wait for commit when you decide
+status, err := submitted.WaitForCommit(ctx)
 ```
 
 ## Configuration
@@ -236,7 +250,8 @@ type Identity struct {
 
 type TLSOptions struct {
     TrustedRoots []byte  // Root CA certificates
-    Verify       bool     // Verify server certificate (default: true)
+    Verify       bool     // Backward-compatible flag, verification is enabled by default with TrustedRoots
+    AllowInsecureTLS bool // Explicit opt-in to skip certificate verification
     ClientCert   []byte  // Client certificate for mutual TLS (optional)
     ClientKey    []byte  // Client key for mutual TLS (optional)
 }
@@ -334,6 +349,8 @@ The SDK has two operational modes:
 - Automatic endorsement gathering
 - Simplified API
 - No peer targeting
+- `Submit()` waits for commit by default
+- `SubmitAsync()` returns a handle for `WaitForCommit(ctx)`
 
 ### Peer-Targeting Mode
 - Uses `fabric-sdk-go` SDK (v1.0.0)
@@ -341,6 +358,8 @@ The SDK has two operational modes:
 - Supports explicit peer selection
 - Used when `SetEndorsingPeers()` is called
 - Requires discovery to be enabled
+- `Submit()` and `SubmitAsync()` require `OrdererEndpoint`
+- Commit waiting is done afterwards through the gateway service using the transaction ID
 
 ### Mode Selection
 
@@ -382,7 +401,6 @@ tx.Submit(ctx, args...)
 
 ```
 github.com/hyperledger/fabric-gateway v1.10.1
-github.com/hyperledger/fabric-sdk-go v1.0.0
 google.golang.org/grpc v1.68.0
 ```
 

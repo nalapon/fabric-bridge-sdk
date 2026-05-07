@@ -1,6 +1,6 @@
 import * as fabricNetwork from 'fabric-network';
 import { Result } from 'better-result';
-import { asBuffer, getTransactionResponse } from 'fabric-network/lib/impl/gatewayutils';
+import { asBuffer, getTransactionResponse } from 'fabric-network/lib/impl/gatewayutils.js';
 import type {
   BridgeCommitResult,
   BridgeContract,

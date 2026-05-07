@@ -1,5 +1,5 @@
 import * as fabricNetwork from "fabric-network";
-import type { X509Identity } from "fabric-network/lib/impl/wallet/x509identity";
+import type { X509Identity } from "fabric-network/lib/impl/wallet/x509identity.js";
 import type { BridgeConfig } from "../types/config";
 import {
   ConfigurationError,
