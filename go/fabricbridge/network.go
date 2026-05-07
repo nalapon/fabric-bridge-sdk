@@ -383,8 +383,9 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 			}, nil
 		}
 
-		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error()})
-		if !isFailoverEligibleError(err) {
+		decision := classifyFailover(err)
+		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error(), Failover: decision})
+		if !decision.Eligible {
 			pc.Close()
 			return nil, err
 		}
@@ -394,8 +395,8 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		}
 
 		next := ordered[i+1]
-		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=submitAsync channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d reason=%q",
-			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), err.Error())
+		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=submitAsync channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d category=%s reason=%q",
+			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), decision.Category, decision.Reason)
 	}
 
 	pc.Close()
@@ -451,8 +452,9 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 			return result, nil
 		}
 
-		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error()})
-		if !isFailoverEligibleError(err) {
+		decision := classifyFailover(err)
+		attempts = append(attempts, SinglePeerAttempt{Peer: peer.URL(), Cause: err.Error(), Failover: decision})
+		if !decision.Eligible {
 			return nil, err
 		}
 		if !t.singlePeer.failover || i == len(ordered)-1 {
@@ -460,8 +462,8 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 		}
 
 		next := ordered[i+1]
-		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=evaluate channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d reason=%q",
-			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), err.Error())
+		log.Printf("fabric_bridge.single_peer.failover event=fabric_bridge.single_peer.failover operation=evaluate channel=%s chaincode=%s transaction=%s failedPeer=%s nextPeer=%s attempt=%d maxAttempts=%d category=%s reason=%q",
+			t.contract.network.channel, t.contract.chaincodeName, t.transactionName, peer.URL(), next.URL(), i+1, len(ordered), decision.Category, decision.Reason)
 	}
 
 	return nil, singlePeerExecutionError("evaluate", t.contract.network.channel, t.contract.chaincodeName, t.transactionName, t.singlePeer.candidates, eligible, attempts)

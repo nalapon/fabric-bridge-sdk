@@ -124,8 +124,9 @@ func (e *PeerNotFoundError) Error() string {
 
 // SinglePeerAttempt describes one failed single-peer execution attempt.
 type SinglePeerAttempt struct {
-	Peer  string
-	Cause string
+	Peer     string
+	Cause    string
+	Failover FailoverDecision
 }
 
 // SinglePeerExecutionError is returned after all eligible single-peer targets fail.

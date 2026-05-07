@@ -158,20 +158,6 @@ func peerURLs(peers []fab.Peer) []string {
 	return out
 }
 
-func isFailoverEligibleError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "timeout") ||
-		strings.Contains(msg, "deadline") ||
-		strings.Contains(msg, "unavailable") ||
-		strings.Contains(msg, "connection") ||
-		strings.Contains(msg, "connect") ||
-		strings.Contains(msg, "grpc") ||
-		strings.Contains(msg, "transport")
-}
-
 func singlePeerExecutionError(operation, channelName, chaincodeName, transactionName string, candidates []string, eligible []fab.Peer, attempts []SinglePeerAttempt) *SinglePeerExecutionError {
 	return &SinglePeerExecutionError{
 		Message:         fmt.Sprintf("single-peer transaction failed after trying %d eligible peer(s)", len(attempts)),

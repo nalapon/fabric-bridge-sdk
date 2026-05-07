@@ -27,7 +27,9 @@ import { DEFAULT_TIMEOUTS } from '../types/config';
 import { PeerConnection } from './PeerConnection';
 import { DiscoveryCache } from '../cache/DiscoveryCache';
 import { log } from '../utils/logger';
-import { isFailoverEligibleError, selectSinglePeers } from './peerSelection';
+import { selectSinglePeers } from './peerSelection';
+import type { FailoverDecision } from '../types/failover';
+import { classifyFailover } from './failoverEligibility';
 
 export class PeerNetwork implements BridgeNetwork {
   private gateway: fabricNetwork.Gateway;
@@ -344,7 +346,7 @@ class PeerTransaction implements BridgeTransaction {
     waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
   }> {
     const peers = await this.resolveSinglePeerEndorsers();
-    const attempts: Array<{ peer: string; cause: string }> = [];
+    const attempts: Array<{ peer: string; cause: string; failover: FailoverDecision }> = [];
     const failover = this.singlePeerOptions?.failover ?? true;
     const peersToTry = failover ? peers : peers.slice(0, 1);
 
@@ -354,8 +356,9 @@ class PeerTransaction implements BridgeTransaction {
         const transaction = await this.createPreparedTransactionForPeers([selected.endorser]);
         return await this.submitAsyncInternal(transaction, stringArgs);
       } catch (error) {
-        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error) });
-        if (!isFailoverEligibleError(error)) {
+        const decision = classifyFailover(error);
+        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error), failover: decision });
+        if (!decision.eligible) {
           throw error;
         }
         if (!failover || index === peersToTry.length - 1) {
@@ -373,7 +376,8 @@ class PeerTransaction implements BridgeTransaction {
           nextPeer: next.peerName,
           attempt: index + 1,
           maxAttempts: peersToTry.length,
-          reason: attempts[attempts.length - 1]?.cause,
+          reason: decision.reason,
+          category: decision.category,
         });
       }
     }
@@ -383,7 +387,7 @@ class PeerTransaction implements BridgeTransaction {
 
   private async evaluateSinglePeer(stringArgs: string[]): Promise<Buffer> {
     const peers = await this.resolveSinglePeerEndorsers();
-    const attempts: Array<{ peer: string; cause: string }> = [];
+    const attempts: Array<{ peer: string; cause: string; failover: FailoverDecision }> = [];
     const failover = this.singlePeerOptions?.failover ?? true;
     const peersToTry = failover ? peers : peers.slice(0, 1);
 
@@ -393,8 +397,9 @@ class PeerTransaction implements BridgeTransaction {
         const transaction = await this.createPreparedTransactionForPeers([selected.endorser]);
         return Buffer.from(await transaction.evaluate(...stringArgs));
       } catch (error) {
-        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error) });
-        if (!isFailoverEligibleError(error)) {
+        const decision = classifyFailover(error);
+        attempts.push({ peer: selected.peerName, cause: error instanceof Error ? error.message : String(error), failover: decision });
+        if (!decision.eligible) {
           throw error;
         }
         if (!failover || index === peersToTry.length - 1) {
@@ -412,7 +417,8 @@ class PeerTransaction implements BridgeTransaction {
           nextPeer: next.peerName,
           attempt: index + 1,
           maxAttempts: peersToTry.length,
-          reason: attempts[attempts.length - 1]?.cause,
+          reason: decision.reason,
+          category: decision.category,
         });
       }
     }
@@ -722,7 +728,7 @@ class PeerTransaction implements BridgeTransaction {
   private singlePeerExecutionError(
     operation: string,
     eligiblePeers: Array<{ peerName: string }>,
-    attempts: Array<{ peer: string; cause: string }>,
+    attempts: Array<{ peer: string; cause: string; failover: FailoverDecision }>,
   ): SinglePeerExecutionError {
     return new SinglePeerExecutionError({
       message: `single-peer transaction failed after trying ${attempts.length} eligible peer(s)`,

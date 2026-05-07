@@ -36,6 +36,10 @@ _Avoid_: peer not found
 A canonical structured log emitted when single-peer failover moves from one peer to another.
 _Avoid_: debug trace, retry hook
 
+**Failover eligibility**:
+The classification that decides whether a failed single-peer attempt may be retried on another eligible peer.
+_Avoid_: retryable error, string matching
+
 **SinglePeer API**:
 The public transaction option that asks the SDK to choose one eligible peer per attempt.
 _Avoid_: RandomPeer API, DiscoveredPeer API
@@ -60,7 +64,14 @@ _Avoid_: SetEndorsingPeers
 - The first supported **Peer selection policies** are round-robin and random.
 - **Single-peer failover** still sends each attempt to exactly one peer and fails only after all eligible peers have failed.
 - **Single-peer failover** is triggered only by transport, timeout, or peer availability failures.
-- A **Single-peer execution failure** reports the eligible peers, attempted peers, and failure cause for each attempt.
+- **Failover eligibility** is classified separately from **Peer selection policy**.
+- **Failover eligibility** includes a category and reason, not just a yes-or-no decision.
+- **Failover eligibility** categories are timeout, peer-unavailable, transport, non-retryable, and unknown.
+- Unknown **Failover eligibility** does not trigger failover.
+- Discovery failure does not trigger **Single-peer failover** because no eligible peer set has been established.
+- Endorsement, policy, chaincode, and invalid commit failures are non-retryable for **Single-peer failover**.
+- Non-retryable failures are returned as their original operation error, not as a **Single-peer execution failure**.
+- A **Single-peer execution failure** reports the eligible peers, attempted peers, failure cause, and **Failover eligibility** for each attempt.
 - A **Single-peer failover log** is emitted when the SDK retries an operation on another eligible peer.
 
 ## Example Dialogue

@@ -1,4 +1,5 @@
 import { TaggedError } from 'better-result';
+import type { FailoverDecision } from '../types/failover';
 
 export class EndorsementError extends TaggedError('EndorsementError')<{
   message: string;
@@ -23,7 +24,7 @@ export class SinglePeerExecutionError extends TaggedError('SinglePeerExecutionEr
   transaction: string;
   candidates?: string[];
   eligiblePeers: string[];
-  attempts: Array<{ peer: string; cause: string }>;
+  attempts: Array<{ peer: string; cause: string; failover: FailoverDecision }>;
 }>() {}
 
 export class SubmitError extends TaggedError('SubmitError')<{

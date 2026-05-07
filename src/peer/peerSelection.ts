@@ -89,17 +89,3 @@ function randomOrder(peers: PeerInfo[]): PeerInfo[] {
   }
   return out;
 }
-
-export function isFailoverEligibleError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  const lower = message.toLowerCase();
-  return lower.includes('timeout') ||
-    lower.includes('deadline') ||
-    lower.includes('unavailable') ||
-    lower.includes('connection') ||
-    lower.includes('connect') ||
-    lower.includes('econn') ||
-    lower.includes('grpc') ||
-    lower.includes('14 unavailable') ||
-    lower.includes('4 deadline_exceeded');
-}
