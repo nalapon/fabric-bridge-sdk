@@ -36,6 +36,14 @@ function isLocalhostEndpoint(endpoint: string): boolean {
          (!!host && host.startsWith('127.'));
 }
 
+function sanitizeEndpoint(endpoint: string | undefined): string {
+  if (!endpoint) {
+    return "";
+  }
+
+  return endpoint.trim().replace(/^"+|"+$/g, "");
+}
+
 export class PeerConnection {
   private gateway: fabricNetwork.Gateway | null = null;
   private config: BridgeConfig;
@@ -286,10 +294,11 @@ export class PeerConnection {
     for (const [mspId, orgInfo] of Object.entries(discoveredPeers)) {
       const peersList = (orgInfo as any).peers || [];
       for (const peer of peersList) {
-        const peerName = peer.endpoint?.split(":")[0] || "unknown";
+        const endpoint = sanitizeEndpoint(peer.endpoint);
+        const peerName = endpoint.split(":")[0] || "unknown";
         peers.set(peerName, {
           name: peerName,
-          endpoint: peer.endpoint || "",
+          endpoint,
           mspId: mspId,
           chaincodes: peer.chaincodes?.map((cc: any) => cc.name) || [],
           ledgerHeight:

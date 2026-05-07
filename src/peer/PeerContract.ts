@@ -543,8 +543,25 @@ class PeerTransaction implements BridgeTransaction {
     );
 
     if (!validEndorsementResponse) {
+      const errorInfos: string[] = [];
+
+      for (const error of proposalResponse.errors ?? []) {
+        errorInfos.push(
+          `peer=${error?.connection?.name ?? "unknown"}, status=grpc, message=${error?.message ?? "unknown error"}`,
+        );
+      }
+
+      for (const response of proposalResponse.responses ?? []) {
+        errorInfos.push(
+          `peer=${response?.connection?.name ?? "unknown"}, status=${response?.response?.status ?? "unknown"}, message=${response?.response?.message ?? "unknown error"}`,
+        );
+      }
+
       throw new EndorsementError({
-        message: 'No valid responses from any peers',
+        message:
+          errorInfos.length > 0
+            ? `No valid responses from any peers. Errors:\n    ${errorInfos.join("\n    ")}`
+            : 'No valid responses from any peers',
       });
     }
 
