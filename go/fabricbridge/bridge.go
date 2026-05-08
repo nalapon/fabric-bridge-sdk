@@ -2,6 +2,7 @@ package fabricbridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -147,6 +148,104 @@ func (b *Bridge) Network(ctx context.Context, channelName string) (*Network, err
 		bridge:  b,
 		config:  b.config,
 	}, nil
+}
+
+// NewSignedProposal resumes an offline signing flow from signed proposal bytes.
+func (b *Bridge) NewSignedProposal(message SignedMessage) (*SignedProposal, error) {
+	b.modeMu.RLock()
+	defer b.modeMu.RUnlock()
+
+	if !b.connected || b.gatewayClient == nil {
+		return nil, &NotConnectedError{Component: "Bridge", Action: "resume signed proposal"}
+	}
+
+	messageBytes, digest, signature, routing, err := decodeSignedMessage(message)
+	if err != nil {
+		return nil, err
+	}
+	if routing != nil && (routing.Mode == "single-peer" || routing.Mode == "endorsing-peers") {
+		digestSum := sha256.Sum256(messageBytes)
+		if !equalDigest(digestSum[:], digest) {
+			return nil, digestMismatch("digest")
+		}
+		proposal, channelName, chaincodeName, txID, err := parsePeerProposal(messageBytes)
+		if err != nil {
+			return nil, err
+		}
+		_ = proposal
+		return &SignedProposal{
+			bridge:        b,
+			proposalBytes: messageBytes,
+			signature:     signature,
+			routing:       routing,
+			transactionID: txID,
+			channelName:   channelName,
+			chaincodeName: chaincodeName,
+		}, nil
+	}
+	if err := validateGatewayRouting(routing); err != nil {
+		return nil, err
+	}
+
+	unsigned, err := b.gatewayClient.NewProposal(messageBytes)
+	if err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
+	}
+	if !equalDigest(unsigned.Digest(), digest) {
+		return nil, digestMismatch("digest")
+	}
+
+	proposal, err := b.gatewayClient.NewSignedProposal(messageBytes, signature)
+	if err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
+	}
+
+	return &SignedProposal{proposal: proposal}, nil
+}
+
+// NewSignedTransaction resumes an offline signing flow from signed transaction bytes.
+func (b *Bridge) NewSignedTransaction(message SignedMessage) (*SignedTransaction, error) {
+	b.modeMu.RLock()
+	defer b.modeMu.RUnlock()
+
+	if !b.connected || b.gatewayClient == nil {
+		return nil, &NotConnectedError{Component: "Bridge", Action: "resume signed transaction"}
+	}
+
+	messageBytes, digest, signature, _, err := decodeSignedMessage(message)
+	if err != nil {
+		return nil, err
+	}
+
+	unsigned, err := b.gatewayClient.NewTransaction(messageBytes)
+	if err != nil {
+		digestSum := sha256.Sum256(messageBytes)
+		if !equalDigest(digestSum[:], digest) {
+			return nil, digestMismatch("digest")
+		}
+		channelName, txID, result, parseErr := parsePeerPayload(messageBytes)
+		if parseErr != nil {
+			return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
+		}
+		return &SignedTransaction{
+			bridge:      b,
+			payload:     messageBytes,
+			signature:   signature,
+			result:      result,
+			txID:        txID,
+			channelName: channelName,
+		}, nil
+	}
+	if !equalDigest(unsigned.Digest(), digest) {
+		return nil, digestMismatch("digest")
+	}
+
+	transaction, err := b.gatewayClient.NewSignedTransaction(messageBytes, signature)
+	if err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
+	}
+
+	return &SignedTransaction{transaction: transaction}, nil
 }
 
 // switchToPeerMode disconnects from the Gateway service and connects to peers

@@ -3,11 +3,16 @@ import { Result } from 'better-result';
 import type {
   BridgeCommitResult,
   BridgeContract,
+  BridgeEndorsedTransaction,
   BridgeNetwork,
   BridgeResult,
+  BridgeSignedProposal,
+  BridgeSignedTransaction,
   BridgeSubmittedTx,
   BridgeTransaction,
+  BridgeUnsignedProposal,
   CommitStatus,
+  SignedMessage,
   SinglePeerOptions,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
@@ -16,11 +21,18 @@ import {
   ConfigurationError,
   EndorsementError,
   EvaluationError,
+  OfflineSigningError,
   SubmitError,
   TimeoutError,
 } from '../errors/index';
 import { DEFAULT_TIMEOUTS } from '../types/config';
 import { GatewayConnection } from './GatewayConnection';
+import {
+  decodeSignedMessage,
+  signedMessage,
+  signingRequest,
+  validateProposalRouting,
+} from '../offlineSigning';
 
 export class GatewayNetwork implements BridgeNetwork {
   private gatewayConnection: GatewayConnection;
@@ -249,6 +261,20 @@ class GatewayTransaction implements BridgeTransaction {
     return this.Evaluate(...args);
   }
 
+  async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
+    const stringArgs = normalizeArgs(args);
+
+    try {
+      const proposal = this.contract.newProposal(this.name, {
+        arguments: stringArgs,
+        transientData: copyTransientData(this.transientData),
+      });
+      return Result.ok(new GatewayUnsignedProposal(proposal));
+    } catch (error) {
+      return Result.err(this.mapSubmitError(error as Error));
+    }
+  }
+
   private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError {
     if (error.message?.includes('timeout') || error.message?.includes('TIMEOUT')) {
       return new TimeoutError({
@@ -267,6 +293,243 @@ class GatewayTransaction implements BridgeTransaction {
     return new SubmitError({
       message: error.message,
     });
+  }
+}
+
+export function NewGatewaySignedProposal(
+  gateway: fabricGateway.Gateway,
+  message: SignedMessage,
+): BridgeResult<BridgeSignedProposal> {
+  const decoded = decodeSignedMessage(message);
+  if (!decoded.isOk()) {
+    return Result.err(decoded.error);
+  }
+  const routing = validateProposalRouting(decoded.value.routing);
+  if (!routing.isOk()) {
+    return Result.err(routing.error);
+  }
+  if (routing.value.mode !== 'gateway-default') {
+    return Result.err(new ConfigurationError({
+      field: 'routing.mode',
+      message: `Gateway signed proposal cannot resume ${routing.value.mode} routing`,
+    }));
+  }
+
+  try {
+    const unsignedProposal = gateway.newProposal(decoded.value.bytes);
+    if (!Buffer.from(unsignedProposal.getDigest()).equals(decoded.value.digest)) {
+      return Result.err(new OfflineSigningError({
+        field: 'digest',
+        message: 'digest does not match proposal bytes',
+      }));
+    }
+    const proposal = gateway.newSignedProposal(decoded.value.bytes, decoded.value.signature);
+    return Result.ok(new GatewaySignedProposal(proposal));
+  } catch (error) {
+    return Result.err(new SubmitError({ message: (error as Error).message }));
+  }
+}
+
+export function NewGatewaySignedTransaction(
+  gateway: fabricGateway.Gateway,
+  message: SignedMessage,
+  timeouts: Required<TimeoutConfig>,
+): BridgeResult<BridgeSignedTransaction> {
+  const decoded = decodeSignedMessage(message);
+  if (!decoded.isOk()) {
+    return Result.err(decoded.error);
+  }
+  try {
+    const unsignedTransaction = gateway.newTransaction(decoded.value.bytes);
+    if (!Buffer.from(unsignedTransaction.getDigest()).equals(decoded.value.digest)) {
+      return Result.err(new OfflineSigningError({
+        field: 'digest',
+        message: 'digest does not match transaction bytes',
+      }));
+    }
+    const transaction = gateway.newSignedTransaction(decoded.value.bytes, decoded.value.signature);
+    return Result.ok(new GatewaySignedTransaction(transaction, timeouts));
+  } catch (error) {
+    return Result.err(new SubmitError({ message: (error as Error).message }));
+  }
+}
+
+class GatewayUnsignedProposal implements BridgeUnsignedProposal {
+  private proposal: fabricGateway.Proposal;
+
+  constructor(proposal: fabricGateway.Proposal) {
+    this.proposal = proposal;
+  }
+
+  Bytes(): Buffer {
+    return Buffer.from(this.proposal.getBytes());
+  }
+
+  GetBytes(): Buffer {
+    return this.Bytes();
+  }
+
+  Digest(): Buffer {
+    return Buffer.from(this.proposal.getDigest());
+  }
+
+  GetDigest(): Buffer {
+    return this.Digest();
+  }
+
+  TransactionID(): string {
+    return this.proposal.getTransactionId();
+  }
+
+  GetTransactionID(): string {
+    return this.TransactionID();
+  }
+
+  SigningRequest() {
+    return signingRequest(this.Bytes(), this.Digest(), { mode: 'gateway-default' });
+  }
+
+  GetSigningRequest() {
+    return this.SigningRequest();
+  }
+
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
+    return signedMessage(this.SigningRequest(), signature);
+  }
+}
+
+class GatewaySignedProposal implements BridgeSignedProposal {
+  private proposal: fabricGateway.Proposal;
+
+  constructor(proposal: fabricGateway.Proposal) {
+    this.proposal = proposal;
+  }
+
+  TransactionID(): string {
+    return this.proposal.getTransactionId();
+  }
+
+  GetTransactionID(): string {
+    return this.TransactionID();
+  }
+
+  async Endorse(): Promise<BridgeResult<BridgeEndorsedTransaction>> {
+    try {
+      const transaction = await this.proposal.endorse();
+      return Result.ok(new GatewayEndorsedTransaction(transaction));
+    } catch (error) {
+      return Result.err(new EndorsementError({ message: (error as Error).message }));
+    }
+  }
+
+  async Evaluate(): Promise<BridgeResult<Buffer>> {
+    try {
+      const result = await this.proposal.evaluate();
+      return Result.ok(Buffer.from(result));
+    } catch (error) {
+      return Result.err(new EvaluationError({ message: (error as Error).message }));
+    }
+  }
+}
+
+class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {
+  private transaction: fabricGateway.Transaction;
+
+  constructor(transaction: fabricGateway.Transaction) {
+    this.transaction = transaction;
+  }
+
+  Bytes(): Buffer {
+    return Buffer.from(this.transaction.getBytes());
+  }
+
+  GetBytes(): Buffer {
+    return this.Bytes();
+  }
+
+  Digest(): Buffer {
+    return Buffer.from(this.transaction.getDigest());
+  }
+
+  GetDigest(): Buffer {
+    return this.Digest();
+  }
+
+  Result(): Buffer {
+    return Buffer.from(this.transaction.getResult());
+  }
+
+  GetResult(): Buffer {
+    return this.Result();
+  }
+
+  TransactionID(): string {
+    return this.transaction.getTransactionId();
+  }
+
+  GetTransactionID(): string {
+    return this.TransactionID();
+  }
+
+  SigningRequest() {
+    return signingRequest(this.Bytes(), this.Digest());
+  }
+
+  GetSigningRequest() {
+    return this.SigningRequest();
+  }
+
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
+    return signedMessage(this.SigningRequest(), signature);
+  }
+}
+
+class GatewaySignedTransaction implements BridgeSignedTransaction {
+  private transaction: fabricGateway.Transaction;
+  private timeouts: Required<TimeoutConfig>;
+
+  constructor(transaction: fabricGateway.Transaction, timeouts: Required<TimeoutConfig>) {
+    this.transaction = transaction;
+    this.timeouts = timeouts;
+  }
+
+  Result(): Buffer {
+    return Buffer.from(this.transaction.getResult());
+  }
+
+  GetResult(): Buffer {
+    return this.Result();
+  }
+
+  TransactionID(): string {
+    return this.transaction.getTransactionId();
+  }
+
+  GetTransactionID(): string {
+    return this.TransactionID();
+  }
+
+  async SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>> {
+    try {
+      const submitted = await this.transaction.submit();
+      return Result.ok(new GatewaySubmittedTx(submitted, this.timeouts));
+    } catch (error) {
+      return Result.err(new SubmitError({ message: (error as Error).message, transactionId: this.TransactionID() }));
+    }
+  }
+
+  async Submit(): Promise<BridgeResult<BridgeCommitResult>> {
+    const submitted = await this.SubmitAsync();
+    if (!submitted.isOk()) {
+      return Result.err(submitted.error);
+    }
+
+    const status = await submitted.value.WaitForCommit();
+    if (!status.isOk()) {
+      return Result.err(status.error);
+    }
+
+    return Result.ok(new GatewayCommitResult(submitted.value, status.value));
   }
 }
 

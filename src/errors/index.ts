@@ -58,3 +58,8 @@ export class NotConnectedError extends TaggedError('NotConnectedError')<{
   component: string;
   action: string;
 }>() {}
+
+export class OfflineSigningError extends TaggedError('OfflineSigningError')<{
+  message: string;
+  field?: string;
+}>() {}

@@ -167,3 +167,16 @@ type NotConnectedError struct {
 func (e *NotConnectedError) Error() string {
 	return fmt.Sprintf("%s not connected: cannot %s", e.Component, e.Action)
 }
+
+// OfflineSigningError is returned when a signing DTO or offline signing state is malformed.
+type OfflineSigningError struct {
+	Field   string
+	Message string
+}
+
+func (e *OfflineSigningError) Error() string {
+	if e.Field != "" {
+		return fmt.Sprintf("offline signing error in %s: %s", e.Field, e.Message)
+	}
+	return fmt.Sprintf("offline signing error: %s", e.Message)
+}

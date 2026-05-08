@@ -1,18 +1,22 @@
 import { GatewayConnection } from "./gateway/GatewayConnection";
-import { GatewayNetwork } from "./gateway/GatewayContract";
+import { GatewayNetwork, NewGatewaySignedProposal, NewGatewaySignedTransaction } from "./gateway/GatewayContract";
 import { PeerConnection } from "./peer/PeerConnection";
-import { PeerNetwork } from "./peer/PeerContract";
+import { NewPeerSignedProposal, NewPeerSignedTransaction, PeerNetwork } from "./peer/PeerContract";
 import { DiscoveryCache } from "./cache/DiscoveryCache";
 import type { BridgeConfig, TimeoutConfig } from "./types/config";
 import { DEFAULT_TIMEOUTS } from "./types/config";
 import type {
   BridgeCommitResult,
+  BridgeSignedProposal,
+  BridgeSignedTransaction,
   BridgeNetwork,
   BridgeContract,
   BridgeTransaction,
   BridgeResult,
   BridgeSubmittedTx,
+  BridgeUnsignedProposal,
   CommitStatus,
+  SignedMessage,
   SinglePeerOptions,
 } from "./types/bridge";
 import { ConfigurationError, EvaluationError, NotConnectedError, SubmitError, TimeoutError } from "./errors/index";
@@ -154,6 +158,55 @@ export class FabricBridge {
       this.discoveryCache,
       this,
     ));
+  }
+
+  async NewSignedProposal(message: SignedMessage): Promise<BridgeResult<BridgeSignedProposal>> {
+    if (message.routing?.mode === 'single-peer' || message.routing?.mode === 'endorsing-peers') {
+      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
+      const connectResult = await peerConnection.connect();
+      if (!connectResult.isOk()) {
+        return Result.err(connectResult.error);
+      }
+      return NewPeerSignedProposal(peerConnection.getGateway(), this.config, message);
+    }
+
+    if (!this.gatewayConnection) {
+      return Result.err(new NotConnectedError({
+        component: 'FabricBridge',
+        action: 'resume signed proposal',
+      }));
+    }
+
+    return NewGatewaySignedProposal(this.gatewayConnection.getGateway(), message);
+  }
+
+  async NewSignedTransaction(message: SignedMessage): Promise<BridgeResult<BridgeSignedTransaction>> {
+    if (message.routing?.mode === 'single-peer' || message.routing?.mode === 'endorsing-peers') {
+      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
+      const connectResult = await peerConnection.connect();
+      if (!connectResult.isOk()) {
+        return Result.err(connectResult.error);
+      }
+      return NewPeerSignedTransaction(
+        peerConnection.getGateway(),
+        this.config,
+        { ...DEFAULT_TIMEOUTS, ...this.config.timeouts },
+        message,
+      );
+    }
+
+    if (!this.gatewayConnection) {
+      return Result.err(new NotConnectedError({
+        component: 'FabricBridge',
+        action: 'resume signed transaction',
+      }));
+    }
+
+    return NewGatewaySignedTransaction(
+      this.gatewayConnection.getGateway(),
+      message,
+      { ...DEFAULT_TIMEOUTS, ...this.config.timeouts },
+    );
   }
 }
 
@@ -523,6 +576,52 @@ class BridgeTransactionImpl implements BridgeTransaction {
 
   async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
     return this.Evaluate(...args);
+  }
+
+  async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
+    if (this.targeting.requiresPeerMode()) {
+      if (!this.config.identity.privateKey) {
+        return Result.err(new ConfigurationError({
+          message: 'identity.privateKey is required to build peer-targeted proposals',
+          field: 'identity.privateKey',
+        }));
+      }
+
+      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
+      const connectResult = await peerConnection.connect();
+      if (!connectResult.isOk()) {
+        return Result.err(connectResult.error);
+      }
+
+      try {
+        const peerNetwork = new PeerNetwork(
+          peerConnection.getGateway(),
+          this.channelName,
+          this.config,
+          peerConnection,
+          this.discoveryCache,
+        );
+        const peerContract = await peerNetwork.getContract(this.chaincodeName);
+        const tx = peerContract.Transaction(this.name);
+        if (Object.keys(this.transientData).length > 0) {
+          tx.SetTransientData(this.transientData);
+        }
+        const targetedTx = this.targeting.applyToPeerTransaction(tx);
+        if (!targetedTx.isOk()) {
+          return Result.err(targetedTx.error);
+        }
+        return await targetedTx.value.NewUnsignedProposal(...args);
+      } finally {
+        await peerConnection.disconnect();
+      }
+    }
+
+    const gatewayContract = await this.gatewayNetwork.getContract(this.chaincodeName);
+    const tx = gatewayContract.Transaction(this.name);
+    if (Object.keys(this.transientData).length > 0) {
+      tx.SetTransientData(this.transientData);
+    }
+    return tx.NewUnsignedProposal(...args);
   }
 }
 

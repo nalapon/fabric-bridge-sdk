@@ -10,6 +10,7 @@ import type {
   TimeoutError,
   NotConnectedError,
   SinglePeerExecutionError,
+  OfflineSigningError,
 } from '../errors/index';
 
 export type BridgeError =
@@ -22,7 +23,8 @@ export type BridgeError =
   | ConfigurationError
   | TimeoutError
   | NotConnectedError
-  | SinglePeerExecutionError;
+  | SinglePeerExecutionError
+  | OfflineSigningError;
 
 export type BridgeResult<T> = Result<T, BridgeError>;
 
@@ -53,6 +55,7 @@ export interface BridgeTransaction {
   Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
+  NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>>;
 
   useSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
   useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
@@ -60,6 +63,67 @@ export interface BridgeTransaction {
   submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
+}
+
+export type OfflineSigningRouting =
+  | { mode: 'gateway-default' }
+  | { mode: 'single-peer'; peers: string[] }
+  | { mode: 'endorsing-peers'; peers: string[] };
+
+export interface SigningRequest {
+  bytes: string;
+  digest: string;
+  routing?: OfflineSigningRouting;
+}
+
+export interface SignedMessage extends SigningRequest {
+  signature: string;
+}
+
+export interface BridgeUnsignedProposal {
+  Bytes(): Buffer;
+  Digest(): Buffer;
+  TransactionID(): string;
+  SigningRequest(): SigningRequest;
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage>;
+
+  GetBytes(): Buffer;
+  GetDigest(): Buffer;
+  GetTransactionID(): string;
+  GetSigningRequest(): SigningRequest;
+}
+
+export interface BridgeSignedProposal {
+  TransactionID(): string;
+  Endorse(): Promise<BridgeResult<BridgeEndorsedTransaction>>;
+  Evaluate(): Promise<BridgeResult<Buffer>>;
+
+  GetTransactionID(): string;
+}
+
+export interface BridgeEndorsedTransaction {
+  Bytes(): Buffer;
+  Digest(): Buffer;
+  Result(): Buffer;
+  TransactionID(): string;
+  SigningRequest(): SigningRequest;
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage>;
+
+  GetBytes(): Buffer;
+  GetDigest(): Buffer;
+  GetResult(): Buffer;
+  GetTransactionID(): string;
+  GetSigningRequest(): SigningRequest;
+}
+
+export interface BridgeSignedTransaction {
+  Result(): Buffer;
+  TransactionID(): string;
+  SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>>;
+  Submit(): Promise<BridgeResult<BridgeCommitResult>>;
+
+  GetResult(): Buffer;
+  GetTransactionID(): string;
 }
 
 export type PeerSelectionPolicy = 'round-robin' | 'random';

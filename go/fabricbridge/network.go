@@ -2,12 +2,19 @@ package fabricbridge
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
+	"github.com/hyperledger/fabric-protos-go-apiv2/common"
+	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Network represents a Fabric channel and provides access to contracts
@@ -260,6 +267,170 @@ func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*Submitt
 	}
 
 	return t.contract.submitAsync(ctx, t.transactionName, t.transientData, args...)
+}
+
+// NewUnsignedProposal creates a signable proposal for offline transaction signing.
+func (t *Transaction) NewUnsignedProposal(ctx context.Context, args ...string) (*UnsignedProposal, error) {
+	if _, ok := t.targeting.singlePeerOptions(); ok {
+		return t.newUnsignedPeerProposal(ctx, args)
+	}
+	if len(t.targeting.endorsingPeerNames()) > 0 {
+		return t.newUnsignedPeerProposal(ctx, args)
+	}
+
+	t.contract.network.bridge.modeMu.RLock()
+	defer t.contract.network.bridge.modeMu.RUnlock()
+
+	opts := []fabricGateway.ProposalOption{
+		fabricGateway.WithArguments(args...),
+	}
+	if len(t.transientData) > 0 {
+		opts = append(opts, fabricGateway.WithTransient(copyTransientData(t.transientData)))
+	}
+
+	proposal, err := t.contract.contract.NewProposal(t.transactionName, opts...)
+	if err != nil {
+		return nil, &OfflineSigningError{Message: fmt.Sprintf("create proposal: %v", err)}
+	}
+
+	bytes, err := proposal.Bytes()
+	if err != nil {
+		return nil, &OfflineSigningError{Message: fmt.Sprintf("serialize proposal: %v", err)}
+	}
+
+	return newUnsignedProposal(bytes, proposal.Digest(), proposal.TransactionID(), &OfflineSigningRouting{Mode: "gateway-default"}), nil
+}
+
+func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string) (*UnsignedProposal, error) {
+	bridge := t.contract.network.bridge
+	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	if err != nil {
+		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
+	}
+	defer pc.Close()
+
+	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
+	if err != nil {
+		return nil, &DiscoveryError{Message: "discover peers for offline signing", Cause: err}
+	}
+
+	var routing *OfflineSigningRouting
+	if singlePeer, ok := t.targeting.singlePeerOptions(); ok {
+		eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
+		if err != nil {
+			return nil, err
+		}
+		ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
+		if len(ordered) == 0 {
+			return nil, &PeerNotFoundError{PeerName: "<single-peer>", AvailablePeers: peerURLs(discovered)}
+		}
+		routing = &OfflineSigningRouting{Mode: "single-peer", Peers: []string{ordered[0].URL()}}
+	} else {
+		var peers []string
+		for _, name := range t.targeting.endorsingPeerNames() {
+			peer, ok := matchDiscoveredPeer(discovered, name)
+			if !ok {
+				return nil, &PeerNotFoundError{PeerName: name, AvailablePeers: peerURLs(discovered)}
+			}
+			peers = append(peers, peer.URL())
+		}
+		routing = &OfflineSigningRouting{Mode: "endorsing-peers", Peers: peers}
+	}
+
+	proposal, txID, err := t.buildLegacyProposal(args)
+	if err != nil {
+		return nil, err
+	}
+	proposalBytes, err := proto.Marshal(proposal)
+	if err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("marshal proposal: %v", err)}
+	}
+	digest := sha256.Sum256(proposalBytes)
+	return newUnsignedProposal(proposalBytes, digest[:], txID, routing), nil
+}
+
+func (t *Transaction) buildLegacyProposal(args []string) (*peer.Proposal, string, error) {
+	id, err := t.contract.network.bridge.config.IdentityProvider()
+	if err != nil {
+		return nil, "", &OfflineSigningError{Field: "identity", Message: err.Error()}
+	}
+	creator, err := proto.Marshal(&msp.SerializedIdentity{
+		Mspid:   id.MspID(),
+		IdBytes: id.Credentials(),
+	})
+	if err != nil {
+		return nil, "", &OfflineSigningError{Field: "identity", Message: fmt.Sprintf("serialize identity: %v", err)}
+	}
+
+	nonce := make([]byte, 24)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, "", &OfflineSigningError{Field: "nonce", Message: err.Error()}
+	}
+	txIDHash := sha256.Sum256(append(append([]byte(nil), nonce...), creator...))
+	txID := hex.EncodeToString(txIDHash[:])
+
+	byteArgs := make([][]byte, len(args)+1)
+	byteArgs[0] = []byte(t.transactionName)
+	for i, arg := range args {
+		byteArgs[i+1] = []byte(arg)
+	}
+	ccis := &peer.ChaincodeInvocationSpec{ChaincodeSpec: &peer.ChaincodeSpec{
+		Type: peer.ChaincodeSpec_GOLANG,
+		ChaincodeId: &peer.ChaincodeID{
+			Name: t.contract.chaincodeName,
+		},
+		Input: &peer.ChaincodeInput{Args: byteArgs},
+	}}
+	proposal, err := createLegacyProposal(
+		txID,
+		t.contract.network.channel,
+		t.contract.chaincodeName,
+		ccis,
+		nonce,
+		creator,
+		copyTransientData(t.transientData),
+	)
+	if err != nil {
+		return nil, "", &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("create proposal: %v", err)}
+	}
+	return proposal, txID, nil
+}
+
+func createLegacyProposal(txID string, channelName string, chaincodeName string, ccis *peer.ChaincodeInvocationSpec, nonce []byte, creator []byte, transientData map[string][]byte) (*peer.Proposal, error) {
+	invocationBytes, err := proto.Marshal(ccis)
+	if err != nil {
+		return nil, err
+	}
+	payloadBytes, err := proto.Marshal(&peer.ChaincodeProposalPayload{
+		Input:        invocationBytes,
+		TransientMap: transientData,
+	})
+	if err != nil {
+		return nil, err
+	}
+	headerExtensionBytes, err := proto.Marshal(&peer.ChaincodeHeaderExtension{ChaincodeId: &peer.ChaincodeID{Name: chaincodeName}})
+	if err != nil {
+		return nil, err
+	}
+	channelHeaderBytes, err := proto.Marshal(&common.ChannelHeader{
+		Type:      int32(common.HeaderType_ENDORSER_TRANSACTION),
+		ChannelId: channelName,
+		TxId:      txID,
+		Timestamp: timestamppb.Now(),
+		Extension: headerExtensionBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	signatureHeaderBytes, err := proto.Marshal(&common.SignatureHeader{Creator: creator, Nonce: nonce})
+	if err != nil {
+		return nil, err
+	}
+	headerBytes, err := proto.Marshal(&common.Header{ChannelHeader: channelHeaderBytes, SignatureHeader: signatureHeaderBytes})
+	if err != nil {
+		return nil, err
+	}
+	return &peer.Proposal{Header: headerBytes, Payload: payloadBytes}, nil
 }
 
 // submitAsyncWithPeerTargeting executes a peer-targeted submit using the legacy SDK path.

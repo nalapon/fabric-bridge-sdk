@@ -52,6 +52,42 @@ _Avoid_: RandomPeer API, DiscoveredPeer API
 The public transaction option that asks the SDK to send the proposal to every named peer.
 _Avoid_: SetEndorsingPeers
 
+**Offline transaction signing**:
+A transaction flow where the SDK builds signable Fabric messages but an external signer supplies the required signatures.
+_Avoid_: asynchronous signing, async transaction signing
+
+**Bridge signable message**:
+A bridge-owned representation of a Fabric message that exposes bytes, digest, and transaction identity for external signing.
+_Avoid_: gateway proposal, legacy proposal wrapper
+
+**Message digest**:
+The byte sequence exposed by a **Bridge signable message** as the value external signers are expected to sign.
+_Avoid_: full message bytes as signing input
+
+**Signing request**:
+A portable representation of a **Bridge signable message** that carries canonical Fabric bytes, **Message digest**, and only the operational metadata needed to resume the flow.
+_Avoid_: serialized SDK object, reconstructed proposal
+
+**Signing request wire format**:
+The runtime-specific JSON representation of a **Signing request**, with every binary field encoded as base64.
+_Avoid_: protobuf wrapper, hex digest
+
+**Endorsement routing snapshot**:
+The operational metadata in a proposal **Signing request** that records whether endorsement should use gateway default routing, one selected peer, or explicit endorsing peers.
+_Avoid_: duplicated transaction metadata
+
+**Offline signing flow object**:
+A runtime object that resumes or advances **Offline transaction signing** from a signing DTO and exposes behavior such as endorse or submit.
+_Avoid_: raw JSON operation target
+
+**Endorsed transaction**:
+A Fabric transaction produced by endorsing a signed proposal and requiring the client's transaction signature before submit.
+_Avoid_: unsigned transaction
+
+**Offline signing error**:
+A local error indicating that a signing DTO or offline signing state is malformed and cannot safely resume the transaction flow.
+_Avoid_: configuration error, endorsement error
+
 ## Relationships
 
 - **Transaction targeting** has exactly three modes: gateway default, single-peer, and endorsing-peers.
@@ -73,8 +109,33 @@ _Avoid_: SetEndorsingPeers
 - **Explicit peer targeting** preserves the developer-provided peer set and does not choose among candidates.
 - The **EndorsingPeers API** expresses **Explicit peer targeting** and sends the proposal to every named peer.
 - The **EndorsingPeers API** requires at least one peer; an empty peer set is invalid **Transaction targeting**.
+- **Offline transaction signing** is distinct from submit-async behavior; submit-async means the transaction has been sent without waiting for commit.
+- **Offline transaction signing** is exposed through **Bridge signable message** types instead of leaking Gateway or legacy SDK transaction types.
+- External signers sign the **Message digest**, while full message bytes remain available for persistence, transport, and signer implementations that require them.
+- A **Signing request** uses canonical Fabric bytes as the source of truth and does not duplicate data already present in the Fabric message.
+- A **Signing request** may include operational metadata that is not present in the Fabric message but is required to resume the same bridge flow.
+- Node and Go expose the same offline signing concepts but do not share a cross-runtime signing DTO contract.
+- A proposal **Signing request** includes an **Endorsement routing snapshot**.
+- An **Endorsement routing snapshot** stores resolved peer endpoints, not candidate names or aliases.
+- **Endorsement routing snapshot** appears only on proposal **Signing request** values because peer routing ends at endorsement.
+- An **Endorsement routing snapshot** selects endorsement targets but does not replace the bridge network, TLS, discovery, or orderer configuration required to resume the flow.
+- The **Signing request wire format** encodes `bytes`, **Message digest**, and signatures as base64.
+- The SDK validates that a signed-message digest matches the canonical Fabric bytes but does not verify the external signature cryptographically before sending to Fabric.
+- Signed-message DTOs retain the **Message digest** from the **Signing request**, and the bridge validates it against the canonical Fabric bytes before resuming.
+- Malformed signing DTOs fail with an **Offline signing error** before any Fabric network call is attempted.
+- A configured transaction is the factory for the proposal **Signing request** so that **Transaction targeting** and transient data are captured before signing.
+- The bridge root object rehydrates signed-message DTOs into **Offline signing flow object** values within the same runtime.
+- A proposal **Signing request** captures the effective peer set for one endorsement attempt.
+- **Single-peer failover** during **Offline transaction signing** requires a new proposal **Signing request** and a new external signature for each attempted peer.
+- **Signing request** and signed-message DTOs are portable data, while **Offline signing flow object** types own runtime behavior.
+- A signed proposal produces an **Endorsed transaction**, and the **Endorsed transaction** produces the next **Signing request** for the client's transaction signature.
+- **Offline transaction signing** never falls back to a local signer when a required external signature is missing.
+- **Offline transaction signing** begins when a transaction creates a proposal **Signing request**; it is not enabled by global bridge state.
+- **Offline transaction signing** supports evaluation as a proposal-only flow that ends after a signed proposal is evaluated.
+- Commit tracking after offline submit uses the bridge identity and signer through the existing commit-waiting behavior.
 - The Node **SinglePeer API** uses an options object for candidates and policy.
 - The Go **SinglePeer API** uses functional options for candidates and policy.
+- Offline signing API methods use PascalCase in both Node and Go.
 - Node and Go keep cohesive API names, but each runtime follows its own error-handling idioms.
 - Node reports SDK operation errors through `better-result`; Go reports SDK errors through returned `error` values.
 - In Go, **SinglePeer API** and **EndorsingPeers API** are mutable setters that return only `error`, not fluent builders.
