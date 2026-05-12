@@ -7,7 +7,6 @@ import type {
   BridgeNetwork,
   BridgeResult,
   BridgeSignedProposal,
-  BridgeSignedTransaction,
   BridgeSubmittedTx,
   BridgeTransaction,
   BridgeUnsignedProposal,
@@ -29,6 +28,9 @@ import { DEFAULT_TIMEOUTS } from '../types/config';
 import { GatewayConnection } from './GatewayConnection';
 import {
   decodeSignedMessage,
+  proposalCreatorCertificate,
+  proposalCreatorIdentity,
+  proposalCreatorMSPID,
   signedMessage,
   signingRequest,
   validateProposalRouting,
@@ -104,18 +106,6 @@ class GatewayContract implements BridgeContract {
     );
   }
 
-  async submitTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
-    return this.Submit(name, ...args);
-  }
-
-  async evaluateTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    return this.Evaluate(name, ...args);
-  }
-
-  createTransaction(name: string): BridgeTransaction {
-    return this.Transaction(name);
-  }
-
   private mapError(
     error: Error,
     operation: 'submit' | 'evaluate',
@@ -181,27 +171,15 @@ class GatewayTransaction implements BridgeTransaction {
     }));
   }
 
-  useSinglePeer(options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
-    return this.UseSinglePeer(options);
-  }
-
   UseEndorsingPeers(_peerNames: string[]): BridgeResult<BridgeTransaction> {
     return Result.err(new ConfigurationError({
       message: 'UseEndorsingPeers() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions.',
     }));
   }
 
-  useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
-    return this.UseEndorsingPeers(peerNames);
-  }
-
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
     this.transientData = { ...transientData };
     return this;
-  }
-
-  setTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
-    return this.SetTransientData(transientData);
   }
 
   async Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
@@ -216,10 +194,6 @@ class GatewayTransaction implements BridgeTransaction {
     }
 
     return Result.ok(new GatewayCommitResult(submittedResult.value, commitStatus.value));
-  }
-
-  async submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
-    return this.Submit(...args);
   }
 
   async SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
@@ -237,10 +211,6 @@ class GatewayTransaction implements BridgeTransaction {
     }
   }
 
-  async submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    return this.SubmitAsync(...args);
-  }
-
   async Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
     const stringArgs = normalizeArgs(args);
 
@@ -255,10 +225,6 @@ class GatewayTransaction implements BridgeTransaction {
         message: (error as Error).message,
       }));
     }
-  }
-
-  async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    return this.Evaluate(...args);
   }
 
   async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
@@ -299,6 +265,7 @@ class GatewayTransaction implements BridgeTransaction {
 export function NewGatewaySignedProposal(
   gateway: fabricGateway.Gateway,
   message: SignedMessage,
+  timeouts: Required<TimeoutConfig>,
 ): BridgeResult<BridgeSignedProposal> {
   const decoded = decodeSignedMessage(message);
   if (!decoded.isOk()) {
@@ -324,31 +291,7 @@ export function NewGatewaySignedProposal(
       }));
     }
     const proposal = gateway.newSignedProposal(decoded.value.bytes, decoded.value.signature);
-    return Result.ok(new GatewaySignedProposal(proposal));
-  } catch (error) {
-    return Result.err(new SubmitError({ message: (error as Error).message }));
-  }
-}
-
-export function NewGatewaySignedTransaction(
-  gateway: fabricGateway.Gateway,
-  message: SignedMessage,
-  timeouts: Required<TimeoutConfig>,
-): BridgeResult<BridgeSignedTransaction> {
-  const decoded = decodeSignedMessage(message);
-  if (!decoded.isOk()) {
-    return Result.err(decoded.error);
-  }
-  try {
-    const unsignedTransaction = gateway.newTransaction(decoded.value.bytes);
-    if (!Buffer.from(unsignedTransaction.getDigest()).equals(decoded.value.digest)) {
-      return Result.err(new OfflineSigningError({
-        field: 'digest',
-        message: 'digest does not match transaction bytes',
-      }));
-    }
-    const transaction = gateway.newSignedTransaction(decoded.value.bytes, decoded.value.signature);
-    return Result.ok(new GatewaySignedTransaction(transaction, timeouts));
+    return Result.ok(new GatewaySignedProposal(proposal, timeouts));
   } catch (error) {
     return Result.err(new SubmitError({ message: (error as Error).message }));
   }
@@ -365,32 +308,28 @@ class GatewayUnsignedProposal implements BridgeUnsignedProposal {
     return Buffer.from(this.proposal.getBytes());
   }
 
-  GetBytes(): Buffer {
-    return this.Bytes();
-  }
-
   Digest(): Buffer {
     return Buffer.from(this.proposal.getDigest());
-  }
-
-  GetDigest(): Buffer {
-    return this.Digest();
   }
 
   TransactionID(): string {
     return this.proposal.getTransactionId();
   }
 
-  GetTransactionID(): string {
-    return this.TransactionID();
+  CreatorIdentity(): BridgeResult<Buffer> {
+    return proposalCreatorIdentity(this.Bytes());
+  }
+
+  CreatorMSPID(): BridgeResult<string> {
+    return proposalCreatorMSPID(this.Bytes());
+  }
+
+  CreatorCertificate(): BridgeResult<Buffer> {
+    return proposalCreatorCertificate(this.Bytes());
   }
 
   SigningRequest() {
     return signingRequest(this.Bytes(), this.Digest(), { mode: 'gateway-default' });
-  }
-
-  GetSigningRequest() {
-    return this.SigningRequest();
   }
 
   WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
@@ -400,23 +339,21 @@ class GatewayUnsignedProposal implements BridgeUnsignedProposal {
 
 class GatewaySignedProposal implements BridgeSignedProposal {
   private proposal: fabricGateway.Proposal;
+  private timeouts: Required<TimeoutConfig>;
 
-  constructor(proposal: fabricGateway.Proposal) {
+  constructor(proposal: fabricGateway.Proposal, timeouts: Required<TimeoutConfig>) {
     this.proposal = proposal;
+    this.timeouts = timeouts;
   }
 
   TransactionID(): string {
     return this.proposal.getTransactionId();
   }
 
-  GetTransactionID(): string {
-    return this.TransactionID();
-  }
-
   async Endorse(): Promise<BridgeResult<BridgeEndorsedTransaction>> {
     try {
       const transaction = await this.proposal.endorse();
-      return Result.ok(new GatewayEndorsedTransaction(transaction));
+      return Result.ok(new GatewayEndorsedTransaction(transaction, this.timeouts));
     } catch (error) {
       return Result.err(new EndorsementError({ message: (error as Error).message }));
     }
@@ -434,58 +371,6 @@ class GatewaySignedProposal implements BridgeSignedProposal {
 
 class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {
   private transaction: fabricGateway.Transaction;
-
-  constructor(transaction: fabricGateway.Transaction) {
-    this.transaction = transaction;
-  }
-
-  Bytes(): Buffer {
-    return Buffer.from(this.transaction.getBytes());
-  }
-
-  GetBytes(): Buffer {
-    return this.Bytes();
-  }
-
-  Digest(): Buffer {
-    return Buffer.from(this.transaction.getDigest());
-  }
-
-  GetDigest(): Buffer {
-    return this.Digest();
-  }
-
-  Result(): Buffer {
-    return Buffer.from(this.transaction.getResult());
-  }
-
-  GetResult(): Buffer {
-    return this.Result();
-  }
-
-  TransactionID(): string {
-    return this.transaction.getTransactionId();
-  }
-
-  GetTransactionID(): string {
-    return this.TransactionID();
-  }
-
-  SigningRequest() {
-    return signingRequest(this.Bytes(), this.Digest());
-  }
-
-  GetSigningRequest() {
-    return this.SigningRequest();
-  }
-
-  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
-    return signedMessage(this.SigningRequest(), signature);
-  }
-}
-
-class GatewaySignedTransaction implements BridgeSignedTransaction {
-  private transaction: fabricGateway.Transaction;
   private timeouts: Required<TimeoutConfig>;
 
   constructor(transaction: fabricGateway.Transaction, timeouts: Required<TimeoutConfig>) {
@@ -493,20 +378,16 @@ class GatewaySignedTransaction implements BridgeSignedTransaction {
     this.timeouts = timeouts;
   }
 
+  Bytes(): Buffer {
+    return Buffer.from(this.transaction.getBytes());
+  }
+
   Result(): Buffer {
     return Buffer.from(this.transaction.getResult());
   }
 
-  GetResult(): Buffer {
-    return this.Result();
-  }
-
   TransactionID(): string {
     return this.transaction.getTransactionId();
-  }
-
-  GetTransactionID(): string {
-    return this.TransactionID();
   }
 
   async SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>> {
@@ -546,24 +427,12 @@ class GatewayCommitResult implements BridgeCommitResult {
     return this.submitted.Result();
   }
 
-  getResult(): Buffer {
-    return this.Result();
-  }
-
   TransactionID(): string {
     return this.submitted.TransactionID();
   }
 
-  getTransactionId(): string {
-    return this.TransactionID();
-  }
-
   CommitStatus(): CommitStatus {
     return this.commitStatus;
-  }
-
-  getCommitStatus(): CommitStatus {
-    return this.CommitStatus();
   }
 }
 
@@ -580,16 +449,8 @@ class GatewaySubmittedTx implements BridgeSubmittedTx {
     return Buffer.from(this.submitted.getResult());
   }
 
-  getResult(): Buffer {
-    return this.Result();
-  }
-
   TransactionID(): string {
     return this.submitted.getTransactionId();
-  }
-
-  getTransactionId(): string {
-    return this.TransactionID();
   }
 
   async WaitForCommit(): Promise<BridgeResult<CommitStatus>> {
@@ -617,14 +478,6 @@ class GatewaySubmittedTx implements BridgeSubmittedTx {
         transactionId: this.submitted.getTransactionId(),
       }));
     }
-  }
-
-  async waitForCommit(): Promise<BridgeResult<CommitStatus>> {
-    return this.WaitForCommit();
-  }
-
-  async getStatus(): Promise<BridgeResult<CommitStatus>> {
-    return this.WaitForCommit();
   }
 }
 

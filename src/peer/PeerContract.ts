@@ -8,7 +8,6 @@ import type {
   BridgeNetwork,
   BridgeResult,
   BridgeSignedProposal,
-  BridgeSignedTransaction,
   BridgeSubmittedTx,
   BridgeTransaction,
   BridgeUnsignedProposal,
@@ -19,7 +18,7 @@ import type {
   SinglePeerOptions,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
-import type { DiscoveryResult } from '../types/discovery';
+import type { DiscoveryResult, PeerInfo } from '../types/discovery';
 import {
   CommitError,
   ConfigurationError,
@@ -33,7 +32,7 @@ import {
   TimeoutError,
 } from '../errors/index';
 import { DEFAULT_TIMEOUTS } from '../types/config';
-import { PeerConnection } from './PeerConnection';
+import { normalizePeerEndpointIdentity, PeerConnection } from './PeerConnection';
 import { DiscoveryCache } from '../cache/DiscoveryCache';
 import { log } from '../utils/logger';
 import { selectSinglePeers } from './peerSelection';
@@ -41,6 +40,7 @@ import type { FailoverDecision } from '../types/failover';
 import { classifyFailover } from './failoverEligibility';
 import { TransactionTargeting } from '../transactionTargeting';
 import { decodeSignedMessage, digestBytes, signedMessage, signingRequest } from '../offlineSigning';
+import { proposalCreatorCertificate, proposalCreatorIdentity, proposalCreatorMSPID } from '../offlineSigning';
 
 // fabric-network exposes these runtime objects but not stable public TS types for the internals we need.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -89,7 +89,7 @@ export async function NewPeerSignedProposal(
   config: BridgeConfig,
   message: SignedMessage,
 ): Promise<BridgeResult<BridgeSignedProposal>> {
-  const decoded = decodePeerSignedMessage(message, 'proposal');
+  const decoded = decodePeerSignedMessage(message);
   if (!decoded.isOk()) {
     return Result.err(decoded.error);
   }
@@ -99,6 +99,11 @@ export async function NewPeerSignedProposal(
       message: 'peer signed proposal requires peer routing',
     }));
   }
+  const routingPeers = normalizeSnapshotPeerEndpoints(decoded.value.routing.peers, !!config.tlsOptions?.trustedRoots);
+  if (!routingPeers.isOk()) {
+    return Result.err(routingPeers.error);
+  }
+  const routing = { ...decoded.value.routing, peers: routingPeers.value };
 
   try {
     const proposal = fabproto6.protos.Proposal.decode(decoded.value.bytes);
@@ -113,39 +118,7 @@ export async function NewPeerSignedProposal(
       decoded.value.bytes,
       decoded.value.digest,
       decoded.value.signature,
-      decoded.value.routing,
-    ));
-  } catch (error) {
-    return Result.err(new ConfigurationError({
-      message: error instanceof Error ? error.message : String(error),
-    }));
-  }
-}
-
-export async function NewPeerSignedTransaction(
-  gateway: fabricNetwork.Gateway,
-  config: BridgeConfig,
-  timeouts: Required<TimeoutConfig>,
-  message: SignedMessage,
-): Promise<BridgeResult<BridgeSignedTransaction>> {
-  const decoded = decodePeerSignedMessage(message, 'transaction');
-  if (!decoded.isOk()) {
-    return Result.err(decoded.error);
-  }
-
-  try {
-    const payload = fabproto6.common.Payload.decode(decoded.value.bytes);
-    const header = fabproto6.common.Header.decode(payload.header);
-    const channelHeader = fabproto6.common.ChannelHeader.decode(header.channel_header);
-    const channelName = channelHeader.channel_id;
-    const network = await gateway.getNetwork(channelName);
-    return Result.ok(new PeerSignedTransaction(
-      network,
-      config,
-      timeouts,
-      decoded.value.bytes,
-      decoded.value.digest,
-      decoded.value.signature,
+      routing,
     ));
   } catch (error) {
     return Result.err(new ConfigurationError({
@@ -209,18 +182,6 @@ class PeerContract implements BridgeContract {
       this.channelName,
     );
   }
-
-  async submitTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
-    return this.Submit(name, ...args);
-  }
-
-  async evaluateTransaction(name: string, ...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    return this.Evaluate(name, ...args);
-  }
-
-  createTransaction(name: string): BridgeTransaction {
-    return this.Transaction(name);
-  }
 }
 
 class PeerTransaction implements BridgeTransaction {
@@ -269,10 +230,6 @@ class PeerTransaction implements BridgeTransaction {
     return Result.ok(this);
   }
 
-  useSinglePeer(options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
-    return this.UseSinglePeer(options);
-  }
-
   UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
     const targeting = TransactionTargeting.endorsingPeers(peerNames);
     if (!targeting.isOk()) {
@@ -282,17 +239,9 @@ class PeerTransaction implements BridgeTransaction {
     return Result.ok(this);
   }
 
-  useEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
-    return this.UseEndorsingPeers(peerNames);
-  }
-
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
     this.transientData = copyTransientData(transientData);
     return this;
-  }
-
-  setTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
-    return this.SetTransientData(transientData);
   }
 
   async Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
@@ -307,10 +256,6 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return Result.ok(new PeerCommitResult(submittedResult.value, commitStatus.value));
-  }
-
-  async submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
-    return this.Submit(...args);
   }
 
   async SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
@@ -331,10 +276,6 @@ class PeerTransaction implements BridgeTransaction {
       },
       catch: (error) => this.mapSubmitError(error as Error),
     });
-  }
-
-  async submitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    return this.SubmitAsync(...args);
   }
 
   async Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
@@ -362,10 +303,6 @@ class PeerTransaction implements BridgeTransaction {
     }
   }
 
-  async evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    return this.Evaluate(...args);
-  }
-
   async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
     const stringArgs = normalizeArgs(args);
 
@@ -382,9 +319,11 @@ class PeerTransaction implements BridgeTransaction {
         }));
       }
 
+      const endorsingPeerNames = this.targeting.endorsingPeerNames();
       const transaction = await this.createPreparedTransaction();
-      const tx = transaction as any;
-      const peers = (tx.endorsingPeers ?? []).map((peer: { name?: string }) => peer.name).filter(Boolean);
+      const peers = endorsingPeerNames.length > 0
+        ? await this.resolvedEndorsingPeerSnapshot(endorsingPeerNames)
+        : [];
       const routing: OfflineSigningRouting = peers.length > 0
         ? { mode: 'endorsing-peers', peers }
         : { mode: 'gateway-default' };
@@ -450,6 +389,20 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return transaction;
+  }
+
+  private async resolvedEndorsingPeerSnapshot(peerNames: string[]): Promise<string[]> {
+    const discoveryResult = await this.ensureDiscovery();
+    if (!discoveryResult.isOk()) {
+      throw discoveryResult.error;
+    }
+
+    const peerInfos = this.resolvePeerInfos(discoveryResult.value, peerNames);
+    if (!peerInfos.isOk()) {
+      throw peerInfos.error;
+    }
+
+    return peerInfos.value.map((peer) => peer.endpoint);
   }
 
   private async resolveSinglePeerEndorsers(): Promise<Array<{ peerName: string; endorser: any }>> {
@@ -739,30 +692,25 @@ class PeerTransaction implements BridgeTransaction {
   private matchPeersToEndorsers(
     discovery: DiscoveryResult,
     peerNames: string[],
-  ): Result<any[], PeerNotFoundError> {
+  ): Result<any[], PeerNotFoundError | ConfigurationError> {
     const endorsers: any[] = [];
-    const notFound: string[] = [];
     const availablePeers = Array.from(discovery.peers.keys());
+    const network = (this.contract as any).network;
+    const channel = network?.getChannel?.() || (network as any)?.channel;
 
-    for (const peerName of peerNames) {
-      const peerInfo = this.peerConnection.matchPeerByPartialName(
-        discovery,
-        peerName,
-      );
+    if (!channel) {
+      return Result.err(new PeerNotFoundError({
+        peerName: peerNames.join(', '),
+        availablePeers,
+      }));
+    }
 
-      if (!peerInfo) {
-        notFound.push(peerName);
-        continue;
-      }
-
-      const network = (this.contract as any).network;
-      const channel = network?.getChannel?.() || (network as any)?.channel;
-
-      if (!channel) {
-        notFound.push(peerName);
-        continue;
-      }
-
+    const peerInfos = this.resolvePeerInfos(discovery, peerNames);
+    if (!peerInfos.isOk()) {
+      return Result.err(peerInfos.error);
+    }
+    const notFound: string[] = [];
+    for (const peerInfo of peerInfos.value) {
       const endorser = channel.getEndorser?.(peerInfo.endpoint);
       if (endorser) {
         endorsers.push(endorser);
@@ -771,13 +719,12 @@ class PeerTransaction implements BridgeTransaction {
 
       const allEndorsers = channel.getEndorsers?.() || [];
       const matched = allEndorsers.find(
-        (candidate: { name?: string }) =>
-          candidate.name?.includes(peerName) || peerName.includes(candidate.name || ''),
+        (candidate: { name?: string }) => candidate.name === peerInfo.endpoint,
       );
       if (matched) {
         endorsers.push(matched);
       } else {
-        notFound.push(peerName);
+        notFound.push(peerInfo.endpoint);
       }
     }
 
@@ -791,6 +738,39 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return Result.ok(endorsers);
+  }
+
+  private resolvePeerInfos(
+    discovery: DiscoveryResult,
+    peerNames: string[],
+  ): Result<PeerInfo[], PeerNotFoundError | ConfigurationError> {
+    const peerInfos: PeerInfo[] = [];
+    const notFound: string[] = [];
+    const seen = new Set<string>();
+
+    for (const peerName of peerNames) {
+      const canonicalPeerName = this.peerConnection.normalizePeerEndpointIdentity(peerName);
+      if (seen.has(canonicalPeerName)) {
+        continue;
+      }
+      seen.add(canonicalPeerName);
+
+      const peerInfo = this.peerConnection.matchPeerByEndpointIdentity(discovery, canonicalPeerName);
+      if (!peerInfo) {
+        notFound.push(canonicalPeerName);
+        continue;
+      }
+      peerInfos.push(peerInfo);
+    }
+
+    if (notFound.length > 0) {
+      return Result.err(new PeerNotFoundError({
+        peerName: notFound.join(', '),
+        availablePeers: Array.from(discovery.peers.keys()),
+      }));
+    }
+
+    return Result.ok(peerInfos);
   }
 
   private matchPeerInfosToEndorsers(
@@ -813,13 +793,11 @@ class PeerTransaction implements BridgeTransaction {
     const allEndorsers = channel.getEndorsers?.() || [];
     for (const peer of peers) {
       const endorser = channel.getEndorser?.(peer.endpoint) ??
-        allEndorsers.find((candidate: { name?: string }) =>
-          candidate.name?.includes(peer.name) || peer.name.includes(candidate.name || ''),
-        );
+        allEndorsers.find((candidate: { name?: string }) => candidate.name === peer.endpoint);
       if (endorser) {
-        endorsers.push({ peerName: peer.name, endorser });
+        endorsers.push({ peerName: peer.endpoint, endorser });
       } else {
-        notFound.push(peer.name);
+        notFound.push(peer.endpoint);
       }
     }
 
@@ -882,14 +860,15 @@ class PeerTransaction implements BridgeTransaction {
     return asBuffer(payload);
   }
 
-  private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError | SinglePeerExecutionError | PeerNotFoundError | DiscoveryError {
+  private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError | SinglePeerExecutionError | PeerNotFoundError | DiscoveryError | ConfigurationError {
     if (
       error instanceof EndorsementError ||
       error instanceof SubmitError ||
       error instanceof TimeoutError ||
       error instanceof SinglePeerExecutionError ||
       error instanceof PeerNotFoundError ||
-      error instanceof DiscoveryError
+      error instanceof DiscoveryError ||
+      error instanceof ConfigurationError
     ) {
       return error;
     }
@@ -939,25 +918,11 @@ class PeerCommitResult implements BridgeCommitResult {
   Result(): Buffer {
     return this.submitted.Result();
   }
-
-  getResult(): Buffer {
-    return this.Result();
-  }
-
   TransactionID(): string {
     return this.submitted.TransactionID();
   }
-
-  getTransactionId(): string {
-    return this.TransactionID();
-  }
-
   CommitStatus(): CommitStatus {
     return this.commitStatus;
-  }
-
-  getCommitStatus(): CommitStatus {
-    return this.CommitStatus();
   }
 }
 
@@ -979,29 +944,11 @@ class PeerSubmittedTx implements BridgeSubmittedTx {
   Result(): Buffer {
     return this.result;
   }
-
-  getResult(): Buffer {
-    return this.Result();
-  }
-
   TransactionID(): string {
     return this.transactionId;
   }
-
-  getTransactionId(): string {
-    return this.TransactionID();
-  }
-
   async WaitForCommit(): Promise<BridgeResult<CommitStatus>> {
     return this.waitForCommitFn();
-  }
-
-  async waitForCommit(): Promise<BridgeResult<CommitStatus>> {
-    return this.WaitForCommit();
-  }
-
-  async getStatus(): Promise<BridgeResult<CommitStatus>> {
-    return this.WaitForCommit();
   }
 }
 
@@ -1015,41 +962,32 @@ class PeerUnsignedProposal implements BridgeUnsignedProposal {
     this.bytes = Buffer.from(bytes);
     this.digest = Buffer.from(digest);
     this.transactionId = transactionId;
-    this.routing = routing;
+    this.routing = routing.mode === 'gateway-default'
+      ? { mode: 'gateway-default' }
+      : { mode: routing.mode, peers: [...routing.peers] };
   }
 
   Bytes(): Buffer {
     return Buffer.from(this.bytes);
   }
-
-  GetBytes(): Buffer {
-    return this.Bytes();
-  }
-
   Digest(): Buffer {
     return Buffer.from(this.digest);
   }
-
-  GetDigest(): Buffer {
-    return this.Digest();
-  }
-
   TransactionID(): string {
     return this.transactionId;
   }
-
-  GetTransactionID(): string {
-    return this.TransactionID();
+  CreatorIdentity(): BridgeResult<Buffer> {
+    return proposalCreatorIdentity(this.bytes);
   }
-
+  CreatorMSPID(): BridgeResult<string> {
+    return proposalCreatorMSPID(this.bytes);
+  }
+  CreatorCertificate(): BridgeResult<Buffer> {
+    return proposalCreatorCertificate(this.bytes);
+  }
   SigningRequest(): SigningRequest {
     return signingRequest(this.bytes, this.digest, this.routing);
   }
-
-  GetSigningRequest(): SigningRequest {
-    return this.SigningRequest();
-  }
-
   WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
     return signedMessage(this.SigningRequest(), signature);
   }
@@ -1059,6 +997,7 @@ class PeerSignedProposal implements BridgeSignedProposal {
   private network: any;
   private channelName: string;
   private config: BridgeConfig;
+  private timeouts: Required<TimeoutConfig>;
   private bytes: Buffer;
   private digest: Buffer;
   private signature: Buffer;
@@ -1080,10 +1019,14 @@ class PeerSignedProposal implements BridgeSignedProposal {
     this.network = network as any;
     this.channelName = channelName;
     this.config = config;
+    this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
     this.bytes = Buffer.from(bytes);
     this.digest = Buffer.from(digest);
     this.signature = Buffer.from(signature);
-    this.routing = routing;
+    this.routing = {
+      mode: routing.mode,
+      peers: uniqueCanonicalPeerEndpoints(routing.peers, !!config.tlsOptions?.trustedRoots),
+    };
     this.proposal = fabproto6.protos.Proposal.decode(this.bytes);
     this.header = fabproto6.common.Header.decode(this.proposal.header);
     const channelHeader = fabproto6.common.ChannelHeader.decode(this.header.channel_header);
@@ -1095,24 +1038,29 @@ class PeerSignedProposal implements BridgeSignedProposal {
   TransactionID(): string {
     return this.transactionId;
   }
-
-  GetTransactionID(): string {
-    return this.TransactionID();
-  }
-
   async Endorse(): Promise<BridgeResult<BridgeEndorsedTransaction>> {
     try {
       const proposalResponse = await this.sendProposal();
       const payload = getPeerProposalPayload(proposalResponse);
       const txPayload = this.buildTransactionPayload(proposalResponse.responses);
       return Result.ok(new PeerEndorsedTransaction(
+        this.network,
+        this.config,
+        this.timeouts,
         txPayload,
-        digestBytes(txPayload),
         payload,
         this.transactionId,
       ));
     } catch (error) {
-      return Result.err(error instanceof EndorsementError ? error : new EndorsementError({
+      if (
+        error instanceof EndorsementError ||
+        error instanceof PeerNotFoundError ||
+        error instanceof DiscoveryError ||
+        error instanceof ConfigurationError
+      ) {
+        return Result.err(error);
+      }
+      return Result.err(new EndorsementError({
         message: error instanceof Error ? error.message : String(error),
       }));
     }
@@ -1123,6 +1071,13 @@ class PeerSignedProposal implements BridgeSignedProposal {
       const proposalResponse = await this.sendProposal();
       return Result.ok(getPeerProposalPayload(proposalResponse));
     } catch (error) {
+      if (
+        error instanceof PeerNotFoundError ||
+        error instanceof DiscoveryError ||
+        error instanceof ConfigurationError
+      ) {
+        return Result.err(error);
+      }
       return Result.err(new EvaluationError({
         message: error instanceof Error ? error.message : String(error),
       }));
@@ -1139,20 +1094,29 @@ class PeerSignedProposal implements BridgeSignedProposal {
     endorsement._action.header = this.header;
     endorsement._action.transactionId = this.transactionId;
 
-    const targets = this.resolveEndorsers(channel);
+    const targets = await this.resolveEndorsers(channel);
     const proposalResponse = await endorsement.send({ targets });
     endorsement._proposalResponses = proposalResponse.responses;
     endorsement._proposalErrors = proposalResponse.errors;
     return proposalResponse;
   }
 
-  private resolveEndorsers(channel: any): any[] {
+  private async resolveEndorsers(channel: any): Promise<any[]> {
+    const discovery = await discoveredPeerEndpoints(this.network, this.channelName, !!this.config.tlsOptions?.trustedRoots);
+    const missingFromDiscovery = this.routing.peers.filter((endpoint) => !discovery.has(endpoint));
+    if (missingFromDiscovery.length > 0) {
+      throw new PeerNotFoundError({
+        peerName: missingFromDiscovery.join(', '),
+        availablePeers: Array.from(discovery),
+      });
+    }
+
     const allEndorsers = channel.getEndorsers?.() ?? [];
     const targets = this.routing.peers
-      .map((endpoint) => channel.getEndorser?.(endpoint) ??
-        allEndorsers.find((candidate: { name?: string }) =>
-          candidate.name === endpoint || candidate.name?.includes(endpoint) || endpoint.includes(candidate.name || ''),
-        ))
+      .map((endpoint) => {
+        return channel.getEndorser?.(endpoint) ??
+          allEndorsers.find((candidate: { name?: string }) => candidate.name === endpoint);
+      })
       .filter(Boolean);
 
     if (targets.length !== this.routing.peers.length) {
@@ -1201,68 +1165,32 @@ class PeerSignedProposal implements BridgeSignedProposal {
 }
 
 class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
+  private network: any;
+  private config: BridgeConfig;
+  private timeouts: Required<TimeoutConfig>;
   private bytes: Buffer;
-  private digest: Buffer;
   private result: Buffer;
   private transactionId: string;
 
-  constructor(bytes: Buffer, digest: Buffer, result: Buffer, transactionId: string) {
+  constructor(
+    network: fabricNetwork.Network,
+    config: BridgeConfig,
+    timeouts: Required<TimeoutConfig>,
+    bytes: Buffer,
+    result: Buffer,
+    transactionId: string,
+  ) {
+    this.network = network as any;
+    this.config = config;
+    this.timeouts = timeouts;
     this.bytes = Buffer.from(bytes);
-    this.digest = Buffer.from(digest);
     this.result = Buffer.from(result);
     this.transactionId = transactionId;
   }
 
   Bytes(): Buffer { return Buffer.from(this.bytes); }
-  GetBytes(): Buffer { return this.Bytes(); }
-  Digest(): Buffer { return Buffer.from(this.digest); }
-  GetDigest(): Buffer { return this.Digest(); }
   Result(): Buffer { return Buffer.from(this.result); }
-  GetResult(): Buffer { return this.Result(); }
   TransactionID(): string { return this.transactionId; }
-  GetTransactionID(): string { return this.TransactionID(); }
-
-  SigningRequest(): SigningRequest {
-    return signingRequest(this.bytes, this.digest);
-  }
-
-  GetSigningRequest(): SigningRequest {
-    return this.SigningRequest();
-  }
-
-  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
-    return signedMessage(this.SigningRequest(), signature);
-  }
-}
-
-class PeerSignedTransaction implements BridgeSignedTransaction {
-  private network: any;
-  private config: BridgeConfig;
-  private timeouts: Required<TimeoutConfig>;
-  private bytes: Buffer;
-  private signature: Buffer;
-  private transactionId: string;
-  private result: Buffer = Buffer.alloc(0);
-
-  constructor(network: fabricNetwork.Network, config: BridgeConfig, timeouts: Required<TimeoutConfig>, bytes: Buffer, digest: Buffer, signature: Buffer) {
-    if (!digestBytes(bytes).equals(digest)) {
-      throw new OfflineSigningError({ field: 'digest', message: 'digest does not match transaction bytes' });
-    }
-    this.network = network as any;
-    this.config = config;
-    this.timeouts = timeouts;
-    this.bytes = Buffer.from(bytes);
-    this.signature = Buffer.from(signature);
-    const payload = fabproto6.common.Payload.decode(this.bytes);
-    const header = fabproto6.common.Header.decode(payload.header);
-    const channelHeader = fabproto6.common.ChannelHeader.decode(header.channel_header);
-    this.transactionId = channelHeader.tx_id;
-  }
-
-  Result(): Buffer { return Buffer.from(this.result); }
-  GetResult(): Buffer { return this.Result(); }
-  TransactionID(): string { return this.transactionId; }
-  GetTransactionID(): string { return this.TransactionID(); }
 
   async SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>> {
     try {
@@ -1272,7 +1200,7 @@ class PeerSignedTransaction implements BridgeSignedTransaction {
       const commit = channel.newCommit('_offline');
       commit._reset();
       commit._payload = this.bytes;
-      commit._signature = this.signature;
+      commit._signature = await this.config.signer(digestBytes(this.bytes));
       const response = await commit.send({ targets: channel.getCommitters() });
       if (response.status !== 'SUCCESS') {
         throw new SubmitError({
@@ -1298,7 +1226,7 @@ class PeerSignedTransaction implements BridgeSignedTransaction {
   }
 }
 
-function decodePeerSignedMessage(message: SignedMessage, expected: 'proposal' | 'transaction'): BridgeResult<{
+function decodePeerSignedMessage(message: SignedMessage): BridgeResult<{
   bytes: Buffer;
   digest: Buffer;
   signature: Buffer;
@@ -1306,11 +1234,9 @@ function decodePeerSignedMessage(message: SignedMessage, expected: 'proposal' | 
 }> {
   const decoded = decodeSignedMessage(message);
   if (!decoded.isOk()) return Result.err(decoded.error);
-  if (expected === 'proposal') {
-    const actualDigest = digestBytes(decoded.value.bytes);
-    if (!actualDigest.equals(decoded.value.digest)) {
-      return Result.err(new OfflineSigningError({ field: 'digest', message: 'digest does not match proposal bytes' }));
-    }
+  const actualDigest = digestBytes(decoded.value.bytes);
+  if (!actualDigest.equals(decoded.value.digest)) {
+    return Result.err(new OfflineSigningError({ field: 'digest', message: 'digest does not match proposal bytes' }));
   }
   return Result.ok(decoded.value);
 }
@@ -1379,6 +1305,59 @@ async function createPeerCommitWaiter(network: any, peers: any[], transactionId:
 
 function normalizeArgs(args: unknown[]): string[] {
   return args.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg)));
+}
+
+function uniqueCanonicalPeerEndpoints(peers: string[], tlsEnabled: boolean): string[] {
+  return uniquePeerEndpoints(peers, (peer) => normalizePeerEndpointIdentity(peer, tlsEnabled));
+}
+
+function normalizeSnapshotPeerEndpoints(peers: string[], tlsEnabled: boolean): BridgeResult<string[]> {
+  try {
+    return Result.ok(uniqueCanonicalPeerEndpoints(peers, tlsEnabled));
+  } catch (error) {
+    return Result.err(new OfflineSigningError({
+      field: 'routing.peers',
+      message: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+async function discoveredPeerEndpoints(network: any, channelName: string, tlsEnabled: boolean): Promise<Set<string>> {
+  const service = network.discoveryService;
+  if (service?.getDiscoveryResults) {
+    await service.getDiscoveryResults(true);
+  }
+
+  const results = service?.discoveryResults ?? {};
+  const out = new Set<string>();
+  for (const orgInfo of Object.values(results.peers_by_org ?? {})) {
+    for (const peer of ((orgInfo as { peers?: Array<{ endpoint?: string }> }).peers ?? [])) {
+      if (!peer.endpoint) {
+        continue;
+      }
+      const endpoint = normalizePeerEndpointIdentity(peer.endpoint, tlsEnabled);
+      if (out.has(endpoint)) {
+        throw new DiscoveryError({
+          message: `Discovery returned duplicate peer endpoint identity for channel ${channelName}: ${endpoint}`,
+        });
+      }
+      out.add(endpoint);
+    }
+  }
+  return out;
+}
+
+function uniquePeerEndpoints(peers: string[], normalize: (peer: string) => string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const peer of peers) {
+    const canonical = normalize(peer);
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      out.push(canonical);
+    }
+  }
+  return out;
 }
 
 function copyTransientData(input: Record<string, Buffer>): Record<string, Buffer> {

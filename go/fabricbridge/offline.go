@@ -10,6 +10,7 @@ import (
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	gatewayProto "github.com/hyperledger/fabric-protos-go-apiv2/gateway"
+	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
@@ -68,6 +69,37 @@ func (p *UnsignedProposal) TransactionID() string {
 	return p.transactionID
 }
 
+// CreatorIdentity returns the serialized Fabric identity embedded in this proposal.
+func (p *UnsignedProposal) CreatorIdentity() ([]byte, error) {
+	return proposalCreatorIdentity(p.bytes)
+}
+
+// CreatorMSPID returns the MSP ID embedded in this proposal's creator identity.
+func (p *UnsignedProposal) CreatorMSPID() (string, error) {
+	creator, err := p.CreatorIdentity()
+	if err != nil {
+		return "", err
+	}
+	identity := &msp.SerializedIdentity{}
+	if err := proto.Unmarshal(creator, identity); err != nil {
+		return "", &OfflineSigningError{Field: "creator", Message: fmt.Sprintf("unmarshal creator identity: %v", err)}
+	}
+	return identity.GetMspid(), nil
+}
+
+// CreatorCertificate returns the certificate bytes embedded in this proposal's creator identity.
+func (p *UnsignedProposal) CreatorCertificate() ([]byte, error) {
+	creator, err := p.CreatorIdentity()
+	if err != nil {
+		return nil, err
+	}
+	identity := &msp.SerializedIdentity{}
+	if err := proto.Unmarshal(creator, identity); err != nil {
+		return nil, &OfflineSigningError{Field: "creator", Message: fmt.Sprintf("unmarshal creator identity: %v", err)}
+	}
+	return append([]byte(nil), identity.GetIdBytes()...), nil
+}
+
 // SigningRequest returns the portable signing DTO.
 func (p *UnsignedProposal) SigningRequest() SigningRequest {
 	return signingRequest(p.bytes, p.digest, p.routing)
@@ -104,7 +136,7 @@ func (p *SignedProposal) TransactionID() string {
 	return p.proposal.TransactionID()
 }
 
-// Endorse obtains endorsement and returns an endorsed transaction for external signing.
+// Endorse obtains endorsement and returns an endorsed transaction ready for SDK-managed submit.
 func (p *SignedProposal) Endorse(ctx context.Context) (*EndorsedTransaction, error) {
 	if p.proposal == nil {
 		return p.endorsePeer(ctx)
@@ -132,13 +164,14 @@ func (p *SignedProposal) Evaluate(ctx context.Context) ([]byte, error) {
 	return result, nil
 }
 
-// EndorsedTransaction is an endorsed transaction that needs a client transaction signature.
+// EndorsedTransaction is an endorsed transaction ready for SDK-managed transaction signing and submit.
 type EndorsedTransaction struct {
 	transaction *fabricGateway.Transaction
 	bytes       []byte
-	digest      []byte
 	result      []byte
 	txID        string
+	bridge      *Bridge
+	channelName string
 }
 
 // Bytes returns canonical Fabric bytes for this endorsed transaction.
@@ -147,14 +180,6 @@ func (t *EndorsedTransaction) Bytes() ([]byte, error) {
 		return append([]byte(nil), t.bytes...), nil
 	}
 	return t.transaction.Bytes()
-}
-
-// Digest returns the digest external signers should sign.
-func (t *EndorsedTransaction) Digest() []byte {
-	if t.transaction == nil {
-		return append([]byte(nil), t.digest...)
-	}
-	return t.transaction.Digest()
 }
 
 // Result returns the endorsed transaction result.
@@ -173,57 +198,8 @@ func (t *EndorsedTransaction) TransactionID() string {
 	return t.transaction.TransactionID()
 }
 
-// SigningRequest returns the portable signing DTO.
-func (t *EndorsedTransaction) SigningRequest() (SigningRequest, error) {
-	bytes, err := t.Bytes()
-	if err != nil {
-		return SigningRequest{}, err
-	}
-	return signingRequest(bytes, t.Digest(), nil), nil
-}
-
-// WithSignature returns a signed-message DTO using the supplied external signature.
-func (t *EndorsedTransaction) WithSignature(signature []byte) (SignedMessage, error) {
-	req, err := t.SigningRequest()
-	if err != nil {
-		return SignedMessage{}, err
-	}
-	return SignedMessage{
-		Bytes:     req.Bytes,
-		Digest:    req.Digest,
-		Signature: base64.StdEncoding.EncodeToString(signature),
-	}, nil
-}
-
-// SignedTransaction is an endorsed transaction with the client transaction signature attached.
-type SignedTransaction struct {
-	transaction *fabricGateway.Transaction
-	bridge      *Bridge
-	payload     []byte
-	signature   []byte
-	result      []byte
-	txID        string
-	channelName string
-}
-
-// Result returns the endorsed transaction result.
-func (t *SignedTransaction) Result() []byte {
-	if t.transaction == nil {
-		return append([]byte(nil), t.result...)
-	}
-	return t.transaction.Result()
-}
-
-// TransactionID returns the Fabric transaction ID.
-func (t *SignedTransaction) TransactionID() string {
-	if t.transaction == nil {
-		return t.txID
-	}
-	return t.transaction.TransactionID()
-}
-
-// SubmitAsync submits the signed transaction without waiting for commit.
-func (t *SignedTransaction) SubmitAsync(ctx context.Context) (*SubmittedTransaction, error) {
+// SubmitAsync signs the endorsed transaction with the bridge identity and submits it without waiting for commit.
+func (t *EndorsedTransaction) SubmitAsync(ctx context.Context) (*SubmittedTransaction, error) {
 	if t.transaction == nil {
 		return t.submitPeer(ctx)
 	}
@@ -253,12 +229,12 @@ func (p *SignedProposal) endorsePeer(ctx context.Context) (*EndorsedTransaction,
 	if err != nil {
 		return nil, &EndorsementError{Message: err.Error()}
 	}
-	digest := sha256.Sum256(payload)
 	return &EndorsedTransaction{
-		bytes:  payload,
-		digest: digest[:],
-		result: result,
-		txID:   p.transactionID,
+		bytes:       payload,
+		result:      result,
+		txID:        p.transactionID,
+		bridge:      p.bridge,
+		channelName: p.channelName,
 	}, nil
 }
 
@@ -276,11 +252,19 @@ func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*legacyfab.Tra
 	if err != nil {
 		return nil, nil, err
 	}
+	tlsEnabled := discoveredPeersUseTLS(discovered)
+	if err := ensureUniqueDiscoveredPeerEndpoints(discovered, tlsEnabled); err != nil {
+		return nil, nil, err
+	}
 	var targets []legacyfab.Peer
 	for _, endpoint := range p.routing.Peers {
-		peer, ok := matchDiscoveredPeer(discovered, endpoint)
+		canonicalEndpoint, err := normalizeSnapshotPeerEndpoint(endpoint, tlsEnabled)
+		if err != nil {
+			return nil, nil, err
+		}
+		peer, ok := matchDiscoveredPeer(discovered, canonicalEndpoint)
 		if !ok {
-			return nil, nil, &PeerNotFoundError{PeerName: endpoint, AvailablePeers: peerURLs(discovered)}
+			return nil, nil, &PeerNotFoundError{PeerName: canonicalEndpoint, AvailablePeers: peerURLs(discovered)}
 		}
 		targets = append(targets, peer)
 	}
@@ -309,10 +293,24 @@ func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*legacyfab.Tra
 	return responses, proposal, nil
 }
 
-func (t *SignedTransaction) submitPeer(ctx context.Context) (*SubmittedTransaction, error) {
-	envelope := &common.Envelope{Payload: append([]byte(nil), t.payload...), Signature: append([]byte(nil), t.signature...)}
+func normalizeSnapshotPeerEndpoint(endpoint string, tlsEnabled bool) (string, error) {
+	canonical, err := normalizePeerEndpointIdentity(endpoint, tlsEnabled)
+	if err != nil {
+		return "", &OfflineSigningError{Field: "routing.peers", Message: err.Error()}
+	}
+	return canonical, nil
+}
+
+func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransaction, error) {
+	digest := sha256.Sum256(t.bytes)
+	signature, err := t.bridge.config.Signer.Sign(digest[:])
+	if err != nil {
+		return nil, &SubmitError{Message: fmt.Sprintf("sign transaction payload: %v", err), TransactionID: t.txID}
+	}
+
+	envelope := &common.Envelope{Payload: append([]byte(nil), t.bytes...), Signature: signature}
 	client := gatewayProto.NewGatewayClient(t.bridge.grpcConnection)
-	_, err := client.Submit(ctx, &gatewayProto.SubmitRequest{
+	_, err = client.Submit(ctx, &gatewayProto.SubmitRequest{
 		TransactionId:       t.txID,
 		ChannelId:           t.channelName,
 		PreparedTransaction: envelope,
@@ -329,8 +327,8 @@ func (t *SignedTransaction) submitPeer(ctx context.Context) (*SubmittedTransacti
 	}, nil
 }
 
-// Submit submits the signed transaction and waits for commit.
-func (t *SignedTransaction) Submit(ctx context.Context) (*CommitResult, error) {
+// Submit signs the endorsed transaction with the bridge identity, submits it, and waits for commit.
+func (t *EndorsedTransaction) Submit(ctx context.Context) (*CommitResult, error) {
 	submitted, err := t.SubmitAsync(ctx)
 	if err != nil {
 		return nil, err
@@ -430,6 +428,22 @@ func parsePeerProposal(proposalBytes []byte) (*peerProto.Proposal, string, strin
 		return nil, "", "", "", &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal chaincode header extension: %v", err)}
 	}
 	return proposal, channelHeader.GetChannelId(), extension.GetChaincodeId().GetName(), channelHeader.GetTxId(), nil
+}
+
+func proposalCreatorIdentity(proposalBytes []byte) ([]byte, error) {
+	proposal := &peerProto.Proposal{}
+	if err := proto.Unmarshal(proposalBytes, proposal); err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal proposal: %v", err)}
+	}
+	header := &common.Header{}
+	if err := proto.Unmarshal(proposal.GetHeader(), header); err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal proposal header: %v", err)}
+	}
+	signatureHeader := &common.SignatureHeader{}
+	if err := proto.Unmarshal(header.GetSignatureHeader(), signatureHeader); err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal signature header: %v", err)}
+	}
+	return append([]byte(nil), signatureHeader.GetCreator()...), nil
 }
 
 func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*legacyfab.TransactionProposalResponse) ([]byte, error) {

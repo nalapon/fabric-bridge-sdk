@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -162,6 +164,10 @@ func orderSinglePeers(channelName string, peers []fab.Peer, opts singlePeerOptio
 }
 
 func resolveSinglePeerCandidates(discovered []fab.Peer, candidates []string) ([]fab.Peer, error) {
+	tlsEnabled := discoveredPeersUseTLS(discovered)
+	if err := ensureUniqueDiscoveredPeerEndpoints(discovered, tlsEnabled); err != nil {
+		return nil, err
+	}
 	if len(candidates) == 0 {
 		if len(discovered) == 0 {
 			return nil, &PeerNotFoundError{PeerName: "<discovered peers>"}
@@ -173,14 +179,22 @@ func resolveSinglePeerCandidates(discovered []fab.Peer, candidates []string) ([]
 	var missing []string
 	seen := make(map[string]bool)
 	for _, candidate := range candidates {
-		peer, ok := matchDiscoveredPeer(discovered, candidate)
+		canonicalCandidate, err := normalizePeerEndpointIdentity(candidate, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		peer, ok := matchDiscoveredPeer(discovered, canonicalCandidate)
 		if !ok {
-			missing = append(missing, candidate)
+			missing = append(missing, canonicalCandidate)
 			continue
 		}
-		if !seen[peer.URL()] {
+		canonicalPeer, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[canonicalPeer] {
 			resolved = append(resolved, peer)
-			seen[peer.URL()] = true
+			seen[canonicalPeer] = true
 		}
 	}
 	if len(missing) > 0 {
@@ -198,11 +212,63 @@ func resolveSinglePeerCandidates(discovered []fab.Peer, candidates []string) ([]
 	return resolved, nil
 }
 
-func matchDiscoveredPeer(peers []fab.Peer, name string) (fab.Peer, bool) {
+func resolveEndorsingPeerTargets(discovered []fab.Peer, names []string) ([]fab.Peer, error) {
+	if len(names) == 0 {
+		return nil, &ConfigurationError{
+			Field:   "endorsingPeers",
+			Message: "UseEndorsingPeers requires at least one peer",
+		}
+	}
+
+	tlsEnabled := discoveredPeersUseTLS(discovered)
+	if err := ensureUniqueDiscoveredPeerEndpoints(discovered, tlsEnabled); err != nil {
+		return nil, err
+	}
+	var resolved []fab.Peer
+	var missing []string
+	seen := make(map[string]bool)
+	for _, name := range names {
+		canonicalName, err := normalizePeerEndpointIdentity(name, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		peer, ok := matchDiscoveredPeer(discovered, canonicalName)
+		if !ok {
+			missing = append(missing, canonicalName)
+			continue
+		}
+		canonicalPeer, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[canonicalPeer] {
+			resolved = append(resolved, peer)
+			seen[canonicalPeer] = true
+		}
+	}
+	if len(missing) > 0 {
+		return nil, &PeerNotFoundError{
+			PeerName:       strings.Join(missing, ", "),
+			AvailablePeers: peerURLs(discovered),
+		}
+	}
+	if len(resolved) == 0 {
+		return nil, &PeerNotFoundError{
+			PeerName:       strings.Join(names, ", "),
+			AvailablePeers: peerURLs(discovered),
+		}
+	}
+	return resolved, nil
+}
+
+func matchDiscoveredPeer(peers []fab.Peer, canonicalEndpoint string) (fab.Peer, bool) {
+	tlsEnabled := discoveredPeersUseTLS(peers)
 	for _, peer := range peers {
-		url := peer.URL()
-		host := extractHost(url)
-		if name == url || name == host || strings.Contains(host, name) || strings.Contains(name, host) {
+		canonicalPeer, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)
+		if err != nil {
+			continue
+		}
+		if canonicalEndpoint == canonicalPeer {
 			return peer, true
 		}
 	}
@@ -212,9 +278,76 @@ func matchDiscoveredPeer(peers []fab.Peer, name string) (fab.Peer, bool) {
 func peerURLs(peers []fab.Peer) []string {
 	out := make([]string, 0, len(peers))
 	for _, peer := range peers {
+		if canonical, err := canonicalDiscoveredPeerEndpoint(peer, discoveredPeersUseTLS(peers)); err == nil {
+			out = append(out, canonical)
+			continue
+		}
 		out = append(out, peer.URL())
 	}
 	return out
+}
+
+func discoveredPeersUseTLS(peers []fab.Peer) bool {
+	for _, peer := range peers {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(peer.URL())), "grpcs://") {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalDiscoveredPeerEndpoint(peer fab.Peer, tlsEnabled bool) (string, error) {
+	return normalizePeerEndpointIdentity(peer.URL(), tlsEnabled)
+}
+
+func ensureUniqueDiscoveredPeerEndpoints(peers []fab.Peer, tlsEnabled bool) error {
+	seen := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		canonical, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)
+		if err != nil {
+			return err
+		}
+		if seen[canonical] {
+			return &DiscoveryError{Message: fmt.Sprintf("duplicate discovered peer endpoint identity: %s", canonical)}
+		}
+		seen[canonical] = true
+	}
+	return nil
+}
+
+func normalizePeerEndpointIdentity(raw string, tlsEnabled bool) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", &ConfigurationError{Field: "peerEndpoint", Message: "peer endpoint must be a non-empty host:port value"}
+	}
+
+	scheme := ""
+	hostPort := value
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "grpc://") || strings.HasPrefix(lower, "grpcs://") {
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Host == "" || parsed.Path != "" {
+			return "", &ConfigurationError{Field: "peerEndpoint", Message: fmt.Sprintf("peer endpoint must be grpc(s)://host:port: %s", raw)}
+		}
+		scheme = strings.ToLower(parsed.Scheme)
+		hostPort = parsed.Host
+	} else {
+		if strings.Contains(value, "://") {
+			return "", &ConfigurationError{Field: "peerEndpoint", Message: fmt.Sprintf("peer endpoint scheme must be grpc or grpcs: %s", raw)}
+		}
+		if tlsEnabled {
+			scheme = "grpcs"
+		} else {
+			scheme = "grpc"
+		}
+	}
+
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil || host == "" || port == "" {
+		return "", &ConfigurationError{Field: "peerEndpoint", Message: fmt.Sprintf("peer endpoint must include host:port: %s", raw)}
+	}
+
+	return fmt.Sprintf("%s://%s:%s", scheme, strings.ToLower(host), port), nil
 }
 
 func executeSinglePeerTargets[T any](

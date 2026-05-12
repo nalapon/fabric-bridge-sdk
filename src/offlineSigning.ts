@@ -3,6 +3,10 @@ import { Result } from 'better-result';
 import { OfflineSigningError } from './errors/index';
 import type { OfflineSigningRouting, SignedMessage, SigningRequest } from './types/bridge';
 
+// fabric-network uses fabric-protos v1 internally for peer-mode proposal bytes.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const fabproto6 = require('fabric-protos');
+
 export function toBase64(bytes: Buffer | Uint8Array): string {
   return Buffer.from(bytes).toString('base64');
 }
@@ -99,6 +103,48 @@ export function validateProposalRouting(routing: OfflineSigningRouting | undefin
     mode: routing.mode,
     peers: [...routing.peers],
   });
+}
+
+export function proposalCreatorIdentity(proposalBytes: Buffer | Uint8Array): Result<Buffer, OfflineSigningError> {
+  try {
+    const proposal = fabproto6.protos.Proposal.decode(Buffer.from(proposalBytes));
+    const header = fabproto6.common.Header.decode(proposal.header);
+    const signatureHeader = fabproto6.common.SignatureHeader.decode(header.signature_header);
+    return Result.ok(Buffer.from(signatureHeader.creator));
+  } catch (error) {
+    return Result.err(new OfflineSigningError({
+      field: 'bytes',
+      message: `unable to inspect proposal creator identity: ${error instanceof Error ? error.message : String(error)}`,
+    }));
+  }
+}
+
+export function proposalCreatorMSPID(proposalBytes: Buffer | Uint8Array): Result<string, OfflineSigningError> {
+  const creator = proposalCreatorIdentity(proposalBytes);
+  if (!creator.isOk()) return Result.err(creator.error);
+  try {
+    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
+    return Result.ok(identity.mspid);
+  } catch (error) {
+    return Result.err(new OfflineSigningError({
+      field: 'creator',
+      message: `unable to inspect proposal creator MSPID: ${error instanceof Error ? error.message : String(error)}`,
+    }));
+  }
+}
+
+export function proposalCreatorCertificate(proposalBytes: Buffer | Uint8Array): Result<Buffer, OfflineSigningError> {
+  const creator = proposalCreatorIdentity(proposalBytes);
+  if (!creator.isOk()) return Result.err(creator.error);
+  try {
+    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
+    return Result.ok(Buffer.from(identity.id_bytes));
+  } catch (error) {
+    return Result.err(new OfflineSigningError({
+      field: 'creator',
+      message: `unable to inspect proposal creator certificate: ${error instanceof Error ? error.message : String(error)}`,
+    }));
+  }
 }
 
 function decodeBase64(value: string, field: string): Result<Buffer, OfflineSigningError> {

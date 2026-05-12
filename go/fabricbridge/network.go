@@ -324,15 +324,23 @@ func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string
 		if len(ordered) == 0 {
 			return nil, &PeerNotFoundError{PeerName: "<single-peer>", AvailablePeers: peerURLs(discovered)}
 		}
-		routing = &OfflineSigningRouting{Mode: "single-peer", Peers: []string{ordered[0].URL()}}
+		canonical, err := canonicalDiscoveredPeerEndpoint(ordered[0], discoveredPeersUseTLS(discovered))
+		if err != nil {
+			return nil, err
+		}
+		routing = &OfflineSigningRouting{Mode: "single-peer", Peers: []string{canonical}}
 	} else {
+		targets, err := resolveEndorsingPeerTargets(discovered, t.targeting.endorsingPeerNames())
+		if err != nil {
+			return nil, err
+		}
 		var peers []string
-		for _, name := range t.targeting.endorsingPeerNames() {
-			peer, ok := matchDiscoveredPeer(discovered, name)
-			if !ok {
-				return nil, &PeerNotFoundError{PeerName: name, AvailablePeers: peerURLs(discovered)}
+		for _, peer := range targets {
+			canonical, err := canonicalDiscoveredPeerEndpoint(peer, discoveredPeersUseTLS(discovered))
+			if err != nil {
+				return nil, err
 			}
-			peers = append(peers, peer.URL())
+			peers = append(peers, canonical)
 		}
 		routing = &OfflineSigningRouting{Mode: "endorsing-peers", Peers: peers}
 	}
@@ -455,19 +463,30 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
 
+	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
+	if err != nil {
+		pc.Close()
+		return nil, &DiscoveryError{Message: "discover peers for UseEndorsingPeers", Cause: err}
+	}
+	targets, err := resolveEndorsingPeerTargets(discovered, t.targeting.endorsingPeerNames())
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+
 	// Convert args to byte arrays
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	submitted, err := pc.SubmitAsync(
+	submitted, err := pc.SubmitAsyncTargets(
 		ctx,
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
-		t.targeting.endorsingPeerNames(),
+		targets,
 		t.transientData,
 	)
 	if err != nil {
@@ -647,18 +666,27 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 	}
 	defer pc.Close()
 
+	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
+	if err != nil {
+		return nil, &DiscoveryError{Message: "discover peers for UseEndorsingPeers", Cause: err}
+	}
+	targets, err := resolveEndorsingPeerTargets(discovered, t.targeting.endorsingPeerNames())
+	if err != nil {
+		return nil, err
+	}
+
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
 		byteArgs[i] = []byte(arg)
 	}
 
-	result, err := pc.Query(
+	result, err := pc.QueryTargets(
 		ctx,
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
 		byteArgs,
-		t.targeting.endorsingPeerNames(),
+		targets,
 		t.transientData,
 	)
 	if err != nil {

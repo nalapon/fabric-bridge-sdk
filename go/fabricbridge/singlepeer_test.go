@@ -162,6 +162,48 @@ func TestTransactionTargetingAllowsEmptySinglePeerCandidates(t *testing.T) {
 	}
 }
 
+func TestResolveSinglePeerCandidatesRequiresExactEndpoint(t *testing.T) {
+	peers := []fab.Peer{
+		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
+		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
+	}
+
+	_, err := resolveSinglePeerCandidates(peers, []string{"peer0"})
+	var configErr *ConfigurationError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("expected ConfigurationError for missing host:port, got %T: %v", err, err)
+	}
+
+	resolved, err := resolveSinglePeerCandidates(peers, []string{"peer0.org1.example.com:7051"})
+	if err != nil {
+		t.Fatalf("expected host:port to resolve, got %v", err)
+	}
+	if got, want := len(resolved), 1; got != want {
+		t.Fatalf("resolved peer count mismatch: got %d want %d", got, want)
+	}
+
+	_, err = resolveSinglePeerCandidates(peers, []string{"peer2.org1.example.com:9051"})
+	var notFound *PeerNotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("expected PeerNotFoundError for undiscovered endpoint, got %T: %v", err, err)
+	}
+}
+
+func TestResolveEndorsingPeerTargetsDeduplicatesCanonicalEndpoints(t *testing.T) {
+	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
+
+	resolved, err := resolveEndorsingPeerTargets(peers, []string{
+		"peer0.org1.example.com:7051",
+		"grpcs://peer0.org1.example.com:7051",
+	})
+	if err != nil {
+		t.Fatalf("expected duplicate endpoints to resolve, got %v", err)
+	}
+	if got, want := len(resolved), 1; got != want {
+		t.Fatalf("resolved peer count mismatch: got %d want %d", got, want)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

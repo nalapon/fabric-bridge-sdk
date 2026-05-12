@@ -61,6 +61,10 @@ async function createSigner(privateKey: Buffer) {
   return signers.newPrivateKeySigner(createPrivateKey(privateKey));
 }
 
+async function signDigest(signer: any, digest: Buffer): Promise<Buffer> {
+  return Buffer.from(await signer(digest));
+}
+
 async function createBridge(org: typeof ORG1, signer: any, cert: Buffer, key: Buffer, tls: Buffer) {
   return new FabricBridge({
     gatewayPeer: org.gateway,
@@ -221,6 +225,134 @@ async function usingOrg2Peer() {
   await bridge.disconnect();
 }
 
+async function usingOrg1OfflineGateway() {
+  console.log("\n[ORG1 - OFFLINE SIGNING - GATEWAY DEFAULT]");
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+
+  const conn = await bridge.connect();
+  if (!conn.isOk()) throw new Error(conn.error.message);
+
+  const networkResult = await bridge.getNetwork(CHANNEL);
+  if (!networkResult.isOk()) throw new Error(networkResult.error.message);
+  const contract = await networkResult.value.getContract(CHAINCODE);
+
+  const id = `org1_offline_gw_${Date.now()}`;
+  const tx = contract.Transaction("CreateAsset");
+  const unsignedProposal = await tx.NewUnsignedProposal(
+    id,
+    "purple",
+    "25",
+    "Org1OfflineGateway",
+    "5000",
+  );
+  if (!unsignedProposal.isOk()) throw new Error(unsignedProposal.error.message);
+
+  const proposalRequest = unsignedProposal.value.SigningRequest();
+  console.log("Proposal routing:", proposalRequest.routing?.mode);
+
+  const signedProposalMessage = unsignedProposal.value.WithSignature(
+    await signDigest(signer, unsignedProposal.value.Digest()),
+  );
+  if (!signedProposalMessage.isOk()) throw new Error(signedProposalMessage.error.message);
+
+  const signedProposal = await bridge.NewSignedProposal(signedProposalMessage.value);
+  if (!signedProposal.isOk()) throw new Error(signedProposal.error.message);
+
+  const endorsed = await signedProposal.value.Endorse();
+  if (!endorsed.isOk()) throw new Error(endorsed.error.message);
+
+  const transactionRequest = endorsed.value.SigningRequest();
+  console.log("Transaction digest bytes:", Buffer.from(transactionRequest.digest, "base64").length);
+
+  const signedTransactionMessage = endorsed.value.WithSignature(
+    await signDigest(signer, endorsed.value.Digest()),
+  );
+  if (!signedTransactionMessage.isOk()) throw new Error(signedTransactionMessage.error.message);
+
+  const signedTransaction = await bridge.NewSignedTransaction(signedTransactionMessage.value);
+  if (!signedTransaction.isOk()) throw new Error(signedTransaction.error.message);
+
+  const result = await signedTransaction.value.Submit();
+  if (result.isOk()) {
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
+    if (read.isOk()) {
+      console.log("Verified:", JSON.parse(read.value.toString()));
+    }
+  } else {
+    console.error("Failed:", result.error.message);
+  }
+
+  await bridge.disconnect();
+}
+
+async function usingOrg1OfflineSinglePeer() {
+  console.log("\n[ORG1 - OFFLINE SIGNING - SINGLE PEER]");
+  const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
+  const signer = await createSigner(privateKey);
+  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+
+  const conn = await bridge.connect();
+  if (!conn.isOk()) throw new Error(conn.error.message);
+
+  const networkResult = await bridge.getNetwork(CHANNEL);
+  if (!networkResult.isOk()) throw new Error(networkResult.error.message);
+  const contract = await networkResult.value.getContract(CHAINCODE);
+
+  const id = `org1_offline_sp_${Date.now()}`;
+  const tx = contract.Transaction("CreateAsset");
+  const targeted = tx.UseSinglePeer({ candidates: [ORG1.peer] });
+  if (!targeted.isOk()) throw new Error(targeted.error.message);
+
+  const unsignedProposal = await targeted.value.NewUnsignedProposal(
+    id,
+    "orange",
+    "30",
+    "Org1OfflineSinglePeer",
+    "6000",
+  );
+  if (!unsignedProposal.isOk()) throw new Error(unsignedProposal.error.message);
+
+  const proposalRequest = unsignedProposal.value.SigningRequest();
+  console.log("Proposal routing:", proposalRequest.routing);
+
+  const signedProposalMessage = unsignedProposal.value.WithSignature(
+    await signDigest(signer, unsignedProposal.value.Digest()),
+  );
+  if (!signedProposalMessage.isOk()) throw new Error(signedProposalMessage.error.message);
+
+  const signedProposal = await bridge.NewSignedProposal(signedProposalMessage.value);
+  if (!signedProposal.isOk()) throw new Error(signedProposal.error.message);
+
+  const endorsed = await signedProposal.value.Endorse();
+  if (!endorsed.isOk()) throw new Error(endorsed.error.message);
+
+  const signedTransactionMessage = endorsed.value.WithSignature(
+    await signDigest(signer, endorsed.value.Digest()),
+  );
+  if (!signedTransactionMessage.isOk()) throw new Error(signedTransactionMessage.error.message);
+
+  const signedTransaction = await bridge.NewSignedTransaction(signedTransactionMessage.value);
+  if (!signedTransaction.isOk()) throw new Error(signedTransaction.error.message);
+
+  const result = await signedTransaction.value.Submit();
+  if (result.isOk()) {
+    console.log(`Created: ${result.value.TransactionID()}`);
+    console.log(`Block: ${result.value.CommitStatus().blockNumber.toString()}`);
+    const read = await contract.Evaluate("ReadAsset", id);
+    if (read.isOk()) {
+      console.log("Verified:", JSON.parse(read.value.toString()));
+    }
+  } else {
+    console.error("Failed:", result.error.message);
+  }
+
+  await bridge.disconnect();
+}
+
 async function main() {
   console.log("Fabric Bridge SDK - Multi-Org Example\n");
 
@@ -228,6 +360,8 @@ async function main() {
   await usingOrg2Gateway();
   await usingOrg1Peer();
   await usingOrg2Peer();
+  await usingOrg1OfflineGateway();
+  await usingOrg1OfflineSinglePeer();
 
   console.log("\nDone");
 }

@@ -68,6 +68,14 @@ _Avoid_: full message bytes as signing input
 A portable representation of a **Bridge signable message** that carries canonical Fabric bytes, **Message digest**, and only the operational metadata needed to resume the flow.
 _Avoid_: serialized SDK object, reconstructed proposal
 
+**Proposal signing request**:
+A **Signing request** whose canonical Fabric bytes represent a proposal to be signed externally before endorsement.
+_Avoid_: transaction signing request, full offline transaction signing
+
+**Proposal creator identity**:
+The serialized Fabric identity embedded in a proposal and bound to the proposal signature.
+_Avoid_: submitter identity, orderer sender identity
+
 **Signing request wire format**:
 The runtime-specific JSON representation of a **Signing request**, with every binary field encoded as base64.
 _Avoid_: protobuf wrapper, hex digest
@@ -76,12 +84,16 @@ _Avoid_: protobuf wrapper, hex digest
 The operational metadata in a proposal **Signing request** that records whether endorsement should use gateway default routing, one selected peer, or explicit endorsing peers.
 _Avoid_: duplicated transaction metadata
 
+**Peer endpoint identity**:
+The exact endpoint used to identify a discovered peer for targeting and offline endorsement routing; developer input may be `host:port` or `grpc(s)://host:port`, while snapshots store canonical `grpc(s)://host:port` URLs.
+_Avoid_: partial peer name, substring match
+
 **Offline signing flow object**:
 A runtime object that resumes or advances **Offline transaction signing** from a signing DTO and exposes behavior such as endorse or submit.
 _Avoid_: raw JSON operation target
 
 **Endorsed transaction**:
-A Fabric transaction produced by endorsing a signed proposal and requiring the client's transaction signature before submit.
+A Fabric transaction produced by endorsing a signed proposal and ready for SDK-managed transaction signing and submit.
 _Avoid_: unsigned transaction
 
 **Offline signing error**:
@@ -113,23 +125,49 @@ _Avoid_: configuration error, endorsement error
 - **Offline transaction signing** is exposed through **Bridge signable message** types instead of leaking Gateway or legacy SDK transaction types.
 - External signers sign the **Message digest**, while full message bytes remain available for persistence, transport, and signer implementations that require them.
 - A **Signing request** uses canonical Fabric bytes as the source of truth and does not duplicate data already present in the Fabric message.
+- A **Proposal signing request** does not duplicate the **Proposal creator identity** in the wire format.
+- Go and Node SDKs expose explicit inspection of the **Proposal creator identity** from a **Proposal signing request** or bridge signable proposal object.
 - A **Signing request** may include operational metadata that is not present in the Fabric message but is required to resume the same bridge flow.
 - Node and Go expose the same offline signing concepts but do not share a cross-runtime signing DTO contract.
 - A proposal **Signing request** includes an **Endorsement routing snapshot**.
+- An **Endorsement routing snapshot** stores only routing mode and canonical peer endpoints; channel, chaincode, transaction identity, and creator identity are read from canonical Fabric bytes.
 - An **Endorsement routing snapshot** stores resolved peer endpoints, not candidate names or aliases.
+- An **Endorsement routing snapshot** is an immutable record of the exact **Peer endpoint identity** values selected when the proposal **Signing request** was created.
+- Peer resolution compares exact **Peer endpoint identity** values and never uses substring matching.
+- **Peer endpoint identity** normalization is deterministic: existing `grpc://` or `grpcs://` schemes are preserved, missing schemes are filled from TLS mode, hosts are lowercased, and ports are required.
+- **Peer endpoint identity** values never include paths, query strings, fragments, DNS resolution, aliases, or partial peer names.
+- When discovery is available, the canonical **Peer endpoint identity** stored in an **Endorsement routing snapshot** is taken from the discovered peer endpoint, not from developer input alone.
+- TLS mode is only a fallback for normalizing developer input before discovery has identified the peer.
+- Invalid **Peer endpoint identity** format is local configuration failure; a valid endpoint absent from discovery is a peer-not-found failure.
+- During offline resume, malformed **Peer endpoint identity** values in an **Endorsement routing snapshot** are **Offline signing error** values, while valid values absent from current channel discovery are peer-not-found failures.
+- **EndorsingPeers API** deduplicates normalized **Peer endpoint identity** values while preserving developer order.
+- **SinglePeer API** candidate lists deduplicate normalized **Peer endpoint identity** values before applying the **Peer selection policy**.
+- An **Endorsement routing snapshot** never stores duplicate **Peer endpoint identity** values.
+- Duplicate developer input for the same **Peer endpoint identity** is deduplicated silently, but duplicate discovered peers with the same canonical **Peer endpoint identity** are ambiguous discovery and fail before endorsement.
+- **Transaction targeting** can only select peers discovered for the channel; valid endpoints absent from channel discovery are never used for endorsement.
+- **Candidate peer selection** and **Explicit peer targeting** fail the whole operation when any requested **Peer endpoint identity** is absent from channel discovery.
+- Offline resume revalidates the **Endorsement routing snapshot** against current channel discovery and never substitutes a different peer automatically.
+- Offline resume fails locally when any **Peer endpoint identity** recorded in the **Endorsement routing snapshot** is absent from current channel discovery.
+- Offline **Single-peer transaction** snapshots store exactly the selected **Peer endpoint identity**, not the full eligible peer set.
 - **Endorsement routing snapshot** appears only on proposal **Signing request** values because peer routing ends at endorsement.
 - An **Endorsement routing snapshot** selects endorsement targets but does not replace the bridge network, TLS, discovery, or orderer configuration required to resume the flow.
 - The **Signing request wire format** encodes `bytes`, **Message digest**, and signatures as base64.
 - The SDK validates that a signed-message digest matches the canonical Fabric bytes but does not verify the external signature cryptographically before sending to Fabric.
 - Signed-message DTOs retain the **Message digest** from the **Signing request**, and the bridge validates it against the canonical Fabric bytes before resuming.
 - Malformed signing DTOs fail with an **Offline signing error** before any Fabric network call is attempted.
+- The bridge performs mandatory structural validation of signed proposal DTOs and treats cryptographic verification of the external proposal signature as optional application policy.
 - A configured transaction is the factory for the proposal **Signing request** so that **Transaction targeting** and transient data are captured before signing.
+- Developers do not manually construct **Proposal signing request** values; the SDK builds the proposal and exposes the **Message digest** to be signed.
 - The bridge root object rehydrates signed-message DTOs into **Offline signing flow object** values within the same runtime.
 - A proposal **Signing request** captures the effective peer set for one endorsement attempt.
 - **Single-peer failover** during **Offline transaction signing** requires a new proposal **Signing request** and a new external signature for each attempted peer.
 - **Signing request** and signed-message DTOs are portable data, while **Offline signing flow object** types own runtime behavior.
-- A signed proposal produces an **Endorsed transaction**, and the **Endorsed transaction** produces the next **Signing request** for the client's transaction signature.
-- **Offline transaction signing** never falls back to a local signer when a required external signature is missing.
+- A **Signing request** is currently always a **Proposal signing request**.
+- A signed proposal produces an **Endorsed transaction**, and the SDK signs the final transaction with the bridge identity before submit.
+- **Offline transaction signing** currently signs only the proposal externally; final transaction signing uses the bridge identity loaded in the SDK.
+- The identity that signs the proposal and the identity that submits to the orderer may differ; the proposal signature is bound to the **Proposal creator identity**.
+- The bridge accepts a signed proposal whose **Proposal creator identity** differs from the loaded bridge identity.
+- Local policy that restricts accepted **Proposal creator identity** values is optional application policy, not default bridge behavior.
 - **Offline transaction signing** begins when a transaction creates a proposal **Signing request**; it is not enabled by global bridge state.
 - **Offline transaction signing** supports evaluation as a proposal-only flow that ends after a signed proposal is evaluated.
 - Commit tracking after offline submit uses the bridge identity and signer through the existing commit-waiting behavior.

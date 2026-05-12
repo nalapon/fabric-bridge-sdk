@@ -203,51 +203,6 @@ func (b *Bridge) NewSignedProposal(message SignedMessage) (*SignedProposal, erro
 	return &SignedProposal{proposal: proposal}, nil
 }
 
-// NewSignedTransaction resumes an offline signing flow from signed transaction bytes.
-func (b *Bridge) NewSignedTransaction(message SignedMessage) (*SignedTransaction, error) {
-	b.modeMu.RLock()
-	defer b.modeMu.RUnlock()
-
-	if !b.connected || b.gatewayClient == nil {
-		return nil, &NotConnectedError{Component: "Bridge", Action: "resume signed transaction"}
-	}
-
-	messageBytes, digest, signature, _, err := decodeSignedMessage(message)
-	if err != nil {
-		return nil, err
-	}
-
-	unsigned, err := b.gatewayClient.NewTransaction(messageBytes)
-	if err != nil {
-		digestSum := sha256.Sum256(messageBytes)
-		if !equalDigest(digestSum[:], digest) {
-			return nil, digestMismatch("digest")
-		}
-		channelName, txID, result, parseErr := parsePeerPayload(messageBytes)
-		if parseErr != nil {
-			return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
-		}
-		return &SignedTransaction{
-			bridge:      b,
-			payload:     messageBytes,
-			signature:   signature,
-			result:      result,
-			txID:        txID,
-			channelName: channelName,
-		}, nil
-	}
-	if !equalDigest(unsigned.Digest(), digest) {
-		return nil, digestMismatch("digest")
-	}
-
-	transaction, err := b.gatewayClient.NewSignedTransaction(messageBytes, signature)
-	if err != nil {
-		return nil, &OfflineSigningError{Field: "bytes", Message: err.Error()}
-	}
-
-	return &SignedTransaction{transaction: transaction}, nil
-}
-
 // switchToPeerMode disconnects from the Gateway service and connects to peers
 // via fabric-sdk-go. channelName is used to build the connection profile.
 func (b *Bridge) switchToPeerMode(channelName string) error {

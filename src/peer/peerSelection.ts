@@ -49,15 +49,17 @@ function resolveCandidatePeers(
   const seen = new Set<string>();
 
   for (const candidate of candidates) {
-    const peer = peerConnection.matchPeerByPartialName(discovery, candidate);
-    if (!peer) {
-      missing.push(candidate);
+    const canonicalCandidate = peerConnection.normalizePeerEndpointIdentity(candidate);
+    if (seen.has(canonicalCandidate)) {
       continue;
     }
-    if (!seen.has(peer.endpoint)) {
-      resolved.push(peer);
-      seen.add(peer.endpoint);
+    const peer = peerConnection.matchPeerByEndpointIdentity(discovery, canonicalCandidate);
+    if (!peer) {
+      missing.push(canonicalCandidate);
+      continue;
     }
+    resolved.push(peer);
+    seen.add(peer.endpoint);
   }
 
   if (missing.length > 0) {

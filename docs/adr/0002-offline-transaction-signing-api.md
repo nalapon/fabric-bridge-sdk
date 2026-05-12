@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0003
+---
+
 # Offline Transaction Signing API
 
 Fabric Bridge SDK will expose offline transaction signing as a bridge-owned API across Node and Go, covering gateway default, single-peer, and endorsing-peers transaction targeting. Node and Go expose the same concepts and method names, but each runtime owns its own signing DTO representation instead of guaranteeing cross-runtime resume.

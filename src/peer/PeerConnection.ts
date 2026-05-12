@@ -44,6 +44,10 @@ function sanitizeEndpoint(endpoint: string | undefined): string {
   return endpoint.trim().replace(/^"+|"+$/g, "");
 }
 
+function endpointUsesTLS(config: BridgeConfig): boolean {
+  return !!config.tlsOptions?.trustedRoots;
+}
+
 export class PeerConnection {
   private gateway: fabricNetwork.Gateway | null = null;
   private config: BridgeConfig;
@@ -294,9 +298,12 @@ export class PeerConnection {
     for (const [mspId, orgInfo] of Object.entries(discoveredPeers)) {
       const peersList = (orgInfo as any).peers || [];
       for (const peer of peersList) {
-        const endpoint = sanitizeEndpoint(peer.endpoint);
-        const peerName = endpoint.split(":")[0] || "unknown";
-        peers.set(peerName, {
+        const endpoint = this.normalizePeerEndpointIdentity(sanitizeEndpoint(peer.endpoint));
+        if (peers.has(endpoint)) {
+          throw new Error(`Discovery returned duplicate peer endpoint identity: ${endpoint}`);
+        }
+        const peerName = endpointHost(endpoint) || "unknown";
+        peers.set(endpoint, {
           name: peerName,
           endpoint,
           mspId: mspId,
@@ -341,34 +348,79 @@ export class PeerConnection {
     };
   }
 
-  matchPeerByPartialName(
+  matchPeerByEndpointIdentity(
     discoveryResult: DiscoveryResult,
-    partialName: string,
+    endpoint: string,
   ): PeerInfo | null {
-    // First try exact match
-    if (discoveryResult.peers.has(partialName)) {
-      return discoveryResult.peers.get(partialName)!;
-    }
+    const canonicalEndpoint = this.normalizePeerEndpointIdentity(endpoint);
+    return discoveryResult.peers.get(canonicalEndpoint) ?? null;
+  }
 
-    // Try partial match
-    for (const [peerName, peerInfo] of discoveryResult.peers) {
-      if (peerName.includes(partialName) || partialName.includes(peerName)) {
-        return peerInfo;
-      }
-    }
+  normalizePeerEndpointIdentity(endpoint: string): string {
+    return normalizePeerEndpointIdentity(endpoint, endpointUsesTLS(this.config));
+  }
+}
 
-    // Try matching by endpoint hostname
-    for (const [, peerInfo] of discoveryResult.peers) {
-      const endpointHostname = peerInfo.endpoint.split(":")[0];
-      if (!endpointHostname) continue;
-      if (
-        endpointHostname.includes(partialName) ||
-        partialName.includes(endpointHostname)
-      ) {
-        return peerInfo;
-      }
-    }
+export function normalizePeerEndpointIdentity(raw: string, tlsEnabled: boolean): string {
+  const value = raw.trim();
+  if (!value) {
+    throw new ConfigurationError({
+      field: 'peerEndpoint',
+      message: 'peer endpoint must be a non-empty host:port value',
+    });
+  }
 
-    return null;
+  const lower = value.toLowerCase();
+  let scheme = tlsEnabled ? 'grpcs' : 'grpc';
+  let hostPort = value;
+  if (lower.startsWith('grpc://') || lower.startsWith('grpcs://')) {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'grpc:' && parsed.protocol !== 'grpcs:') {
+      throw new ConfigurationError({
+        field: 'peerEndpoint',
+        message: `peer endpoint scheme must be grpc or grpcs: ${raw}`,
+      });
+    }
+    if (!['', '/'].includes(parsed.pathname) || parsed.search || parsed.hash || !parsed.hostname || !parsed.port) {
+      throw new ConfigurationError({
+        field: 'peerEndpoint',
+        message: `peer endpoint must be grpc(s)://host:port: ${raw}`,
+      });
+    }
+    scheme = parsed.protocol.slice(0, -1);
+    hostPort = `${parsed.hostname}:${parsed.port}`;
+  } else if (value.includes('://')) {
+    throw new ConfigurationError({
+      field: 'peerEndpoint',
+      message: `peer endpoint scheme must be grpc or grpcs: ${raw}`,
+    });
+  }
+
+  const separator = hostPort.lastIndexOf(':');
+  if (separator <= 0 || separator === hostPort.length - 1) {
+    throw new ConfigurationError({
+      field: 'peerEndpoint',
+      message: `peer endpoint must include host:port: ${raw}`,
+    });
+  }
+
+  const host = hostPort.slice(0, separator).toLowerCase();
+  const port = hostPort.slice(separator + 1);
+  if (!/^\d+$/.test(port)) {
+    throw new ConfigurationError({
+      field: 'peerEndpoint',
+      message: `peer endpoint port must be numeric: ${raw}`,
+    });
+  }
+
+  return `${scheme}://${host}:${port}`;
+}
+
+function endpointHost(endpoint: string): string {
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    const separator = endpoint.lastIndexOf(':');
+    return separator > 0 ? endpoint.slice(0, separator) : endpoint;
   }
 }
