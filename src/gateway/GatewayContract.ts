@@ -1,5 +1,8 @@
 import * as fabricGateway from '@hyperledger/fabric-gateway';
+import * as fabricProtos from '@hyperledger/fabric-protos';
 import { Result } from 'better-result';
+import { createHash, randomBytes } from 'node:crypto';
+import timestampModule from 'google-protobuf/google/protobuf/timestamp_pb.js';
 import type {
   BridgeCommitResult,
   BridgeContract,
@@ -13,6 +16,7 @@ import type {
   CommitStatus,
   SignedMessage,
   SinglePeerOptions,
+  ProposalCreator,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
 import {
@@ -36,6 +40,8 @@ import {
   validateProposalRouting,
 } from '../offlineSigning';
 
+const { Timestamp } = timestampModule as typeof import('google-protobuf/google/protobuf/timestamp_pb.js');
+
 export class GatewayNetwork implements BridgeNetwork {
   private gatewayConnection: GatewayConnection;
   private channelName: string;
@@ -51,22 +57,25 @@ export class GatewayNetwork implements BridgeNetwork {
     const gateway = this.gatewayConnection.getGateway();
     const network = gateway.getNetwork(this.channelName);
     const contract = network.getContract(chaincodeName);
-    return new GatewayContract(contract, chaincodeName, this.timeouts);
+    return new GatewayContract(contract, chaincodeName, this.channelName, this.timeouts);
   }
 }
 
 class GatewayContract implements BridgeContract {
   private contract: fabricGateway.Contract;
   private chaincodeName: string;
+  private channelName: string;
   private timeouts: Required<TimeoutConfig>;
 
   constructor(
     contract: fabricGateway.Contract,
     chaincodeName: string,
+    channelName: string,
     timeouts: Required<TimeoutConfig>,
   ) {
     this.contract = contract;
     this.chaincodeName = chaincodeName;
+    this.channelName = channelName;
     this.timeouts = timeouts;
   }
 
@@ -101,6 +110,7 @@ class GatewayContract implements BridgeContract {
     return new GatewayTransaction(
       name,
       this.chaincodeName,
+      this.channelName,
       this.contract,
       this.timeouts,
     );
@@ -141,18 +151,22 @@ class GatewayContract implements BridgeContract {
 class GatewayTransaction implements BridgeTransaction {
   private name: string;
   private chaincodeName: string;
+  private channelName: string;
   private contract: fabricGateway.Contract;
   private timeouts: Required<TimeoutConfig>;
   private transientData: Record<string, Buffer> = {};
+  private proposalCreator?: ProposalCreator;
 
   constructor(
     name: string,
     chaincodeName: string,
+    channelName: string,
     contract: fabricGateway.Contract,
     timeouts: Required<TimeoutConfig>,
   ) {
     this.name = name;
     this.chaincodeName = chaincodeName;
+    this.channelName = channelName;
     this.contract = contract;
     this.timeouts = timeouts;
   }
@@ -182,6 +196,11 @@ class GatewayTransaction implements BridgeTransaction {
     return this;
   }
 
+  SetProposalCreator(proposalCreator: ProposalCreator): BridgeTransaction {
+    this.proposalCreator = copyProposalCreator(proposalCreator);
+    return this;
+  }
+
   async Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>> {
     const submittedResult = await this.SubmitAsync(...args);
     if (!submittedResult.isOk()) {
@@ -197,11 +216,11 @@ class GatewayTransaction implements BridgeTransaction {
   }
 
   async SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>> {
-    const stringArgs = normalizeArgs(args);
+    const normalizedArgs = normalizeArgs(args);
 
     try {
       const submitted = await this.contract.submitAsync(this.name, {
-        arguments: stringArgs,
+        arguments: normalizedArgs,
         transientData: copyTransientData(this.transientData),
       });
 
@@ -212,11 +231,11 @@ class GatewayTransaction implements BridgeTransaction {
   }
 
   async Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>> {
-    const stringArgs = normalizeArgs(args);
+    const normalizedArgs = normalizeArgs(args);
 
     try {
       const result = await this.contract.evaluate(this.name, {
-        arguments: stringArgs,
+        arguments: normalizedArgs,
         transientData: copyTransientData(this.transientData),
       });
       return Result.ok(Buffer.from(result));
@@ -228,14 +247,23 @@ class GatewayTransaction implements BridgeTransaction {
   }
 
   async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
-    const stringArgs = normalizeArgs(args);
+    const normalizedArgs = normalizeArgs(args);
 
     try {
-      const proposal = this.contract.newProposal(this.name, {
-        arguments: stringArgs,
+      if (!this.proposalCreator) {
+        return Result.err(new ConfigurationError({
+          field: 'proposalCreator',
+          message: 'proposalCreator is required to build an unsigned proposal for offline signing',
+        }));
+      }
+      return Result.ok(new GatewayUnsignedProposal(buildGatewayProposal({
+        channelName: this.channelName,
+        chaincodeName: this.chaincodeName,
+        transactionName: this.name,
+        args: normalizedArgs,
         transientData: copyTransientData(this.transientData),
-      });
-      return Result.ok(new GatewayUnsignedProposal(proposal));
+        proposalCreator: this.proposalCreator,
+      })));
     } catch (error) {
       return Result.err(this.mapSubmitError(error as Error));
     }
@@ -291,29 +319,33 @@ export function NewGatewaySignedProposal(
       }));
     }
     const proposal = gateway.newSignedProposal(decoded.value.bytes, decoded.value.signature);
-    return Result.ok(new GatewaySignedProposal(proposal, timeouts));
+    return Result.ok(new GatewaySignedProposal(gateway, proposal, timeouts));
   } catch (error) {
     return Result.err(new SubmitError({ message: (error as Error).message }));
   }
 }
 
 class GatewayUnsignedProposal implements BridgeUnsignedProposal {
-  private proposal: fabricGateway.Proposal;
+  private bytes: Buffer;
+  private digest: Buffer;
+  private transactionId: string;
 
-  constructor(proposal: fabricGateway.Proposal) {
-    this.proposal = proposal;
+  constructor(proposal: BuiltGatewayProposal) {
+    this.bytes = Buffer.from(proposal.bytes);
+    this.digest = Buffer.from(proposal.digest);
+    this.transactionId = proposal.transactionId;
   }
 
   Bytes(): Buffer {
-    return Buffer.from(this.proposal.getBytes());
+    return Buffer.from(this.bytes);
   }
 
   Digest(): Buffer {
-    return Buffer.from(this.proposal.getDigest());
+    return Buffer.from(this.digest);
   }
 
   TransactionID(): string {
-    return this.proposal.getTransactionId();
+    return this.transactionId;
   }
 
   CreatorIdentity(): BridgeResult<Buffer> {
@@ -338,10 +370,12 @@ class GatewayUnsignedProposal implements BridgeUnsignedProposal {
 }
 
 class GatewaySignedProposal implements BridgeSignedProposal {
+  private gateway: fabricGateway.Gateway;
   private proposal: fabricGateway.Proposal;
   private timeouts: Required<TimeoutConfig>;
 
-  constructor(proposal: fabricGateway.Proposal, timeouts: Required<TimeoutConfig>) {
+  constructor(gateway: fabricGateway.Gateway, proposal: fabricGateway.Proposal, timeouts: Required<TimeoutConfig>) {
+    this.gateway = gateway;
     this.proposal = proposal;
     this.timeouts = timeouts;
   }
@@ -353,7 +387,7 @@ class GatewaySignedProposal implements BridgeSignedProposal {
   async Endorse(): Promise<BridgeResult<BridgeEndorsedTransaction>> {
     try {
       const transaction = await this.proposal.endorse();
-      return Result.ok(new GatewayEndorsedTransaction(transaction, this.timeouts));
+      return Result.ok(new GatewayEndorsedTransaction(this.gateway, transaction, this.timeouts));
     } catch (error) {
       return Result.err(new EndorsementError({ message: (error as Error).message }));
     }
@@ -370,16 +404,22 @@ class GatewaySignedProposal implements BridgeSignedProposal {
 }
 
 class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {
+  private gateway: fabricGateway.Gateway;
   private transaction: fabricGateway.Transaction;
   private timeouts: Required<TimeoutConfig>;
 
-  constructor(transaction: fabricGateway.Transaction, timeouts: Required<TimeoutConfig>) {
+  constructor(gateway: fabricGateway.Gateway, transaction: fabricGateway.Transaction, timeouts: Required<TimeoutConfig>) {
+    this.gateway = gateway;
     this.transaction = transaction;
     this.timeouts = timeouts;
   }
 
   Bytes(): Buffer {
     return Buffer.from(this.transaction.getBytes());
+  }
+
+  Digest(): Buffer {
+    return Buffer.from(this.transaction.getDigest());
   }
 
   Result(): Buffer {
@@ -411,6 +451,42 @@ class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {
     }
 
     return Result.ok(new GatewayCommitResult(submitted.value, status.value));
+  }
+
+  SigningRequest() {
+    return signingRequest(this.Bytes(), this.Digest());
+  }
+
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
+    return signedMessage(this.SigningRequest(), signature);
+  }
+
+  async SubmitWithSignature(signature: Buffer | Uint8Array | string): Promise<BridgeResult<BridgeCommitResult>> {
+    const signed = this.WithSignature(signature);
+    if (!signed.isOk()) return Result.err(signed.error);
+
+    const decoded = decodeSignedMessage(signed.value);
+    if (!decoded.isOk()) return Result.err(decoded.error);
+
+    try {
+      const transaction = this.gateway.newTransaction(decoded.value.bytes);
+      if (!Buffer.from(transaction.getDigest()).equals(decoded.value.digest)) {
+        return Result.err(new OfflineSigningError({
+          field: 'digest',
+          message: 'digest does not match transaction bytes',
+        }));
+      }
+
+      const signedTransaction = this.gateway.newSignedTransaction(decoded.value.bytes, decoded.value.signature);
+      const submitted = await signedTransaction.submit();
+      const submittedTx = new GatewaySubmittedTx(submitted, this.timeouts);
+      const status = await submittedTx.WaitForCommit();
+      if (!status.isOk()) return Result.err(status.error);
+
+      return Result.ok(new GatewayCommitResult(submittedTx, status.value));
+    } catch (error) {
+      return Result.err(new SubmitError({ message: (error as Error).message, transactionId: this.TransactionID() }));
+    }
   }
 }
 
@@ -481,8 +557,12 @@ class GatewaySubmittedTx implements BridgeSubmittedTx {
   }
 }
 
-function normalizeArgs(args: unknown[]): string[] {
-  return args.map((arg) => (typeof arg === 'string' ? arg : JSON.stringify(arg)));
+function normalizeArgs(args: unknown[]): Array<string | Uint8Array> {
+  return args.map((arg) => {
+    if (typeof arg === 'string') return arg;
+    if (arg instanceof Uint8Array) return arg;
+    return JSON.stringify(arg);
+  });
 }
 
 function copyTransientData(input: Record<string, Buffer>): Record<string, Buffer> | undefined {
@@ -494,4 +574,99 @@ function copyTransientData(input: Record<string, Buffer>): Record<string, Buffer
   return Object.fromEntries(
     entries.map(([key, value]) => [key, Buffer.from(value)]),
   );
+}
+
+interface BuiltGatewayProposal {
+  bytes: Buffer;
+  digest: Buffer;
+  transactionId: string;
+}
+
+function buildGatewayProposal(options: {
+  channelName: string;
+  chaincodeName: string;
+  transactionName: string;
+  args: Array<string | Uint8Array>;
+  transientData?: Record<string, Buffer>;
+  proposalCreator: ProposalCreator;
+}): BuiltGatewayProposal {
+  const creator = serializedIdentity(options.proposalCreator);
+  const nonce = randomBytes(24);
+  const transactionId = createHash('sha256').update(Buffer.concat([nonce, creator])).digest('hex');
+
+  const signatureHeader = new fabricProtos.common.SignatureHeader();
+  signatureHeader.setCreator(creator);
+  signatureHeader.setNonce(nonce);
+
+  const chaincodeId = new fabricProtos.peer.ChaincodeID();
+  chaincodeId.setName(options.chaincodeName);
+
+  const chaincodeHeaderExtension = new fabricProtos.peer.ChaincodeHeaderExtension();
+  chaincodeHeaderExtension.setChaincodeId(chaincodeId);
+
+  const channelHeader = new fabricProtos.common.ChannelHeader();
+  channelHeader.setType(fabricProtos.common.HeaderType.ENDORSER_TRANSACTION);
+  channelHeader.setTxId(transactionId);
+  channelHeader.setTimestamp(Timestamp.fromDate(new Date()));
+  channelHeader.setChannelId(options.channelName);
+  channelHeader.setExtension$(chaincodeHeaderExtension.serializeBinary());
+  channelHeader.setEpoch(0);
+
+  const header = new fabricProtos.common.Header();
+  header.setChannelHeader(channelHeader.serializeBinary());
+  header.setSignatureHeader(signatureHeader.serializeBinary());
+
+  const chaincodeInput = new fabricProtos.peer.ChaincodeInput();
+  chaincodeInput.setArgsList([options.transactionName, ...options.args].map(asBytes));
+
+  const chaincodeSpec = new fabricProtos.peer.ChaincodeSpec();
+  chaincodeSpec.setType(fabricProtos.peer.ChaincodeSpec.Type.NODE);
+  chaincodeSpec.setChaincodeId(chaincodeId);
+  chaincodeSpec.setInput(chaincodeInput);
+
+  const invocationSpec = new fabricProtos.peer.ChaincodeInvocationSpec();
+  invocationSpec.setChaincodeSpec(chaincodeSpec);
+
+  const payload = new fabricProtos.peer.ChaincodeProposalPayload();
+  payload.setInput(invocationSpec.serializeBinary());
+  const transientMap = payload.getTransientmapMap();
+  for (const [key, value] of Object.entries(options.transientData ?? {})) {
+    transientMap.set(key, value);
+  }
+
+  const proposal = new fabricProtos.peer.Proposal();
+  proposal.setHeader(header.serializeBinary());
+  proposal.setPayload(payload.serializeBinary());
+
+  const signedProposal = new fabricProtos.peer.SignedProposal();
+  signedProposal.setProposalBytes(proposal.serializeBinary());
+
+  const proposedTransaction = new fabricProtos.gateway.ProposedTransaction();
+  proposedTransaction.setProposal(signedProposal);
+  proposedTransaction.setTransactionId(transactionId);
+
+  const proposalBytes = signedProposal.getProposalBytes_asU8();
+  return {
+    bytes: Buffer.from(proposedTransaction.serializeBinary()),
+    digest: createHash('sha256').update(proposalBytes).digest(),
+    transactionId,
+  };
+}
+
+function serializedIdentity(proposalCreator: ProposalCreator): Buffer {
+  const identity = new fabricProtos.msp.SerializedIdentity();
+  identity.setMspid(proposalCreator.mspId);
+  identity.setIdBytes(proposalCreator.credentials);
+  return Buffer.from(identity.serializeBinary());
+}
+
+function asBytes(value: string | Uint8Array): Uint8Array {
+  return typeof value === 'string' ? Buffer.from(value) : value;
+}
+
+function copyProposalCreator(input: ProposalCreator): ProposalCreator {
+  return {
+    mspId: input.mspId,
+    credentials: Buffer.from(input.credentials),
+  };
 }

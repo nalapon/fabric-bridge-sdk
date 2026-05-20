@@ -43,6 +43,11 @@ func (mgr *SigningManager) Sign(object []byte, key core.Key) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if externalKey, ok := key.(interface {
+		SignDigest([]byte) ([]byte, error)
+	}); ok {
+		return externalKey.SignDigest(digest)
+	}
 	signature, err := mgr.cryptoProvider.Sign(key, digest, mgr.signerOpts)
 	if err != nil {
 		return nil, err

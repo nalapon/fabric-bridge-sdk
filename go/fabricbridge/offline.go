@@ -431,6 +431,7 @@ func parsePeerProposal(proposalBytes []byte) (*peerProto.Proposal, string, strin
 }
 
 func proposalCreatorIdentity(proposalBytes []byte) ([]byte, error) {
+	proposalBytes = unwrapProposalBytes(proposalBytes)
 	proposal := &peerProto.Proposal{}
 	if err := proto.Unmarshal(proposalBytes, proposal); err != nil {
 		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal proposal: %v", err)}
@@ -444,6 +445,17 @@ func proposalCreatorIdentity(proposalBytes []byte) ([]byte, error) {
 		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal signature header: %v", err)}
 	}
 	return append([]byte(nil), signatureHeader.GetCreator()...), nil
+}
+
+func unwrapProposalBytes(proposalBytes []byte) []byte {
+	proposedTransaction := &gatewayProto.ProposedTransaction{}
+	if err := proto.Unmarshal(proposalBytes, proposedTransaction); err == nil {
+		rawProposal := proposedTransaction.GetProposal().GetProposalBytes()
+		if len(rawProposal) > 0 {
+			return rawProposal
+		}
+	}
+	return proposalBytes
 }
 
 func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*legacyfab.TransactionProposalResponse) ([]byte, error) {

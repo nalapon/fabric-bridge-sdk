@@ -31,7 +31,6 @@ func main() {
 		fabricbridge.Identity{
 			MSPId:       "Org1MSP",
 			Certificate: []byte("-----BEGIN CERTIFICATE-----\ndummy-cert\n-----END CERTIFICATE-----"),
-			PrivateKey:  []byte("-----BEGIN PRIVATE KEY-----\ndummy-key\n-----END PRIVATE KEY-----"),
 		},
 		signer,
 		fabricbridge.WithDiscovery(true),
@@ -135,7 +134,10 @@ func main() {
 }
 
 func runOfflineGatewayDefault(ctx context.Context, bridge *fabricbridge.Bridge, contract *fabricbridge.Contract, signer fabricbridge.Signer) error {
-	tx := contract.Transaction("CreateAsset")
+	tx := contract.Transaction("CreateAsset").SetProposalCreator(fabricbridge.ProposalCreator{
+		MSPId:       "Org1MSP",
+		Certificate: []byte("-----BEGIN CERTIFICATE-----\ndummy-cert\n-----END CERTIFICATE-----"),
+	})
 	unsignedProposal, err := tx.NewUnsignedProposal(ctx, "asset-offline-gateway", "purple", "25", "Olivia", "500")
 	if err != nil {
 		return err
@@ -169,7 +171,10 @@ func runOfflineGatewayDefault(ctx context.Context, bridge *fabricbridge.Bridge, 
 }
 
 func runOfflineSinglePeer(ctx context.Context, bridge *fabricbridge.Bridge, contract *fabricbridge.Contract, signer fabricbridge.Signer) error {
-	tx := contract.Transaction("CreateAsset")
+	tx := contract.Transaction("CreateAsset").SetProposalCreator(fabricbridge.ProposalCreator{
+		MSPId:       "Org1MSP",
+		Certificate: []byte("-----BEGIN CERTIFICATE-----\ndummy-cert\n-----END CERTIFICATE-----"),
+	})
 	if err := tx.UseSinglePeer(fabricbridge.WithCandidatePeers("peer0.org1.example.com")); err != nil {
 		return err
 	}

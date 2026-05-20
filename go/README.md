@@ -33,9 +33,9 @@ type SimpleSigner struct {
     privateKey []byte
 }
 
-func (s *SimpleSigner) Sign(message []byte) ([]byte, error) {
+func (s *SimpleSigner) Sign(digest []byte) ([]byte, error) {
     // Implement your signing logic here
-    return message, nil
+    return digest, nil
 }
 
 func main() {
@@ -249,7 +249,6 @@ type Config struct {
 type Identity struct {
     MSPId       string  // MSP ID (e.g., "Org1MSP")
     Certificate []byte  // X.509 certificate in PEM format
-    PrivateKey  []byte  // Private key (optional, only needed for peer mode)
 }
 
 type TLSOptions struct {

@@ -10,6 +10,7 @@ import (
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
+	gatewayProto "github.com/hyperledger/fabric-protos-go-apiv2/gateway"
 	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
@@ -210,6 +211,7 @@ type Transaction struct {
 	transactionName string
 	targeting       transactionTargeting
 	transientData   map[string][]byte
+	proposalCreator *ProposalCreator
 }
 
 // UseEndorsingPeers sends proposals to every named peer (peer-targeting mode).
@@ -235,6 +237,13 @@ func (t *Transaction) UseSinglePeer(opts ...SinglePeerOption) error {
 // SetTransientData sets transient data for the transaction
 func (t *Transaction) SetTransientData(data map[string][]byte) *Transaction {
 	t.transientData = data
+	return t
+}
+
+// SetProposalCreator sets the Fabric identity embedded in offline proposals.
+func (t *Transaction) SetProposalCreator(proposalCreator ProposalCreator) *Transaction {
+	clone := cloneProposalCreator(proposalCreator)
+	t.proposalCreator = &clone
 	return t
 }
 
@@ -271,6 +280,13 @@ func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*Submitt
 
 // NewUnsignedProposal creates a signable proposal for offline transaction signing.
 func (t *Transaction) NewUnsignedProposal(ctx context.Context, args ...string) (*UnsignedProposal, error) {
+	if t.proposalCreator == nil {
+		return nil, &ConfigurationError{
+			Field:   "proposalCreator",
+			Message: "proposalCreator is required to build an unsigned proposal for offline signing",
+		}
+	}
+
 	if _, ok := t.targeting.singlePeerOptions(); ok {
 		return t.newUnsignedPeerProposal(ctx, args)
 	}
@@ -278,27 +294,28 @@ func (t *Transaction) NewUnsignedProposal(ctx context.Context, args ...string) (
 		return t.newUnsignedPeerProposal(ctx, args)
 	}
 
-	t.contract.network.bridge.modeMu.RLock()
-	defer t.contract.network.bridge.modeMu.RUnlock()
-
-	opts := []fabricGateway.ProposalOption{
-		fabricGateway.WithArguments(args...),
-	}
-	if len(t.transientData) > 0 {
-		opts = append(opts, fabricGateway.WithTransient(copyTransientData(t.transientData)))
-	}
-
-	proposal, err := t.contract.contract.NewProposal(t.transactionName, opts...)
+	proposal, txID, err := t.buildGatewayProposal(args)
 	if err != nil {
-		return nil, &OfflineSigningError{Message: fmt.Sprintf("create proposal: %v", err)}
+		return nil, err
 	}
 
-	bytes, err := proposal.Bytes()
+	proposalBytes, err := proto.Marshal(proposal)
 	if err != nil {
-		return nil, &OfflineSigningError{Message: fmt.Sprintf("serialize proposal: %v", err)}
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("marshal proposal: %v", err)}
+	}
+	digest := sha256.Sum256(proposalBytes)
+
+	proposedTransactionBytes, err := proto.Marshal(&gatewayProto.ProposedTransaction{
+		TransactionId: txID,
+		Proposal: &peer.SignedProposal{
+			ProposalBytes: proposalBytes,
+		},
+	})
+	if err != nil {
+		return nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("marshal proposed transaction: %v", err)}
 	}
 
-	return newUnsignedProposal(bytes, proposal.Digest(), proposal.TransactionID(), &OfflineSigningRouting{Mode: "gateway-default"}), nil
+	return newUnsignedProposal(proposedTransactionBytes, digest[:], txID, &OfflineSigningRouting{Mode: "gateway-default"}), nil
 }
 
 func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string) (*UnsignedProposal, error) {
@@ -345,7 +362,7 @@ func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string
 		routing = &OfflineSigningRouting{Mode: "endorsing-peers", Peers: peers}
 	}
 
-	proposal, txID, err := t.buildLegacyProposal(args)
+	proposal, txID, err := t.buildPeerProposal(args)
 	if err != nil {
 		return nil, err
 	}
@@ -357,17 +374,27 @@ func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string
 	return newUnsignedProposal(proposalBytes, digest[:], txID, routing), nil
 }
 
-func (t *Transaction) buildLegacyProposal(args []string) (*peer.Proposal, string, error) {
-	id, err := t.contract.network.bridge.config.IdentityProvider()
-	if err != nil {
-		return nil, "", &OfflineSigningError{Field: "identity", Message: err.Error()}
+func (t *Transaction) buildGatewayProposal(args []string) (*peer.Proposal, string, error) {
+	return t.buildProposal(args, 0)
+}
+
+func (t *Transaction) buildPeerProposal(args []string) (*peer.Proposal, string, error) {
+	return t.buildProposal(args, peer.ChaincodeSpec_GOLANG)
+}
+
+func (t *Transaction) buildProposal(args []string, chaincodeType peer.ChaincodeSpec_Type) (*peer.Proposal, string, error) {
+	if t.proposalCreator == nil {
+		return nil, "", &ConfigurationError{
+			Field:   "proposalCreator",
+			Message: "proposalCreator is required to build an unsigned proposal for offline signing",
+		}
 	}
 	creator, err := proto.Marshal(&msp.SerializedIdentity{
-		Mspid:   id.MspID(),
-		IdBytes: id.Credentials(),
+		Mspid:   t.proposalCreator.MSPId,
+		IdBytes: t.proposalCreator.Certificate,
 	})
 	if err != nil {
-		return nil, "", &OfflineSigningError{Field: "identity", Message: fmt.Sprintf("serialize identity: %v", err)}
+		return nil, "", &OfflineSigningError{Field: "proposalCreator", Message: fmt.Sprintf("serialize identity: %v", err)}
 	}
 
 	nonce := make([]byte, 24)
@@ -383,7 +410,7 @@ func (t *Transaction) buildLegacyProposal(args []string) (*peer.Proposal, string
 		byteArgs[i+1] = []byte(arg)
 	}
 	ccis := &peer.ChaincodeInvocationSpec{ChaincodeSpec: &peer.ChaincodeSpec{
-		Type: peer.ChaincodeSpec_GOLANG,
+		Type: chaincodeType,
 		ChaincodeId: &peer.ChaincodeID{
 			Name: t.contract.chaincodeName,
 		},
@@ -445,12 +472,6 @@ func createLegacyProposal(txID string, channelName string, chaincodeName string,
 func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
 
-	if !bridge.config.HasPrivateKey() {
-		return nil, &ConfigurationError{
-			Field:   "identity.privateKey",
-			Message: "privateKey is required for UseEndorsingPeers",
-		}
-	}
 	if bridge.config.OrdererEndpoint == "" {
 		return nil, &ConfigurationError{
 			Field:   "ordererEndpoint",
@@ -516,12 +537,6 @@ func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, err
 func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
 
-	if !bridge.config.HasPrivateKey() {
-		return nil, &ConfigurationError{
-			Field:   "identity.privateKey",
-			Message: "privateKey is required for UseSinglePeer",
-		}
-	}
 	if bridge.config.OrdererEndpoint == "" {
 		return nil, &ConfigurationError{
 			Field:   "ordererEndpoint",
@@ -594,13 +609,6 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string) ([]byte, error) {
 	bridge := t.contract.network.bridge
 
-	if !bridge.config.HasPrivateKey() {
-		return nil, &ConfigurationError{
-			Field:   "identity.privateKey",
-			Message: "privateKey is required for UseSinglePeer",
-		}
-	}
-
 	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
@@ -652,13 +660,6 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 // evaluateWithPeerTargeting evaluates on specific peers using the legacy SDK path.
 func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) ([]byte, error) {
 	bridge := t.contract.network.bridge
-
-	if !bridge.config.HasPrivateKey() {
-		return nil, &ConfigurationError{
-			Field:   "identity.privateKey",
-			Message: "privateKey is required for UseEndorsingPeers",
-		}
-	}
 
 	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
 	if err != nil {

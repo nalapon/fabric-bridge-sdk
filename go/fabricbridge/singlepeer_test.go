@@ -5,9 +5,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/hyperledger/fabric-protos-go-apiv2/common"
+	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type fakeSinglePeer struct {
@@ -201,6 +204,60 @@ func TestResolveEndorsingPeerTargetsDeduplicatesCanonicalEndpoints(t *testing.T)
 	}
 	if got, want := len(resolved), 1; got != want {
 		t.Fatalf("resolved peer count mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestBuildGatewayProposalRequiresExplicitProposalCreator(t *testing.T) {
+	tx := &Transaction{}
+
+	_, _, err := tx.buildGatewayProposal([]string{"asset1"})
+	var configErr *ConfigurationError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("expected ConfigurationError, got %T: %v", err, err)
+	}
+	if configErr.Field != "proposalCreator" {
+		t.Fatalf("expected proposalCreator field, got %q", configErr.Field)
+	}
+}
+
+func TestBuildGatewayProposalUsesExplicitProposalCreator(t *testing.T) {
+	tx := &Transaction{
+		contract: &Contract{
+			chaincodeName: "asset",
+			network:       &Network{channel: "mychannel"},
+		},
+		transactionName: "CreateAsset",
+		proposalCreator: &ProposalCreator{
+			MSPId:       "ExternalMSP",
+			Certificate: []byte("external-cert"),
+		},
+	}
+
+	proposal, txID, err := tx.buildGatewayProposal([]string{"asset1"})
+	if err != nil {
+		t.Fatalf("expected proposal, got %v", err)
+	}
+	if txID == "" {
+		t.Fatal("expected transaction ID")
+	}
+
+	header := &common.Header{}
+	if err := proto.Unmarshal(proposal.GetHeader(), header); err != nil {
+		t.Fatalf("unmarshal header: %v", err)
+	}
+	signatureHeader := &common.SignatureHeader{}
+	if err := proto.Unmarshal(header.GetSignatureHeader(), signatureHeader); err != nil {
+		t.Fatalf("unmarshal signature header: %v", err)
+	}
+	creator := &msp.SerializedIdentity{}
+	if err := proto.Unmarshal(signatureHeader.GetCreator(), creator); err != nil {
+		t.Fatalf("unmarshal creator: %v", err)
+	}
+	if creator.GetMspid() != "ExternalMSP" {
+		t.Fatalf("creator MSP mismatch: got %q", creator.GetMspid())
+	}
+	if string(creator.GetIdBytes()) != "external-cert" {
+		t.Fatalf("creator certificate mismatch: got %q", string(creator.GetIdBytes()))
 	}
 }
 

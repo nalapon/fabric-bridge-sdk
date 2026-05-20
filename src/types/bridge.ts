@@ -48,10 +48,16 @@ export interface BridgeTransaction {
   UseSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
   UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
+  SetProposalCreator(proposalCreator: ProposalCreator): BridgeTransaction;
   Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
   SubmitAsync(...args: unknown[]): Promise<BridgeResult<BridgeSubmittedTx>>;
   Evaluate(...args: unknown[]): Promise<BridgeResult<Buffer>>;
   NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>>;
+}
+
+export interface ProposalCreator {
+  mspId: string;
+  credentials: Buffer;
 }
 
 export type OfflineSigningRouting =
@@ -88,10 +94,14 @@ export interface BridgeSignedProposal {
 
 export interface BridgeEndorsedTransaction {
   Bytes(): Buffer;
+  Digest(): Buffer;
   Result(): Buffer;
   TransactionID(): string;
+  SigningRequest(): SigningRequest;
+  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage>;
   SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>>;
   Submit(): Promise<BridgeResult<BridgeCommitResult>>;
+  SubmitWithSignature(signature: Buffer | Uint8Array | string): Promise<BridgeResult<BridgeCommitResult>>;
 }
 
 export type PeerSelectionPolicy = 'round-robin' | 'random';

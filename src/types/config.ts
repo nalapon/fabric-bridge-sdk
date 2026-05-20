@@ -32,7 +32,6 @@ export interface BridgeConfig {
   identity: {
     mspId: string;
     credentials: Buffer;
-    privateKey?: Buffer;
   };
   
   signer: Signer;
@@ -52,7 +51,7 @@ export interface TimeoutConfig {
   discovery?: number;
 }
 
-export type Signer = (digest: Uint8Array) => Promise<Uint8Array>;
+export type Signer = (digest: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 
 export const DEFAULT_TIMEOUTS: Required<TimeoutConfig> = {
   endorse: 30000,

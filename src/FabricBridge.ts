@@ -17,6 +17,7 @@ import type {
   CommitStatus,
   SignedMessage,
   SinglePeerOptions,
+  ProposalCreator,
 } from "./types/bridge";
 import { ConfigurationError, EvaluationError, NotConnectedError, SubmitError, TimeoutError } from "./errors/index";
 import { Result } from "better-result";
@@ -54,7 +55,6 @@ export class FabricBridge {
       hasTrustedRoots: !!config.tlsOptions?.trustedRoots,
       hasClientCert: !!config.tlsOptions?.clientCert,
       hasClientKey: !!config.tlsOptions?.clientKey,
-      hasPrivateKey: !!config.identity.privateKey,
       discovery: config.discovery,
     });
   }
@@ -250,6 +250,7 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private discoveryCache: DiscoveryCache;
   private targeting = TransactionTargeting.gatewayDefault();
   private transientData: Record<string, Buffer> = {};
+  private proposalCreator?: ProposalCreator;
 
   constructor(
     name: string,
@@ -295,6 +296,11 @@ class BridgeTransactionImpl implements BridgeTransaction {
 
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction {
     this.transientData = copyTransientData(transientData);
+    return this;
+  }
+
+  SetProposalCreator(proposalCreator: ProposalCreator): BridgeTransaction {
+    this.proposalCreator = copyProposalCreator(proposalCreator);
     return this;
   }
 
@@ -367,6 +373,13 @@ class BridgeTransactionImpl implements BridgeTransaction {
   }
 
   async NewUnsignedProposal(...args: unknown[]): Promise<BridgeResult<BridgeUnsignedProposal>> {
+    if (!this.proposalCreator) {
+      return Result.err(new ConfigurationError({
+        field: 'proposalCreator',
+        message: 'proposalCreator is required to build an unsigned proposal for offline signing',
+      }));
+    }
+
     if (this.targeting.requiresPeerMode()) {
       let connection: PeerConnection | undefined;
       try {
@@ -390,13 +403,6 @@ class BridgeTransactionImpl implements BridgeTransaction {
     connection: PeerConnection;
     transaction: BridgeTransaction;
   }> {
-    if (!this.config.identity.privateKey) {
-      throw new ConfigurationError({
-        message: `identity.privateKey is required for ${reason}`,
-        field: 'identity.privateKey',
-      });
-    }
-
     const connection = new PeerConnection(this.config, this.discoveryCache);
     const connectResult = await connection.connect();
     if (!connectResult.isOk()) {
@@ -429,6 +435,9 @@ class BridgeTransactionImpl implements BridgeTransaction {
   private prepareTransaction(transaction: BridgeTransaction): BridgeTransaction {
     if (Object.keys(this.transientData).length > 0) {
       transaction.SetTransientData(this.transientData);
+    }
+    if (this.proposalCreator) {
+      transaction.SetProposalCreator(this.proposalCreator);
     }
     return transaction;
   }
@@ -490,6 +499,7 @@ export type {
   BridgeResult,
   BridgeSubmittedTx,
   CommitStatus,
+  ProposalCreator,
 } from "./types/bridge";
 export * from "./errors/index";
 
@@ -497,4 +507,11 @@ function copyTransientData(input: Record<string, Buffer>): Record<string, Buffer
   return Object.fromEntries(
     Object.entries(input).map(([key, value]) => [key, Buffer.from(value)]),
   );
+}
+
+function copyProposalCreator(input: ProposalCreator): ProposalCreator {
+  return {
+    mspId: input.mspId,
+    credentials: Buffer.from(input.credentials),
+  };
 }

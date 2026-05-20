@@ -76,6 +76,14 @@ _Avoid_: transaction signing request, full offline transaction signing
 The serialized Fabric identity embedded in a proposal and bound to the proposal signature.
 _Avoid_: submitter identity, orderer sender identity
 
+**Bridge identity**:
+The Fabric identity loaded in the SDK for network operations such as connection, discovery, submit, and commit tracking.
+_Avoid_: proposal creator identity, external signer identity
+
+**External proposal signer**:
+The signer outside the SDK that signs the **Message digest** for a proposal.
+_Avoid_: bridge signer, orderer signer, application identity provider
+
 **Signing request wire format**:
 The runtime-specific JSON representation of a **Signing request**, with every binary field encoded as base64.
 _Avoid_: protobuf wrapper, hex digest
@@ -107,6 +115,7 @@ _Avoid_: configuration error, endorsement error
 - Gateway default **Transaction targeting** is the initial transaction state and is not exposed as a public reset API.
 - Single-peer **Transaction targeting** uses the **SinglePeer API**.
 - Endorsing-peers **Transaction targeting** uses the **EndorsingPeers API**.
+- **Proposal creator identity** is independent of **Transaction targeting** and may be supplied for gateway default, single-peer, or endorsing-peers proposal signing.
 - **Transaction targeting** is last-call-wins: setting a targeting mode replaces any previous targeting mode on the same transaction.
 - **Transaction targeting** is represented as one value object with semantic operations, not as multiple sibling fields inspected across operation code.
 - **Transaction targeting** owns only targeting intent and invariants; discovery, peer selection, failover, and Fabric peer adaptation remain separate concerns.
@@ -126,7 +135,9 @@ _Avoid_: configuration error, endorsement error
 - External signers sign the **Message digest**, while full message bytes remain available for persistence, transport, and signer implementations that require them.
 - A **Signing request** uses canonical Fabric bytes as the source of truth and does not duplicate data already present in the Fabric message.
 - A **Proposal signing request** does not duplicate the **Proposal creator identity** in the wire format.
+- A **Proposal creator identity** is represented to the SDK by the creator MSP ID and serialized X.509 credential material, not by an application-specific identity provider.
 - Go and Node SDKs expose explicit inspection of the **Proposal creator identity** from a **Proposal signing request** or bridge signable proposal object.
+- A transaction ID for an externally signed proposal is derived from the proposal nonce and **Proposal creator identity**, not from the **Bridge identity**.
 - A **Signing request** may include operational metadata that is not present in the Fabric message but is required to resume the same bridge flow.
 - Node and Go expose the same offline signing concepts but do not share a cross-runtime signing DTO contract.
 - A proposal **Signing request** includes an **Endorsement routing snapshot**.
@@ -155,8 +166,12 @@ _Avoid_: configuration error, endorsement error
 - The SDK validates that a signed-message digest matches the canonical Fabric bytes but does not verify the external signature cryptographically before sending to Fabric.
 - Signed-message DTOs retain the **Message digest** from the **Signing request**, and the bridge validates it against the canonical Fabric bytes before resuming.
 - Malformed signing DTOs fail with an **Offline signing error** before any Fabric network call is attempted.
+- Missing **Proposal creator identity** while building a proposal **Signing request** is local configuration failure, not an **Offline signing error**.
 - The bridge performs mandatory structural validation of signed proposal DTOs and treats cryptographic verification of the external proposal signature as optional application policy.
 - A configured transaction is the factory for the proposal **Signing request** so that **Transaction targeting** and transient data are captured before signing.
+- The configured transaction also owns any caller-supplied **Proposal creator identity** used to build a proposal **Signing request**.
+- Building a proposal **Signing request** requires an explicit **Proposal creator identity**; the SDK does not silently use the **Bridge identity** as the proposal creator for offline signing.
+- The explicit **Proposal creator identity** requirement applies to offline proposal signing, not to online submit or evaluate flows that use the **Bridge identity** normally.
 - Developers do not manually construct **Proposal signing request** values; the SDK builds the proposal and exposes the **Message digest** to be signed.
 - The bridge root object rehydrates signed-message DTOs into **Offline signing flow object** values within the same runtime.
 - A proposal **Signing request** captures the effective peer set for one endorsement attempt.
@@ -165,11 +180,19 @@ _Avoid_: configuration error, endorsement error
 - A **Signing request** is currently always a **Proposal signing request**.
 - A signed proposal produces an **Endorsed transaction**, and the SDK signs the final transaction with the bridge identity before submit.
 - **Offline transaction signing** currently signs only the proposal externally; final transaction signing uses the bridge identity loaded in the SDK.
+- The **External proposal signer** signs the proposal **Message digest** for the **Proposal creator identity**.
+- The **External proposal signer** is not used for bridge-owned operations such as discovery, event handling, submit, or commit tracking.
+- The **Proposal creator identity** and the **Bridge identity** may differ.
+- The **Bridge identity** is signed exclusively through the SDK-configured bridge signer, not through private key material in bridge configuration.
+- Transport-layer TLS client key material is distinct from **Bridge identity** signing and may still be configured for mTLS.
+- The **Bridge identity** is expected to have an SDK-configured bridge signer for submit and commit tracking even when the **Proposal creator identity** is externally signed.
+- Fabric Bridge SDK models **Proposal creator identity** and **External proposal signer** generically; application-specific identity providers are outside the SDK language.
 - The identity that signs the proposal and the identity that submits to the orderer may differ; the proposal signature is bound to the **Proposal creator identity**.
 - The bridge accepts a signed proposal whose **Proposal creator identity** differs from the loaded bridge identity.
 - Local policy that restricts accepted **Proposal creator identity** values is optional application policy, not default bridge behavior.
 - **Offline transaction signing** begins when a transaction creates a proposal **Signing request**; it is not enabled by global bridge state.
 - **Offline transaction signing** supports evaluation as a proposal-only flow that ends after a signed proposal is evaluated.
+- Peer-targeted offline proposal construction and endorsement do not require the **Bridge identity** private key; the externally supplied proposal signature is used for endorsement.
 - Commit tracking after offline submit uses the bridge identity and signer through the existing commit-waiting behavior.
 - The Node **SinglePeer API** uses an options object for candidates and policy.
 - The Go **SinglePeer API** uses functional options for candidates and policy.

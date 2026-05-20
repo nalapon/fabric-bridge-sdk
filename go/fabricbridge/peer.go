@@ -376,7 +376,7 @@ func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithUser("BridgeUser"))
+	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
 	client, err := channel.New(channelProvider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create channel client: %w", err)
@@ -390,7 +390,7 @@ func (p *PeerConnection) DiscoverPeers(channelName string) ([]fab.Peer, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithUser("BridgeUser"))
+	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
 	channelContext, err := channelProvider()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create channel context: %w", err)
@@ -412,7 +412,7 @@ func (p *PeerConnection) getTxStatusEventService(channelName string) (fab.EventS
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithUser("BridgeUser"))
+	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
 	channelContext, err := channelProvider()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create channel context: %w", err)
@@ -466,25 +466,11 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 		peerName: peerEntry,
 	}
 
-	certPEM, err := certificatePEM(cfg.Identity.Certificate)
-	if err != nil {
-		panic(fmt.Sprintf("failed to normalize certificate to PEM: %v", err))
-	}
-
 	orgName := strings.ToLower(cfg.Identity.MSPId)
 	orgEntry := map[string]interface{}{
 		"mspid": cfg.Identity.MSPId,
 		"peers": []string{peerName},
-		"users": map[string]interface{}{
-			"BridgeUser": map[string]interface{}{
-				"key": map[string]interface{}{
-					"pem": string(cfg.Identity.PrivateKey),
-				},
-				"cert": map[string]interface{}{
-					"pem": string(certPEM),
-				},
-			},
-		},
+		"users": map[string]interface{}{},
 	}
 
 	channelPeers := map[string]interface{}{

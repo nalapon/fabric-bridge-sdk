@@ -9,16 +9,15 @@ import (
 	"github.com/hyperledger/fabric-gateway/pkg/identity"
 )
 
-// Signer signs messages
+// Signer signs message digests.
 type Signer interface {
-	Sign(message []byte) ([]byte, error)
+	Sign(digest []byte) ([]byte, error)
 }
 
 // Identity represents a client identity
 type Identity struct {
 	MSPId       string
 	Certificate []byte
-	PrivateKey  []byte
 }
 
 // TLSOptions for TLS configuration
@@ -161,11 +160,6 @@ func (c Config) IdentityProvider() (*identity.X509Identity, error) {
 		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return identity.NewX509Identity(c.Identity.MSPId, cert)
-}
-
-// HasPrivateKey returns true if the config has a private key (required for peer mode)
-func (c Config) HasPrivateKey() bool {
-	return len(c.Identity.PrivateKey) > 0
 }
 
 func (c Config) normalized() Config {

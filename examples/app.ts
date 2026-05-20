@@ -1,8 +1,8 @@
 import { FabricBridge } from "../src/FabricBridge";
+import { createSyncPrivateKeySigner } from "../src/signers";
 import { promises as fs } from "fs";
 import path from "path";
 import { createPrivateKey } from "crypto";
-import { signers } from "@hyperledger/fabric-gateway";
 
 const PATH = "/Users/naderaladelponce/Proyectos/fabric-samples/test-network";
 const CHAINCODE = "basic";
@@ -58,20 +58,19 @@ async function loadCredentials(org: typeof ORG1) {
 }
 
 async function createSigner(privateKey: Buffer) {
-  return signers.newPrivateKeySigner(createPrivateKey(privateKey));
+  return createSyncPrivateKeySigner(createPrivateKey(privateKey));
 }
 
 async function signDigest(signer: any, digest: Buffer): Promise<Buffer> {
   return Buffer.from(await signer(digest));
 }
 
-async function createBridge(org: typeof ORG1, signer: any, cert: Buffer, key: Buffer, tls: Buffer) {
+async function createBridge(org: typeof ORG1, signer: any, cert: Buffer, tls: Buffer) {
   return new FabricBridge({
     gatewayPeer: org.gateway,
     identity: {
       mspId: org.mspId,
       credentials: cert,
-      privateKey: key,
     },
     signer,
     tlsOptions: { trustedRoots: tls, verify: false },
@@ -83,7 +82,7 @@ async function usingOrg1Gateway() {
   console.log("\n[ORG1 - GATEWAY MODE]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG1, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -121,7 +120,7 @@ async function usingOrg2Gateway() {
   console.log("\n[ORG2 - GATEWAY MODE]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG2);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG2, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG2, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -159,7 +158,7 @@ async function usingOrg1Peer() {
   console.log("\n[ORG1 - PEER-TARGETED MODE]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG1, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -194,7 +193,7 @@ async function usingOrg2Peer() {
   console.log("\n[ORG2 - PEER-TARGETED MODE]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG2);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG2, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG2, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -229,7 +228,7 @@ async function usingOrg1OfflineGateway() {
   console.log("\n[ORG1 - OFFLINE SIGNING - GATEWAY DEFAULT]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG1, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -239,7 +238,10 @@ async function usingOrg1OfflineGateway() {
   const contract = await networkResult.value.getContract(CHAINCODE);
 
   const id = `org1_offline_gw_${Date.now()}`;
-  const tx = contract.Transaction("CreateAsset");
+  const tx = contract.Transaction("CreateAsset").SetProposalCreator({
+    mspId: ORG1.mspId,
+    credentials: certificate,
+  });
   const unsignedProposal = await tx.NewUnsignedProposal(
     id,
     "purple",
@@ -293,7 +295,7 @@ async function usingOrg1OfflineSinglePeer() {
   console.log("\n[ORG1 - OFFLINE SIGNING - SINGLE PEER]");
   const { certificate, privateKey, tlsCert } = await loadCredentials(ORG1);
   const signer = await createSigner(privateKey);
-  const bridge = await createBridge(ORG1, signer, certificate, privateKey, tlsCert);
+  const bridge = await createBridge(ORG1, signer, certificate, tlsCert);
 
   const conn = await bridge.connect();
   if (!conn.isOk()) throw new Error(conn.error.message);
@@ -303,7 +305,10 @@ async function usingOrg1OfflineSinglePeer() {
   const contract = await networkResult.value.getContract(CHAINCODE);
 
   const id = `org1_offline_sp_${Date.now()}`;
-  const tx = contract.Transaction("CreateAsset");
+  const tx = contract.Transaction("CreateAsset").SetProposalCreator({
+    mspId: ORG1.mspId,
+    credentials: certificate,
+  });
   const targeted = tx.UseSinglePeer({ candidates: [ORG1.peer] });
   if (!targeted.isOk()) throw new Error(targeted.error.message);
 

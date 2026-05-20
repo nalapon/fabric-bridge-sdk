@@ -1,13 +1,17 @@
 import * as grpc from '@grpc/grpc-js';
 import * as fabricGateway from '@hyperledger/fabric-gateway';
 import { createHash } from 'crypto';
-import * as gatewayProto from '@hyperledger/fabric-protos/lib/gateway/gateway_pb';
-import { SerializedIdentity } from '@hyperledger/fabric-protos/lib/msp/identities_pb';
+import gatewayProtoModule from '@hyperledger/fabric-protos/lib/gateway/gateway_pb.js';
+import identitiesProtoModule from '@hyperledger/fabric-protos/lib/msp/identities_pb.js';
+import type * as GatewayProto from '@hyperledger/fabric-protos/lib/gateway/gateway_pb.js';
 import type { BridgeConfig, Signer } from '../types/config';
 import type { CommitStatus } from '../types/bridge';
 import { CommitError, ConfigurationError, NotConnectedError, TimeoutError } from '../errors/index';
 import { Result } from 'better-result';
 import { log } from '../utils/logger';
+
+const gatewayProto = gatewayProtoModule as typeof import('@hyperledger/fabric-protos/lib/gateway/gateway_pb.js');
+const { SerializedIdentity } = identitiesProtoModule as typeof import('@hyperledger/fabric-protos/lib/msp/identities_pb.js');
 
 export class GatewayConnection {
   private client: grpc.Client | null = null;
@@ -160,10 +164,10 @@ export class GatewayConnection {
 
     return Result.tryPromise({
       try: async () => {
-        const response = await new Promise<gatewayProto.CommitStatusResponse>((resolve, reject) => {
+        const response = await new Promise<GatewayProto.CommitStatusResponse>((resolve, reject) => {
           this.client!.makeUnaryRequest(
             '/gateway.Gateway/CommitStatus',
-            (value: gatewayProto.SignedCommitStatusRequest) => Buffer.from(value.serializeBinary()),
+            (value: GatewayProto.SignedCommitStatusRequest) => Buffer.from(value.serializeBinary()),
             (bytes: Buffer) => gatewayProto.CommitStatusResponse.deserializeBinary(new Uint8Array(bytes)),
             signedRequest,
             {

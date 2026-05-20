@@ -1,5 +1,4 @@
 import * as fabricNetwork from "fabric-network";
-import type { X509Identity } from "fabric-network/lib/impl/wallet/x509identity.js";
 import type { BridgeConfig } from "../types/config";
 import {
   ConfigurationError,
@@ -15,6 +14,7 @@ import type {
 } from "../types/discovery";
 import { DiscoveryCache } from "../cache/DiscoveryCache";
 import { log } from "../utils/logger";
+import { createBridgeIdentityProvider } from "../fabricIdentity";
 
 /**
  * Detects if the endpoint is localhost based on the hostname.
@@ -72,42 +72,26 @@ export class PeerConnection {
       clientCertLength: tlsOptions?.clientCert?.length,
       hasClientKey: !!tlsOptions?.clientKey,
       clientKeyLength: tlsOptions?.clientKey?.length,
-      hasPrivateKey: !!identity.privateKey,
       discovery: this.config.discovery,
       connectTimeout,
     });
 
     return Result.tryPromise({
       try: async () => {
-        log().debug('PeerConnection.connect() - Creando wallet in-memory');
-        const wallet = await fabricNetwork.Wallets.newInMemoryWallet();
-
-        if (!identity.privateKey) {
-          log().error('PeerConnection.connect() - Private key no proporcionada');
-          throw new Error(
-            "Private key is required for peer-targeted mode. Please provide identity.privateKey in BridgeConfig",
-          );
-        }
-
-        log().debug('PeerConnection.connect() - Creando identidad X.509');
-        const x509Identity: X509Identity = {
-          type: "X.509",
+        const bridgeIdentity = {
+          type: "bridge-x509",
           mspId: identity.mspId,
           credentials: {
             certificate: identity.credentials.toString(),
-            privateKey: identity.privateKey.toString(),
           },
         };
-
-        await wallet.put(identity.mspId, x509Identity as fabricNetwork.Identity);
-        log().debug('PeerConnection.connect() - Identidad X.509 guardada en wallet');
 
         const asLocalhost = isLocalhostEndpoint(this.config.gatewayPeer);
         log().debug(`PeerConnection.connect() - Auto-detected asLocalhost: ${asLocalhost} (from ${this.config.gatewayPeer})`);
 
         const gatewayOptions: fabricNetwork.GatewayOptions = {
-          wallet,
-          identity: identity.mspId,
+          identity: bridgeIdentity as any,
+          identityProvider: createBridgeIdentityProvider(this.config),
           discovery: {
             enabled: this.config.discovery ?? true,
             asLocalhost,
