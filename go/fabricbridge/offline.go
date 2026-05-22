@@ -463,16 +463,13 @@ func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*lega
 		return nil, err
 	}
 
+	if err := validatePeerProposalResponses(responses); err != nil {
+		return nil, err
+	}
+
 	first := responses[0].ProposalResponse
 	endorsements := make([]*peerProto.Endorsement, 0, len(responses))
 	for _, response := range responses {
-		if response.ProposalResponse.GetResponse().GetStatus() < int32(common.Status_SUCCESS) ||
-			response.ProposalResponse.GetResponse().GetStatus() >= int32(common.Status_BAD_REQUEST) {
-			return nil, fmt.Errorf("proposal response was not successful, status %d: %s", response.ProposalResponse.GetResponse().GetStatus(), response.ProposalResponse.GetResponse().GetMessage())
-		}
-		if !bytes.Equal(first.GetPayload(), response.ProposalResponse.GetPayload()) {
-			return nil, fmt.Errorf("proposal response payloads do not match")
-		}
 		endorsements = append(endorsements, response.ProposalResponse.GetEndorsement())
 	}
 

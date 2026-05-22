@@ -34,6 +34,17 @@ type peerSubmittedTransaction struct {
 	waitForCommit func(ctx context.Context) (*CommitStatus, error)
 }
 
+type peerRuntime interface {
+	Close()
+	DiscoverPeers(channelName string) ([]fab.Peer, error)
+	QueryTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []fab.Peer, transientData map[string][]byte) ([]byte, error)
+	SubmitAsyncTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []fab.Peer, transientData map[string][]byte) (*peerSubmittedTransaction, error)
+}
+
+var newPeerRuntime = func(cfg Config, channelName string) (peerRuntime, error) {
+	return NewPeerConnection(cfg, channelName)
+}
+
 type pendingPeerCommit struct {
 	eventService   fab.EventService
 	registration   fab.Registration

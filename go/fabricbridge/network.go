@@ -205,7 +205,7 @@ type CommitStatus struct {
 }
 
 // Transaction represents a prepared transaction with custom options.
-// Use UseSinglePeer or UseEndorsingPeers to target peers via the legacy peer path.
+// Use UseSinglePeer or UseEndorsingPeers to target peers via the direct endorsement path.
 type Transaction struct {
 	contract        *Contract
 	transactionName string
@@ -316,7 +316,7 @@ func (t *Transaction) NewUnsignedProposal(ctx context.Context, args ...string) (
 
 func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string) (*UnsignedProposal, error) {
 	bridge := t.contract.network.bridge
-	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
@@ -464,7 +464,7 @@ func createLegacyProposal(txID string, channelName string, chaincodeName string,
 	return &peer.Proposal{Header: headerBytes, Payload: payloadBytes}, nil
 }
 
-// submitAsyncWithPeerTargeting executes a peer-targeted submit using the legacy SDK path.
+// submitAsyncWithPeerTargeting executes explicit endorsement, then submits through the current peer submit path.
 func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
 
@@ -475,7 +475,7 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 		}
 	}
 
-	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
@@ -489,6 +489,15 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 	if err != nil {
 		pc.Close()
 		return nil, err
+	}
+	proposal, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	if _, err := buildPeerTransactionPayload(proposal, responses); err != nil {
+		pc.Close()
+		return nil, &EndorsementError{Message: err.Error()}
 	}
 
 	// Convert args to byte arrays
@@ -540,7 +549,7 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		}
 	}
 
-	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
@@ -599,7 +608,7 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string) ([]byte, error) {
 	bridge := t.contract.network.bridge
 
-	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
@@ -641,11 +650,11 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 	)
 }
 
-// evaluateWithPeerTargeting evaluates on specific peers using the legacy SDK path.
+// evaluateWithPeerTargeting evaluates on every caller-selected discovered peer.
 func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []string) ([]byte, error) {
 	bridge := t.contract.network.bridge
 
-	pc, err := NewPeerConnection(bridge.config, t.contract.network.channel)
+	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
@@ -660,25 +669,12 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 		return nil, err
 	}
 
-	byteArgs := make([][]byte, len(args))
-	for i, arg := range args {
-		byteArgs[i] = []byte(arg)
-	}
-
-	result, err := pc.QueryTargets(
-		ctx,
-		t.contract.network.channel,
-		t.contract.chaincodeName,
-		t.transactionName,
-		byteArgs,
-		targets,
-		t.transientData,
-	)
+	_, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
 	if err != nil {
 		return nil, &EvaluationError{Message: fmt.Sprintf("peer-targeted query failed: %v", err)}
 	}
 
-	return result, nil
+	return proposalResultPayload(responses)
 }
 
 func copyTransientData(input map[string][]byte) map[string][]byte {
