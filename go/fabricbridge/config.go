@@ -52,14 +52,16 @@ var DefaultTimeouts = TimeoutConfig{
 
 // Config for the bridge connection
 type Config struct {
-	GatewayPeer       string
-	Identity          Identity
-	Signer            Signer
-	TLSOptions        *TLSOptions
-	OrdererTLSOptions *TLSOptions
-	Discovery         bool
-	Timeouts          TimeoutConfig
-	OrdererEndpoint   string // Optional: orderer endpoint for commit in peer mode (e.g., "orderer.example.com:7050")
+	GatewayEndpoint string
+	DiscoverySeed   string
+	OrdererEndpoint string
+	Identity        Identity
+	Signer          Signer
+	GatewayTLS      *TLSOptions
+	DiscoveryTLS    *TLSOptions
+	OrdererTLS      *TLSOptions
+	Discovery       bool
+	Timeouts        TimeoutConfig
 }
 
 // Option configures a Config
@@ -79,27 +81,35 @@ func WithDiscovery(enabled bool) Option {
 	}
 }
 
-// WithTLS sets TLS options
-func WithTLS(opts TLSOptions) Option {
+// WithDiscoverySeed sets the initial peer endpoint used for Fabric service discovery.
+func WithDiscoverySeed(endpoint string) Option {
 	return func(c *Config) {
-		if len(opts.TrustedRoots) > 0 && !opts.AllowInsecureTLS {
-			opts.Verify = true
-		}
-		c.TLSOptions = &opts
+		c.DiscoverySeed = endpoint
 	}
 }
 
-// WithOrdererTLS sets dedicated TLS options for the orderer used in peer mode.
+// WithGatewayTLS sets TLS options for the Gateway endpoint.
+func WithGatewayTLS(opts TLSOptions) Option {
+	return func(c *Config) {
+		c.GatewayTLS = normalizedTLSOptions(opts)
+	}
+}
+
+// WithDiscoveryTLS sets TLS options for the Discovery seed.
+func WithDiscoveryTLS(opts TLSOptions) Option {
+	return func(c *Config) {
+		c.DiscoveryTLS = normalizedTLSOptions(opts)
+	}
+}
+
+// WithOrdererTLS sets dedicated TLS options for the orderer used by direct endorsement submit.
 func WithOrdererTLS(opts TLSOptions) Option {
 	return func(c *Config) {
-		if len(opts.TrustedRoots) > 0 && !opts.AllowInsecureTLS {
-			opts.Verify = true
-		}
-		c.OrdererTLSOptions = &opts
+		c.OrdererTLS = normalizedTLSOptions(opts)
 	}
 }
 
-// WithOrderer sets the orderer endpoint for commit in peer mode
+// WithOrderer sets the orderer endpoint for direct endorsement submit.
 func WithOrderer(endpoint string) Option {
 	return func(c *Config) {
 		c.OrdererEndpoint = endpoint
@@ -107,13 +117,13 @@ func WithOrderer(endpoint string) Option {
 }
 
 // NewConfig creates a Config with functional options
-func NewConfig(gatewayPeer string, identity Identity, signer Signer, opts ...Option) Config {
+func NewConfig(gatewayEndpoint string, identity Identity, signer Signer, opts ...Option) Config {
 	c := Config{
-		GatewayPeer: gatewayPeer,
-		Identity:    identity,
-		Signer:      signer,
-		Discovery:   true,
-		Timeouts:    DefaultTimeouts,
+		GatewayEndpoint: gatewayEndpoint,
+		Identity:        identity,
+		Signer:          signer,
+		Discovery:       true,
+		Timeouts:        DefaultTimeouts,
 	}
 	for _, opt := range opts {
 		opt(&c)
@@ -125,8 +135,11 @@ func NewConfig(gatewayPeer string, identity Identity, signer Signer, opts ...Opt
 func (c Config) Validate() error {
 	c = c.normalized()
 
-	if c.GatewayPeer == "" {
-		return fmt.Errorf("gatewayPeer is required")
+	if c.GatewayEndpoint == "" {
+		return fmt.Errorf("gatewayEndpoint is required")
+	}
+	if c.DiscoverySeed == "" {
+		return fmt.Errorf("discoverySeed is required")
 	}
 	if c.Identity.MSPId == "" {
 		return fmt.Errorf("identity.MSPId is required")
@@ -140,14 +153,19 @@ func (c Config) Validate() error {
 	if c.Signer == nil {
 		return fmt.Errorf("signer is required")
 	}
-	if c.TLSOptions != nil && len(c.TLSOptions.TrustedRoots) > 0 {
-		if _, err := createCertPool(c.TLSOptions.TrustedRoots); err != nil {
-			return fmt.Errorf("tlsOptions.TrustedRoots is invalid: %w", err)
+	if c.GatewayTLS != nil && len(c.GatewayTLS.TrustedRoots) > 0 {
+		if _, err := createCertPool(c.GatewayTLS.TrustedRoots); err != nil {
+			return fmt.Errorf("gatewayTls.TrustedRoots is invalid: %w", err)
 		}
 	}
-	if c.OrdererTLSOptions != nil && len(c.OrdererTLSOptions.TrustedRoots) > 0 {
-		if _, err := createCertPool(c.OrdererTLSOptions.TrustedRoots); err != nil {
-			return fmt.Errorf("ordererTlsOptions.TrustedRoots is invalid: %w", err)
+	if c.DiscoveryTLS != nil && len(c.DiscoveryTLS.TrustedRoots) > 0 {
+		if _, err := createCertPool(c.DiscoveryTLS.TrustedRoots); err != nil {
+			return fmt.Errorf("discoveryTls.TrustedRoots is invalid: %w", err)
+		}
+	}
+	if c.OrdererTLS != nil && len(c.OrdererTLS.TrustedRoots) > 0 {
+		if _, err := createCertPool(c.OrdererTLS.TrustedRoots); err != nil {
+			return fmt.Errorf("ordererTls.TrustedRoots is invalid: %w", err)
 		}
 	}
 	return nil
@@ -166,22 +184,38 @@ func (c Config) normalized() Config {
 	out := c
 	out.Timeouts = normalizeTimeouts(out.Timeouts)
 
-	if out.TLSOptions != nil {
-		tlsOptions := *out.TLSOptions
-		if len(tlsOptions.TrustedRoots) > 0 && !tlsOptions.AllowInsecureTLS {
-			tlsOptions.Verify = true
-		}
-		out.TLSOptions = &tlsOptions
+	if out.DiscoverySeed == "" {
+		out.DiscoverySeed = out.GatewayEndpoint
 	}
-	if out.OrdererTLSOptions != nil {
-		ordererTLSOptions := *out.OrdererTLSOptions
-		if len(ordererTLSOptions.TrustedRoots) > 0 && !ordererTLSOptions.AllowInsecureTLS {
-			ordererTLSOptions.Verify = true
-		}
-		out.OrdererTLSOptions = &ordererTLSOptions
+
+	out.GatewayTLS = cloneTLSOptions(out.GatewayTLS)
+	if out.DiscoveryTLS == nil {
+		out.DiscoveryTLS = cloneTLSOptions(out.GatewayTLS)
+	} else {
+		out.DiscoveryTLS = cloneTLSOptions(out.DiscoveryTLS)
+	}
+	if out.OrdererTLS == nil {
+		out.OrdererTLS = cloneTLSOptions(out.GatewayTLS)
+	} else {
+		out.OrdererTLS = cloneTLSOptions(out.OrdererTLS)
 	}
 
 	return out
+}
+
+func normalizedTLSOptions(opts TLSOptions) *TLSOptions {
+	if len(opts.TrustedRoots) > 0 && !opts.AllowInsecureTLS {
+		opts.Verify = true
+	}
+	return &opts
+}
+
+func cloneTLSOptions(opts *TLSOptions) *TLSOptions {
+	if opts == nil {
+		return nil
+	}
+	clone := *normalizedTLSOptions(*opts)
+	return &clone
 }
 
 func normalizeTimeouts(tc TimeoutConfig) TimeoutConfig {

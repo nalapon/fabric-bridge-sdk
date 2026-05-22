@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0010
+---
+
 # Single-Peer Transaction API
 
 Fabric Bridge SDK will expose `UseSinglePeer` as the recommended API for transactions that must send each proposal attempt to exactly one discovered peer, and `UseEndorsingPeers` for transactions that must send proposals to every named peer. This keeps automatic single-peer choice distinct from explicit multi-peer endorsement, which makes transaction code easier for developers and LLMs to read.

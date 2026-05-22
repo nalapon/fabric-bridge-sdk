@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 
 	fabricGateway "github.com/hyperledger/fabric-gateway/pkg/client"
@@ -52,7 +54,7 @@ func Connect(ctx context.Context, config Config) (*Bridge, error) {
 		gatewayClient:   gw,
 		grpcConnection:  grpcConn,
 		connected:       true,
-		gatewayEndpoint: config.GatewayPeer,
+		gatewayEndpoint: config.GatewayEndpoint,
 		roundRobin:      newRoundRobinState(),
 	}, nil
 }
@@ -251,26 +253,31 @@ func (b *Bridge) restoreGatewayMode() error {
 
 // createGRPCConnection creates the gRPC connection with TLS
 func createGRPCConnection(config Config) (*grpc.ClientConn, error) {
+	config = config.normalized()
+	return createGRPCConnectionTo(config.GatewayEndpoint, config.GatewayTLS)
+}
+
+func createGRPCConnectionTo(endpoint string, tlsOptions *TLSOptions) (*grpc.ClientConn, error) {
 	transportCredentials := insecureCredentials.NewCredentials()
 
-	if config.TLSOptions != nil && len(config.TLSOptions.TrustedRoots) > 0 {
-		certPool, err := createCertPool(config.TLSOptions.TrustedRoots)
+	if tlsOptions != nil && len(tlsOptions.TrustedRoots) > 0 {
+		certPool, err := createCertPool(tlsOptions.TrustedRoots)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS root certificates: %w", err)
 		}
 
 		tlsConfig := &tls.Config{
 			RootCAs:            certPool,
-			InsecureSkipVerify: config.TLSOptions.AllowInsecureTLS,
+			InsecureSkipVerify: tlsOptions.AllowInsecureTLS,
 			MinVersion:         tls.VersionTLS12,
 		}
 
-		if config.TLSOptions.SslTargetNameOverride != "" {
-			tlsConfig.ServerName = config.TLSOptions.SslTargetNameOverride
+		if tlsOptions.SslTargetNameOverride != "" {
+			tlsConfig.ServerName = tlsOptions.SslTargetNameOverride
 		}
 
-		if len(config.TLSOptions.ClientCert) > 0 && len(config.TLSOptions.ClientKey) > 0 {
-			clientCert, err := tls.X509KeyPair(config.TLSOptions.ClientCert, config.TLSOptions.ClientKey)
+		if len(tlsOptions.ClientCert) > 0 && len(tlsOptions.ClientKey) > 0 {
+			clientCert, err := tls.X509KeyPair(tlsOptions.ClientCert, tlsOptions.ClientKey)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load client certificate: %w", err)
 			}
@@ -280,7 +287,18 @@ func createGRPCConnection(config Config) (*grpc.ClientConn, error) {
 		transportCredentials = credentials.NewTLS(tlsConfig)
 	}
 
-	return grpc.NewClient(config.GatewayPeer, grpc.WithTransportCredentials(transportCredentials))
+	return grpc.NewClient(grpcTargetAddress(endpoint), grpc.WithTransportCredentials(transportCredentials))
+}
+
+func grpcTargetAddress(endpoint string) string {
+	value := strings.TrimSpace(endpoint)
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "grpc://") || strings.HasPrefix(lower, "grpcs://") {
+		if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+			return parsed.Host
+		}
+	}
+	return value
 }
 
 func (b *Bridge) commitStatus(ctx context.Context, channelName string, transactionID string) (*CommitStatus, error) {

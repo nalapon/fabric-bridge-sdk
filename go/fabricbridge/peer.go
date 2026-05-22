@@ -112,26 +112,22 @@ func (m *legacyCommitMonitor) Wait(ctx context.Context) (*CommitStatus, error) {
 	}
 }
 
-// NewPeerConnection creates a new peer connection using fabric-sdk-go.
-// channelName is used to build the connection profile (channels section).
+// NewPeerConnection creates a peer connection. The broad legacy SDK runtime is initialized lazily
+// only for paths that still need legacy channel/orderer/event handling.
 func NewPeerConnection(cfg Config, channelName string) (*PeerConnection, error) {
-	configProvider := buildConfigProvider(cfg, channelName)
-
-	sdk, err := fabsdk.New(configProvider)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SDK: %w", err)
-	}
-
 	return &PeerConnection{
-		sdk:    sdk,
-		config: cfg,
+		channel: channelName,
+		config:  cfg.normalized(),
 	}, nil
 }
 
 // Close closes the peer connection and releases all resources
 func (p *PeerConnection) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.sdk != nil {
 		p.sdk.Close()
+		p.sdk = nil
 	}
 }
 
@@ -373,8 +369,12 @@ func (p *PeerConnection) SubmitAsyncTargets(ctx context.Context, channelName str
 
 // getChannelClient returns a channel client for the specified channel
 func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.ensureLegacySDK(channelName); err != nil {
+		return nil, err
+	}
 
 	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
 	client, err := channel.New(channelProvider)
@@ -385,32 +385,18 @@ func (p *PeerConnection) getChannelClient(channelName string) (*channel.Client, 
 	return client, nil
 }
 
-// DiscoverPeers returns channel peers from the legacy SDK discovery service.
+// DiscoverPeers returns channel peers from direct Fabric service discovery.
 func (p *PeerConnection) DiscoverPeers(channelName string) ([]fab.Peer, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
-	channelContext, err := channelProvider()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create channel context: %w", err)
-	}
-
-	discovery, err := channelContext.ChannelService().Discovery()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create discovery service: %w", err)
-	}
-
-	peers, err := discovery.GetPeers()
-	if err != nil {
-		return nil, err
-	}
-	return peers, nil
+	return newDirectDiscoveryClient(p.config).DiscoverPeers(context.Background(), channelName)
 }
 
 func (p *PeerConnection) getTxStatusEventService(channelName string) (fab.EventService, func(), error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.ensureLegacySDK(channelName); err != nil {
+		return nil, nil, err
+	}
 
 	channelProvider := p.sdk.ChannelContext(channelName, fabsdk.WithIdentity(newBridgeSigningIdentity(p.config)))
 	channelContext, err := channelProvider()
@@ -438,9 +424,23 @@ func (p *PeerConnection) getTxStatusEventService(channelName string) (fab.EventS
 	return eventClientRef, eventClientRef.Close, nil
 }
 
+func (p *PeerConnection) ensureLegacySDK(channelName string) error {
+	if p.sdk != nil {
+		return nil
+	}
+
+	sdk, err := fabsdk.New(buildConfigProvider(p.config, channelName))
+	if err != nil {
+		return fmt.Errorf("failed to create SDK: %w", err)
+	}
+	p.sdk = sdk
+	return nil
+}
+
 // buildConfigProvider creates a minimal connection profile for fabric-sdk-go.
 // The config is built as a Go map and marshaled to YAML.
 func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
+	cfg = cfg.normalized()
 	peerName := peerName(cfg)
 	peerURL := peerURL(cfg)
 
@@ -449,16 +449,16 @@ func buildConfigProvider(cfg Config, channelName string) core.ConfigProvider {
 	}
 
 	grpcOptions := map[string]interface{}{}
-	if cfg.TLSOptions != nil && cfg.TLSOptions.SslTargetNameOverride != "" {
-		grpcOptions["ssl-target-name-override"] = cfg.TLSOptions.SslTargetNameOverride
+	if cfg.DiscoveryTLS != nil && cfg.DiscoveryTLS.SslTargetNameOverride != "" {
+		grpcOptions["ssl-target-name-override"] = cfg.DiscoveryTLS.SslTargetNameOverride
 	}
 	if len(grpcOptions) > 0 {
 		peerEntry["grpcOptions"] = grpcOptions
 	}
 
-	if cfg.TLSOptions != nil && len(cfg.TLSOptions.TrustedRoots) > 0 {
+	if cfg.DiscoveryTLS != nil && len(cfg.DiscoveryTLS.TrustedRoots) > 0 {
 		peerEntry["tlsCACerts"] = map[string]interface{}{
-			"pem": string(cfg.TLSOptions.TrustedRoots),
+			"pem": string(cfg.DiscoveryTLS.TrustedRoots),
 		}
 	}
 
@@ -596,16 +596,16 @@ func (h *submitTxHandler) Handle(requestContext *invoke.RequestContext, clientCo
 // peerName returns the logical name for the peer in the connection profile.
 // Uses SslTargetNameOverride if set, otherwise extracts hostname from the endpoint.
 func peerName(cfg Config) string {
-	if cfg.TLSOptions != nil && cfg.TLSOptions.SslTargetNameOverride != "" {
-		return cfg.TLSOptions.SslTargetNameOverride
+	if cfg.DiscoveryTLS != nil && cfg.DiscoveryTLS.SslTargetNameOverride != "" {
+		return cfg.DiscoveryTLS.SslTargetNameOverride
 	}
-	return extractHost(cfg.GatewayPeer)
+	return extractHost(cfg.DiscoverySeed)
 }
 
 // peerURL returns the full URL for the peer with protocol prefix.
 func peerURL(cfg Config) string {
-	host := cfg.GatewayPeer
-	if cfg.TLSOptions != nil && len(cfg.TLSOptions.TrustedRoots) > 0 {
+	host := cfg.DiscoverySeed
+	if cfg.DiscoveryTLS != nil && len(cfg.DiscoveryTLS.TrustedRoots) > 0 {
 		if !strings.HasPrefix(host, "grpcs://") && !strings.HasPrefix(host, "grpc://") {
 			return "grpcs://" + host
 		}
@@ -641,11 +641,7 @@ func ordererURL(cfg Config) string {
 }
 
 func ordererTLSOptions(cfg Config) *TLSOptions {
-	if cfg.OrdererTLSOptions != nil {
-		return cfg.OrdererTLSOptions
-	}
-
-	return cfg.TLSOptions
+	return cfg.OrdererTLS
 }
 
 // extractHost extracts the hostname from a host:port string

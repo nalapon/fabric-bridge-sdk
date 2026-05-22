@@ -293,14 +293,6 @@ func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*legacyfab.Tra
 	return responses, proposal, nil
 }
 
-func normalizeSnapshotPeerEndpoint(endpoint string, tlsEnabled bool) (string, error) {
-	canonical, err := normalizePeerEndpointIdentity(endpoint, tlsEnabled)
-	if err != nil {
-		return "", &OfflineSigningError{Field: "routing.peers", Message: err.Error()}
-	}
-	return canonical, nil
-}
-
 func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransaction, error) {
 	digest := sha256.Sum256(t.bytes)
 	signature, err := t.bridge.config.Signer.Sign(digest[:])

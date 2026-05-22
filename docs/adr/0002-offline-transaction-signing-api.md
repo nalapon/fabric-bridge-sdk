@@ -1,5 +1,5 @@
 ---
-status: superseded by ADR-0003
+status: superseded by ADR-0003 and ADR-0011
 ---
 
 # Offline Transaction Signing API

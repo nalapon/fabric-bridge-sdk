@@ -42,10 +42,8 @@ func TestExecuteSinglePeerTargetsRetriesEligibleFailures(t *testing.T) {
 		"mychannel",
 		"asset",
 		"Read",
-		nil,
 		peers,
 		peers,
-		true,
 		func(peer fab.Peer) (string, error) {
 			attempted = append(attempted, peer.URL())
 			if len(attempted) == 1 {
@@ -75,10 +73,8 @@ func TestExecuteSinglePeerTargetsStopsOnNonRetryableFailure(t *testing.T) {
 		"mychannel",
 		"asset",
 		"Read",
-		nil,
 		peers,
 		peers,
-		true,
 		func(fab.Peer) (string, error) {
 			attempts++
 			return "", originalErr
@@ -100,10 +96,8 @@ func TestExecuteSinglePeerTargetsReturnsCanonicalFailureAfterAllEligiblePeersFai
 		"mychannel",
 		"asset",
 		"Transfer",
-		[]string{"peer0", "peer1"},
 		peers,
 		peers,
-		true,
 		func(peer fab.Peer) (string, error) {
 			if peer.URL() == "grpcs://peer0" {
 				return "", context.DeadlineExceeded
@@ -138,57 +132,59 @@ func TestTransactionTargetingRejectsEmptyEndorsingPeers(t *testing.T) {
 	}
 }
 
-func TestTransactionTargetingRejectsUnsupportedSinglePeerPolicy(t *testing.T) {
-	_, err := newSinglePeerTargeting([]SinglePeerOption{
-		WithPeerSelectionPolicy(PeerSelectionPolicy("least-loaded")),
-	})
-	var configErr *ConfigurationError
-	if !errors.As(err, &configErr) {
-		t.Fatalf("expected ConfigurationError, got %T: %v", err, err)
-	}
-	if configErr.Field != "singlePeer.policy" {
-		t.Fatalf("expected singlePeer.policy field, got %q", configErr.Field)
-	}
-}
-
-func TestTransactionTargetingAllowsEmptySinglePeerCandidates(t *testing.T) {
-	targeting, err := newSinglePeerTargeting([]SinglePeerOption{WithCandidatePeers()})
-	if err != nil {
-		t.Fatalf("expected empty candidates to be valid, got %v", err)
-	}
-	options, ok := targeting.singlePeerOptions()
-	if !ok {
+func TestTransactionTargetingSinglePeerHasNoPeerList(t *testing.T) {
+	targeting := newSinglePeerTargeting()
+	if !targeting.isSinglePeer() {
 		t.Fatal("expected single-peer targeting")
 	}
-	if len(options.candidates) != 0 {
-		t.Fatalf("expected no candidate restriction, got %v", options.candidates)
+	if got := targeting.endorsingPeerNames(); got != nil {
+		t.Fatalf("expected no endorsing peer names, got %v", got)
 	}
 }
 
-func TestResolveSinglePeerCandidatesRequiresExactEndpoint(t *testing.T) {
+func TestTransactionTargetingLastCallWins(t *testing.T) {
+	tx := &Transaction{targeting: gatewayDefaultTransactionTargeting()}
+	if err := tx.UseEndorsingPeers("peer0.org1.example.com:7051"); err != nil {
+		t.Fatalf("UseEndorsingPeers failed: %v", err)
+	}
+	if tx.targeting.isSinglePeer() {
+		t.Fatal("expected endorsing-peers targeting")
+	}
+	if err := tx.UseSinglePeer(); err != nil {
+		t.Fatalf("UseSinglePeer failed: %v", err)
+	}
+	if !tx.targeting.isSinglePeer() {
+		t.Fatal("expected single-peer targeting after last call")
+	}
+	if err := tx.UseEndorsingPeers("peer1.org1.example.com:8051"); err != nil {
+		t.Fatalf("UseEndorsingPeers failed: %v", err)
+	}
+	if tx.targeting.isSinglePeer() {
+		t.Fatal("expected endorsing-peers targeting after last call")
+	}
+	if got, want := tx.targeting.endorsingPeerNames(), []string{"peer1.org1.example.com:8051"}; !equalStrings(got, want) {
+		t.Fatalf("endorsing peer names mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestResolveDiscoveredSinglePeersUsesAllDiscoveredPeers(t *testing.T) {
 	peers := []fab.Peer{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
 	}
 
-	_, err := resolveSinglePeerCandidates(peers, []string{"peer0"})
-	var configErr *ConfigurationError
-	if !errors.As(err, &configErr) {
-		t.Fatalf("expected ConfigurationError for missing host:port, got %T: %v", err, err)
-	}
-
-	resolved, err := resolveSinglePeerCandidates(peers, []string{"peer0.org1.example.com:7051"})
+	resolved, err := resolveDiscoveredSinglePeers(peers)
 	if err != nil {
-		t.Fatalf("expected host:port to resolve, got %v", err)
+		t.Fatalf("expected discovered peers to resolve, got %v", err)
 	}
-	if got, want := len(resolved), 1; got != want {
+	if got, want := len(resolved), 2; got != want {
 		t.Fatalf("resolved peer count mismatch: got %d want %d", got, want)
 	}
 
-	_, err = resolveSinglePeerCandidates(peers, []string{"peer2.org1.example.com:9051"})
+	_, err = resolveDiscoveredSinglePeers(nil)
 	var notFound *PeerNotFoundError
 	if !errors.As(err, &notFound) {
-		t.Fatalf("expected PeerNotFoundError for undiscovered endpoint, got %T: %v", err, err)
+		t.Fatalf("expected PeerNotFoundError for empty discovery, got %T: %v", err, err)
 	}
 }
 

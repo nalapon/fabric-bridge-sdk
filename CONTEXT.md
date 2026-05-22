@@ -12,10 +12,6 @@ _Avoid_: single node transaction, one-node transaction
 A transaction targeting mode where the developer names the exact peers that must receive the proposal.
 _Avoid_: candidate peer selection
 
-**Candidate peer selection**:
-A transaction targeting mode where the developer provides allowed peers and the SDK chooses exactly one of them.
-_Avoid_: explicit peer targeting, fallback peer selection
-
 **Discovered peer selection**:
 A transaction targeting mode where the SDK chooses exactly one peer from the peers discovered for the channel.
 _Avoid_: gateway peer selection
@@ -51,6 +47,42 @@ _Avoid_: RandomPeer API, DiscoveredPeer API
 **EndorsingPeers API**:
 The public transaction option that asks the SDK to send the proposal to every named peer.
 _Avoid_: SetEndorsingPeers
+
+**Gateway path**:
+The normal Fabric Gateway transaction path where the Gateway service handles endorsement routing for standard Fabric applications.
+_Avoid_: default peer path
+
+**Single-peer path**:
+The primary Fabric Bridge SDK transaction path where each proposal attempt is sent to exactly one discovered peer.
+_Avoid_: one-node path, explicit endorsement path
+
+**Explicit endorsement path**:
+The transaction path where the caller supplies the exact discovered peers that must receive the proposal.
+_Avoid_: single-peer path, gateway path
+
+**Direct endorsement path**:
+The bridge-owned transaction path family that sends proposals directly to discovered peers instead of letting Gateway choose endorsement routing.
+_Avoid_: legacy SDK path, peer mode
+
+**Fabric service discovery**:
+The Fabric network mechanism the SDK uses to obtain the channel peer set before applying **Transaction targeting**.
+_Avoid_: configured peer list, manual peer registry
+
+**Discovery seed**:
+The initial peer endpoint the SDK contacts to run **Fabric service discovery**; it is not automatically an endorsement target.
+_Avoid_: selected peer, target peer
+
+**Gateway endpoint**:
+The Fabric Gateway service endpoint used for gateway default transactions, gateway offline resume, and commit status queries.
+_Avoid_: discovery seed, orderer endpoint
+
+**Gateway submit**:
+Submitting a prepared transaction through the Fabric Gateway service.
+_Avoid_: direct submit
+
+**Orderer submit**:
+Submitting a prepared transaction directly to the Fabric orderer.
+_Avoid_: direct submit
 
 **Offline transaction signing**:
 A transaction flow where the SDK builds signable Fabric messages but an external signer supplies the required signatures.
@@ -111,7 +143,10 @@ _Avoid_: configuration error, endorsement error
 ## Relationships
 
 - **Transaction targeting** has exactly three modes: gateway default, single-peer, and endorsing-peers.
-- Gateway default **Transaction targeting** uses the normal Gateway path and does not force peer mode.
+- Gateway default **Transaction targeting** uses the **Gateway path**.
+- Single-peer **Transaction targeting** uses the **Single-peer path**.
+- Endorsing-peers **Transaction targeting** uses the **Explicit endorsement path**.
+- The **Direct endorsement path** includes the **Single-peer path** and **Explicit endorsement path**.
 - Gateway default **Transaction targeting** is the initial transaction state and is not exposed as a public reset API.
 - Single-peer **Transaction targeting** uses the **SinglePeer API**.
 - Endorsing-peers **Transaction targeting** uses the **EndorsingPeers API**.
@@ -121,12 +156,17 @@ _Avoid_: configuration error, endorsement error
 - **Transaction targeting** owns only targeting intent and invariants; discovery, peer selection, failover, and Fabric peer adaptation remain separate concerns.
 - **Transaction targeting** is an internal model; the public developer API remains the readable **SinglePeer API** and **EndorsingPeers API**.
 - The internal **Transaction targeting** model is implemented in both Node and Go SDKs.
-- A **Single-peer transaction** uses either **Candidate peer selection** or **Discovered peer selection**.
+- The **Single-peer path** is the primary reason Fabric Bridge SDK exists.
+- The **Single-peer path** sends each proposal attempt to exactly one discovered peer.
+- The **Explicit endorsement path** sends a proposal to every selected discovered peer.
+- The **Direct endorsement path** always uses **Fabric service discovery** before selecting or validating endorsement peers.
+- The **Discovery seed** is only used to obtain discovered peers and does not override **Transaction targeting**.
+- The **Gateway endpoint** and **Discovery seed** are separate configuration roles, even when they point to the same peer endpoint.
+- Gateway default **Transaction targeting** uses **Gateway submit**.
+- The **Direct endorsement path** uses **Orderer submit**.
+- A **Single-peer transaction** uses **Discovered peer selection** in the first new design.
 - A **Single-peer transaction** can be an evaluation or a submit operation.
 - The **SinglePeer API** expresses automatic single-peer choice and is distinct from **Explicit peer targeting**.
-- A candidate list passed to the **SinglePeer API** means "choose one of these peers" and never "send to all of these peers".
-- Empty candidates in the **SinglePeer API** mean no candidate restriction, equivalent to **Discovered peer selection**.
-- **Candidate peer selection** must fail when none of the candidates can be resolved to a discovered usable peer.
 - **Explicit peer targeting** preserves the developer-provided peer set and does not choose among candidates.
 - The **EndorsingPeers API** expresses **Explicit peer targeting** and sends the proposal to every named peer.
 - The **EndorsingPeers API** requires at least one peer; an empty peer set is invalid **Transaction targeting**.
@@ -152,11 +192,10 @@ _Avoid_: configuration error, endorsement error
 - Invalid **Peer endpoint identity** format is local configuration failure; a valid endpoint absent from discovery is a peer-not-found failure.
 - During offline resume, malformed **Peer endpoint identity** values in an **Endorsement routing snapshot** are **Offline signing error** values, while valid values absent from current channel discovery are peer-not-found failures.
 - **EndorsingPeers API** deduplicates normalized **Peer endpoint identity** values while preserving developer order.
-- **SinglePeer API** candidate lists deduplicate normalized **Peer endpoint identity** values before applying the **Peer selection policy**.
 - An **Endorsement routing snapshot** never stores duplicate **Peer endpoint identity** values.
 - Duplicate developer input for the same **Peer endpoint identity** is deduplicated silently, but duplicate discovered peers with the same canonical **Peer endpoint identity** are ambiguous discovery and fail before endorsement.
 - **Transaction targeting** can only select peers discovered for the channel; valid endpoints absent from channel discovery are never used for endorsement.
-- **Candidate peer selection** and **Explicit peer targeting** fail the whole operation when any requested **Peer endpoint identity** is absent from channel discovery.
+- **Explicit peer targeting** fails the whole operation when any requested **Peer endpoint identity** is absent from channel discovery.
 - Offline resume revalidates the **Endorsement routing snapshot** against current channel discovery and never substitutes a different peer automatically.
 - Offline resume fails locally when any **Peer endpoint identity** recorded in the **Endorsement routing snapshot** is absent from current channel discovery.
 - Offline **Single-peer transaction** snapshots store exactly the selected **Peer endpoint identity**, not the full eligible peer set.
@@ -175,7 +214,7 @@ _Avoid_: configuration error, endorsement error
 - Developers do not manually construct **Proposal signing request** values; the SDK builds the proposal and exposes the **Message digest** to be signed.
 - The bridge root object rehydrates signed-message DTOs into **Offline signing flow object** values within the same runtime.
 - A proposal **Signing request** captures the effective peer set for one endorsement attempt.
-- **Single-peer failover** during **Offline transaction signing** requires a new proposal **Signing request** and a new external signature for each attempted peer.
+- **Offline transaction signing** on the **Single-peer path** does not perform **Single-peer failover**; endorsement failure for the snapshotted peer is terminal for that signed proposal.
 - **Signing request** and signed-message DTOs are portable data, while **Offline signing flow object** types own runtime behavior.
 - A **Signing request** is currently always a **Proposal signing request**.
 - A signed proposal produces an **Endorsed transaction**, and the SDK signs the final transaction with the bridge identity before submit.
@@ -194,18 +233,17 @@ _Avoid_: configuration error, endorsement error
 - **Offline transaction signing** supports evaluation as a proposal-only flow that ends after a signed proposal is evaluated.
 - Peer-targeted offline proposal construction and endorsement do not require the **Bridge identity** private key; the externally supplied proposal signature is used for endorsement.
 - Commit tracking after offline submit uses the bridge identity and signer through the existing commit-waiting behavior.
-- The Node **SinglePeer API** uses an options object for candidates and policy.
-- The Go **SinglePeer API** uses functional options for candidates and policy.
+- The **SinglePeer API** does not accept peer lists in the first new design.
 - Offline signing API methods use PascalCase in both Node and Go.
 - Node and Go keep cohesive API names, but each runtime follows its own error-handling idioms.
 - Node reports SDK operation errors through `better-result`; Go reports SDK errors through returned `error` values.
 - In Go, **SinglePeer API** and **EndorsingPeers API** are mutable setters that return only `error`, not fluent builders.
 - In Node, **SinglePeer API** and **EndorsingPeers API** return `better-result` values when local targeting validation can fail.
 - In Node, a successful targeting setter returns the same mutable transaction builder inside `Result.ok`.
-- The **SinglePeer API** always validates eligible peers through discovery, even when exactly one candidate is provided.
+- The **SinglePeer API** always validates eligible peers through discovery.
 - The default **Peer selection policy** is round-robin scoped to the SDK instance and the effective peer set.
-- The first supported **Peer selection policies** are round-robin and random.
-- Unsupported **Peer selection policies** are invalid local targeting configuration.
+- Online **Single-peer failover** is enabled by design and is not exposed as a public toggle in the first new design.
+- The first new design uses round-robin as the only **Peer selection policy** for the **Single-peer path**.
 - **Single-peer failover** still sends each attempt to exactly one peer and fails only after all eligible peers have failed.
 - **Single-peer failover** is triggered only by transport, timeout, or peer availability failures.
 - **Failover eligibility** is classified separately from **Peer selection policy**.
@@ -220,9 +258,9 @@ _Avoid_: configuration error, endorsement error
 
 ## Example Dialogue
 
-> **Dev:** "Can I pass three peers and let the SDK use only one?"
-> **Domain expert:** "Yes, that is **Candidate peer selection**: the three peers are allowed candidates, and the SDK must choose exactly one or fail."
+> **Dev:** "Can I pass three peers to `UseEndorsingPeers`?"
+> **Domain expert:** "Yes, that is **Explicit peer targeting**: the SDK sends the proposal to all three discovered peers. `UseSinglePeer` is different: the SDK chooses exactly one discovered peer."
 
 ## Flagged Ambiguities
 
-- "single peer" was used both for exact peer targeting and automatic choice of one peer; resolved: **Explicit peer targeting** and **Candidate peer selection** are distinct concepts.
+- "single peer" was used both for automatic single-peer choice and caller-provided peer lists; resolved: **Single-peer path** chooses one discovered peer, while **Explicit endorsement path** sends to every caller-provided peer.

@@ -41,7 +41,7 @@ func main() {
 			Evaluate: 30 * time.Second,
 		}),
 		// Optional: TLS config
-		// fabricbridge.WithTLS(fabricbridge.TLSOptions{
+		// fabricbridge.WithGatewayTLS(fabricbridge.TLSOptions{
 		// 	TrustedRoots:        tlsRootCert,
 		// 	Verify:              true,
 		// 	SslTargetNameOverride: "peer0.org1.example.com",
@@ -93,9 +93,7 @@ func main() {
 	// Example 2: Submit with single-peer targeting.
 	// Peer-targeted operations use a dedicated peer adapter for the operation.
 	txBuilder := contract.Transaction("CreateAsset")
-	if err := txBuilder.UseSinglePeer(
-		fabricbridge.WithCandidatePeers("peer0.org1.example.com", "peer0.org2.example.com"),
-	); err != nil {
+	if err := txBuilder.UseSinglePeer(); err != nil {
 		log.Fatalf("Configure single-peer targeting failed: %v", err)
 	}
 	txBuilder.SetTransientData(map[string][]byte{
@@ -109,7 +107,7 @@ func main() {
 
 	// Example 3: Evaluate with peer targeting
 	// queryBuilder := contract.Transaction("ReadAsset")
-	// if err := queryBuilder.UseSinglePeer(fabricbridge.WithCandidatePeers("peer0.org1.example.com")); err != nil {
+	// if err := queryBuilder.UseSinglePeer(); err != nil {
 	//     log.Fatalf("Configure single-peer targeting failed: %v", err)
 	// }
 	// result, err := queryBuilder.Evaluate(ctx, "asset1")
@@ -175,7 +173,7 @@ func runOfflineSinglePeer(ctx context.Context, bridge *fabricbridge.Bridge, cont
 		MSPId:       "Org1MSP",
 		Certificate: []byte("-----BEGIN CERTIFICATE-----\ndummy-cert\n-----END CERTIFICATE-----"),
 	})
-	if err := tx.UseSinglePeer(fabricbridge.WithCandidatePeers("peer0.org1.example.com")); err != nil {
+	if err := tx.UseSinglePeer(); err != nil {
 		return err
 	}
 

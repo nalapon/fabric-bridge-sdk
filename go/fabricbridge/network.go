@@ -225,12 +225,8 @@ func (t *Transaction) UseEndorsingPeers(peers ...string) error {
 }
 
 // UseSinglePeer chooses one discovered peer per attempt.
-func (t *Transaction) UseSinglePeer(opts ...SinglePeerOption) error {
-	targeting, err := newSinglePeerTargeting(opts)
-	if err != nil {
-		return err
-	}
-	t.targeting = targeting
+func (t *Transaction) UseSinglePeer() error {
+	t.targeting = newSinglePeerTargeting()
 	return nil
 }
 
@@ -268,7 +264,7 @@ func (t *Transaction) Submit(ctx context.Context, args ...string) (*CommitResult
 
 // SubmitAsync executes the transaction without waiting for commit.
 func (t *Transaction) SubmitAsync(ctx context.Context, args ...string) (*SubmittedTransaction, error) {
-	if _, ok := t.targeting.singlePeerOptions(); ok {
+	if t.targeting.isSinglePeer() {
 		return t.submitAsyncWithSinglePeer(ctx, args)
 	}
 	if len(t.targeting.endorsingPeerNames()) > 0 {
@@ -287,7 +283,7 @@ func (t *Transaction) NewUnsignedProposal(ctx context.Context, args ...string) (
 		}
 	}
 
-	if _, ok := t.targeting.singlePeerOptions(); ok {
+	if t.targeting.isSinglePeer() {
 		return t.newUnsignedPeerProposal(ctx, args)
 	}
 	if len(t.targeting.endorsingPeerNames()) > 0 {
@@ -332,12 +328,12 @@ func (t *Transaction) newUnsignedPeerProposal(ctx context.Context, args []string
 	}
 
 	var routing *OfflineSigningRouting
-	if singlePeer, ok := t.targeting.singlePeerOptions(); ok {
-		eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
+	if t.targeting.isSinglePeer() {
+		eligible, err := resolveDiscoveredSinglePeers(discovered)
 		if err != nil {
 			return nil, err
 		}
-		ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
+		ordered := orderSinglePeers(t.contract.network.channel, eligible, bridge.roundRobin)
 		if len(ordered) == 0 {
 			return nil, &PeerNotFoundError{PeerName: "<single-peer>", AvailablePeers: peerURLs(discovered)}
 		}
@@ -524,7 +520,7 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 
 // Evaluate executes the transaction as a query with peer targeting if configured
 func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, error) {
-	if _, ok := t.targeting.singlePeerOptions(); ok {
+	if t.targeting.isSinglePeer() {
 		return t.evaluateWithSinglePeer(ctx, args)
 	}
 	if len(t.targeting.endorsingPeerNames()) > 0 {
@@ -557,16 +553,12 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		pc.Close()
 		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
 	}
-	singlePeer, _ := t.targeting.singlePeerOptions()
-	eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
+	eligible, err := resolveDiscoveredSinglePeers(discovered)
 	if err != nil {
 		pc.Close()
 		return nil, err
 	}
-	ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
-	if !singlePeer.failover && len(ordered) > 1 {
-		ordered = ordered[:1]
-	}
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, bridge.roundRobin)
 
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
@@ -578,10 +570,8 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
-		singlePeer.candidates,
 		eligible,
 		ordered,
-		singlePeer.failover,
 		func(peer legacyfab.Peer) (*peerSubmittedTransaction, error) {
 			return pc.SubmitAsyncTargets(
 				ctx,
@@ -619,15 +609,11 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 	if err != nil {
 		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
 	}
-	singlePeer, _ := t.targeting.singlePeerOptions()
-	eligible, err := resolveSinglePeerCandidates(discovered, singlePeer.candidates)
+	eligible, err := resolveDiscoveredSinglePeers(discovered)
 	if err != nil {
 		return nil, err
 	}
-	ordered := orderSinglePeers(t.contract.network.channel, eligible, *singlePeer, bridge.roundRobin)
-	if !singlePeer.failover && len(ordered) > 1 {
-		ordered = ordered[:1]
-	}
+	ordered := orderSinglePeers(t.contract.network.channel, eligible, bridge.roundRobin)
 
 	byteArgs := make([][]byte, len(args))
 	for i, arg := range args {
@@ -639,10 +625,8 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
-		singlePeer.candidates,
 		eligible,
 		ordered,
-		singlePeer.failover,
 		func(peer legacyfab.Peer) ([]byte, error) {
 			return pc.QueryTargets(
 				ctx,
