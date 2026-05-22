@@ -8,14 +8,12 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	legacychannel "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
 )
 
 type fakeExplicitPeer struct {
 	url     string
-	process func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error)
+	process func(context.Context, processProposalRequest) (*proposalResponse, error)
 }
 
 func (p fakeExplicitPeer) MSPID() string {
@@ -26,31 +24,31 @@ func (p fakeExplicitPeer) URL() string {
 	return p.url
 }
 
-func (p fakeExplicitPeer) Properties() fab.Properties {
+func (p fakeExplicitPeer) Properties() peerProperties {
 	return nil
 }
 
-func (p fakeExplicitPeer) ProcessTransactionProposal(ctx context.Context, request fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+func (p fakeExplicitPeer) ProcessTransactionProposal(ctx context.Context, request processProposalRequest) (*proposalResponse, error) {
 	return p.process(ctx, request)
 }
 
 func TestEndorseExplicitPeerTargetsRunsConcurrentlyAndPreservesOrder(t *testing.T) {
 	started := make(chan string, 2)
 	release := make(chan struct{})
-	targets := []fab.Peer{
-		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+	targets := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			started <- "peer0"
 			<-release
 			return successfulProposalResponse("peer0", []byte("result")), nil
 		}},
-		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			started <- "peer1"
 			<-release
 			return successfulProposalResponse("peer1", []byte("result")), nil
 		}},
 	}
 
-	var responses []*fab.TransactionProposalResponse
+	var responses []*proposalResponse
 	var err error
 	done := make(chan struct{})
 	go func() {
@@ -74,11 +72,11 @@ func TestEndorseExplicitPeerTargetsRunsConcurrentlyAndPreservesOrder(t *testing.
 }
 
 func TestEndorseExplicitPeerTargetsFailsOnAnySelectedPeerFailure(t *testing.T) {
-	targets := []fab.Peer{
-		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+	targets := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return successfulProposalResponse("peer0", []byte("result")), nil
 		}},
-		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return nil, errors.New("endorser refused")
 		}},
 	}
@@ -96,23 +94,23 @@ func TestEndorseExplicitPeerTargetsFailsOnAnySelectedPeerFailure(t *testing.T) {
 func TestEndorseExplicitPeerTargetsValidatesSuccessfulMatchingEndorsements(t *testing.T) {
 	tests := []struct {
 		name      string
-		responses []*fab.TransactionProposalResponse
+		responses []*proposalResponse
 	}{
 		{
 			name: "unsuccessful status",
-			responses: []*fab.TransactionProposalResponse{
+			responses: []*proposalResponse{
 				failedProposalResponse("peer0"),
 			},
 		},
 		{
 			name: "missing endorsement",
-			responses: []*fab.TransactionProposalResponse{
+			responses: []*proposalResponse{
 				proposalResponseWithoutEndorsement("peer0"),
 			},
 		},
 		{
 			name: "mismatched payload",
-			responses: []*fab.TransactionProposalResponse{
+			responses: []*proposalResponse{
 				successfulProposalResponse("peer0", []byte("result-a")),
 				successfulProposalResponse("peer1", []byte("result-b")),
 			},
@@ -129,11 +127,11 @@ func TestEndorseExplicitPeerTargetsValidatesSuccessfulMatchingEndorsements(t *te
 }
 
 func TestEvaluateWithEndorsingPeersResolvesAllPeersAndPreservesCallerOrder(t *testing.T) {
-	peers := []fab.Peer{
-		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return successfulProposalResponse("peer0", []byte("evaluated")), nil
 		}},
-		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return successfulProposalResponse("peer1", []byte("evaluated")), nil
 		}},
 	}
@@ -153,7 +151,7 @@ func TestEvaluateWithEndorsingPeersResolvesAllPeersAndPreservesCallerOrder(t *te
 }
 
 func TestEvaluateWithEndorsingPeersFailsWhenRequestedPeerMissing(t *testing.T) {
-	peers := []fab.Peer{fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+	peers := []peerTarget{fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 		return successfulProposalResponse("peer0", []byte("evaluated")), nil
 	}}}
 	installExplicitPeerRuntimeHarness(t, peers)
@@ -166,42 +164,70 @@ func TestEvaluateWithEndorsingPeersFailsWhenRequestedPeerMissing(t *testing.T) {
 	}
 }
 
+func TestSubmitAsyncWithEndorsingPeersRequiresOrdererEndpointLocally(t *testing.T) {
+	tx := newExplicitPeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer(), "peer0.org1.example.com:7051")
+	_, err := tx.SubmitAsync(context.Background(), "asset1")
+	var configErr *ConfigurationError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("expected ConfigurationError, got %T: %v", err, err)
+	}
+	if configErr.Field != "ordererEndpoint" {
+		t.Fatalf("expected ordererEndpoint field, got %q", configErr.Field)
+	}
+}
+
 func TestSubmitAsyncWithEndorsingPeersPreservesCallerOrderAfterDeduplication(t *testing.T) {
-	peers := []fab.Peer{
-		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+	ordererAddress, _, stop := startTestOrdererServer(t, common.Status_SUCCESS)
+	defer stop()
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return successfulProposalResponse("peer0", []byte("submitted")), nil
 		}},
-		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
 			return successfulProposalResponse("peer1", []byte("submitted")), nil
 		}},
 	}
-	harness := installExplicitPeerRuntimeHarness(t, peers)
-	tx := newExplicitPeerTestTransaction(t, newSinglePeerTestBridge(), "peer1.org1.example.com:8051", "peer0.org1.example.com:7051", "grpcs://peer1.org1.example.com:8051")
+	installExplicitPeerRuntimeHarness(t, peers)
+	tx := newExplicitPeerTestTransaction(t, newSinglePeerTestBridgeWithOrderer(ordererAddress), "peer1.org1.example.com:8051", "peer0.org1.example.com:7051", "grpcs://peer1.org1.example.com:8051")
 
 	submitted, err := tx.SubmitAsync(context.Background(), "asset1")
 	if err != nil {
 		t.Fatalf("expected explicit endorsement submit, got %v", err)
 	}
-	if submitted.TransactionID() != "explicit-tx" {
-		t.Fatalf("transaction ID mismatch: got %q", submitted.TransactionID())
+	if submitted.TransactionID() == "" {
+		t.Fatal("expected non-empty direct transaction ID")
 	}
-	if got, want := harness.submitAttempts, [][]string{{"grpcs://peer1.org1.example.com:8051", "grpcs://peer0.org1.example.com:7051"}}; !equalStringSlices(got, want) {
-		t.Fatalf("submit target order mismatch: got %v want %v", got, want)
+}
+
+func TestResolveEndorsingPeerTargetsPreservesCallerOrderAfterDeduplication(t *testing.T) {
+	discovered := []peerTarget{
+		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
+		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
+	}
+	targets, err := resolveEndorsingPeerTargets(discovered, []string{
+		"peer1.org1.example.com:8051",
+		"peer0.org1.example.com:7051",
+		"grpcs://peer1.org1.example.com:8051",
+	})
+	if err != nil {
+		t.Fatalf("resolve targets: %v", err)
+	}
+	if got, want := peerEndpointsForTest(targets), []string{"grpcs://peer1.org1.example.com:8051", "grpcs://peer0.org1.example.com:7051"}; !equalStrings(got, want) {
+		t.Fatalf("target order mismatch: got %v want %v", got, want)
 	}
 }
 
 type explicitPeerRuntimeHarness struct {
-	peers          []fab.Peer
-	discovered     int
-	submitAttempts [][]string
-	mu             sync.Mutex
+	peers      []peerTarget
+	discovered int
+	mu         sync.Mutex
 }
 
 type explicitPeerRuntime struct {
 	harness *explicitPeerRuntimeHarness
 }
 
-func installExplicitPeerRuntimeHarness(t *testing.T, peers []fab.Peer) *explicitPeerRuntimeHarness {
+func installExplicitPeerRuntimeHarness(t *testing.T, peers []peerTarget) *explicitPeerRuntimeHarness {
 	t.Helper()
 	harness := &explicitPeerRuntimeHarness{peers: peers}
 	previous := newPeerRuntime
@@ -216,30 +242,15 @@ func installExplicitPeerRuntimeHarness(t *testing.T, peers []fab.Peer) *explicit
 
 func (r *explicitPeerRuntime) Close() {}
 
-func (r *explicitPeerRuntime) DiscoverPeers(string) ([]fab.Peer, error) {
+func (r *explicitPeerRuntime) DiscoverPeers(string) ([]peerTarget, error) {
 	r.harness.mu.Lock()
 	defer r.harness.mu.Unlock()
 	r.harness.discovered++
-	return append([]fab.Peer(nil), r.harness.peers...), nil
+	return append([]peerTarget(nil), r.harness.peers...), nil
 }
 
-func (r *explicitPeerRuntime) QueryTargets(context.Context, string, string, string, [][]byte, []fab.Peer, map[string][]byte) ([]byte, error) {
+func (r *explicitPeerRuntime) QueryTargets(context.Context, string, string, string, [][]byte, []peerTarget, map[string][]byte) ([]byte, error) {
 	return nil, errors.New("QueryTargets should not be used by explicit endorsement")
-}
-
-func (r *explicitPeerRuntime) SubmitAsyncTargets(_ context.Context, _ string, _ string, _ string, _ [][]byte, peers []fab.Peer, _ map[string][]byte) (*peerSubmittedTransaction, error) {
-	r.harness.mu.Lock()
-	r.harness.submitAttempts = append(r.harness.submitAttempts, peerEndpointsForTest(peers))
-	r.harness.mu.Unlock()
-	return &peerSubmittedTransaction{
-		response: &legacychannel.Response{
-			TransactionID: fab.TransactionID("explicit-tx"),
-			Payload:       []byte("submitted"),
-		},
-		waitForCommit: func(context.Context) (*CommitStatus, error) {
-			return &CommitStatus{TransactionID: "explicit-tx"}, nil
-		},
-	}, nil
 }
 
 func newExplicitPeerTestTransaction(t *testing.T, bridge *Bridge, peers ...string) *Transaction {
@@ -257,8 +268,8 @@ func newExplicitPeerTestTransaction(t *testing.T, bridge *Bridge, peers ...strin
 	return tx
 }
 
-func successfulProposalResponse(endorser string, result []byte) *fab.TransactionProposalResponse {
-	return &fab.TransactionProposalResponse{
+func successfulProposalResponse(endorser string, result []byte) *proposalResponse {
+	return &proposalResponse{
 		Endorser: endorser,
 		Status:   int32(common.Status_SUCCESS),
 		ProposalResponse: &peerProto.ProposalResponse{
@@ -269,8 +280,8 @@ func successfulProposalResponse(endorser string, result []byte) *fab.Transaction
 	}
 }
 
-func failedProposalResponse(endorser string) *fab.TransactionProposalResponse {
-	return &fab.TransactionProposalResponse{
+func failedProposalResponse(endorser string) *proposalResponse {
+	return &proposalResponse{
 		Endorser: endorser,
 		ProposalResponse: &peerProto.ProposalResponse{
 			Response: &peerProto.Response{Status: int32(common.Status_BAD_REQUEST), Message: "bad request"},
@@ -279,7 +290,7 @@ func failedProposalResponse(endorser string) *fab.TransactionProposalResponse {
 	}
 }
 
-func proposalResponseWithoutEndorsement(endorser string) *fab.TransactionProposalResponse {
+func proposalResponseWithoutEndorsement(endorser string) *proposalResponse {
 	response := successfulProposalResponse(endorser, []byte("result"))
 	response.ProposalResponse.Endorsement = nil
 	return response
@@ -299,7 +310,7 @@ func proposalResponsePayload(result []byte) []byte {
 	return payloadBytes
 }
 
-func proposalResponseEndorsers(responses []*fab.TransactionProposalResponse) []string {
+func proposalResponseEndorsers(responses []*proposalResponse) []string {
 	out := make([]string, 0, len(responses))
 	for _, response := range responses {
 		out = append(out, string(response.ProposalResponse.GetEndorsement().GetEndorser()))

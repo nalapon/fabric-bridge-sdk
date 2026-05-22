@@ -5,8 +5,6 @@ import (
 	"net"
 	"net/url"
 	"strings"
-
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 )
 
 func dedupePeerEndpointInputs(inputs []string, tlsEnabled bool) ([]string, error) {
@@ -26,7 +24,7 @@ func dedupePeerEndpointInputs(inputs []string, tlsEnabled bool) ([]string, error
 	return out, nil
 }
 
-func matchDiscoveredPeer(peers []fab.Peer, canonicalEndpoint string) (fab.Peer, bool) {
+func matchDiscoveredPeer(peers []peerTarget, canonicalEndpoint string) (peerTarget, bool) {
 	tlsEnabled := discoveredPeersUseTLS(peers)
 	for _, peer := range peers {
 		canonicalPeer, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)
@@ -40,7 +38,7 @@ func matchDiscoveredPeer(peers []fab.Peer, canonicalEndpoint string) (fab.Peer, 
 	return nil, false
 }
 
-func peerURLs(peers []fab.Peer) []string {
+func peerURLs(peers []peerTarget) []string {
 	tlsEnabled := discoveredPeersUseTLS(peers)
 	out := make([]string, 0, len(peers))
 	for _, peer := range peers {
@@ -53,7 +51,7 @@ func peerURLs(peers []fab.Peer) []string {
 	return out
 }
 
-func discoveredPeersUseTLS(peers []fab.Peer) bool {
+func discoveredPeersUseTLS(peers []peerTarget) bool {
 	for _, peer := range peers {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(peer.URL())), "grpcs://") {
 			return true
@@ -62,11 +60,11 @@ func discoveredPeersUseTLS(peers []fab.Peer) bool {
 	return false
 }
 
-func canonicalDiscoveredPeerEndpoint(peer fab.Peer, tlsEnabled bool) (string, error) {
+func canonicalDiscoveredPeerEndpoint(peer peerTarget, tlsEnabled bool) (string, error) {
 	return normalizePeerEndpointIdentity(peer.URL(), tlsEnabled)
 }
 
-func ensureUniqueDiscoveredPeerEndpoints(peers []fab.Peer, tlsEnabled bool) error {
+func ensureUniqueDiscoveredPeerEndpoints(peers []peerTarget, tlsEnabled bool) error {
 	seen := make(map[string]bool, len(peers))
 	for _, peer := range peers {
 		canonical, err := canonicalDiscoveredPeerEndpoint(peer, tlsEnabled)

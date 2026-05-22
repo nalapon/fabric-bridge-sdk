@@ -7,8 +7,6 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
-	legacychannel "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/client/channel"
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -26,16 +24,16 @@ func (p fakeSinglePeer) URL() string {
 	return p.url
 }
 
-func (p fakeSinglePeer) Properties() fab.Properties {
+func (p fakeSinglePeer) Properties() peerProperties {
 	return nil
 }
 
-func (p fakeSinglePeer) ProcessTransactionProposal(context.Context, fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+func (p fakeSinglePeer) ProcessTransactionProposal(context.Context, processProposalRequest) (*proposalResponse, error) {
 	return nil, nil
 }
 
 func TestExecuteSinglePeerTargetsRetriesEligibleFailures(t *testing.T) {
-	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
 	var attempted []string
 
 	result, err := executeSinglePeerTargets(
@@ -45,7 +43,7 @@ func TestExecuteSinglePeerTargetsRetriesEligibleFailures(t *testing.T) {
 		"Read",
 		peers,
 		peers,
-		func(peer fab.Peer) (string, error) {
+		func(peer peerTarget) (string, error) {
 			attempted = append(attempted, peer.URL())
 			if len(attempted) == 1 {
 				return "", context.DeadlineExceeded
@@ -65,7 +63,7 @@ func TestExecuteSinglePeerTargetsRetriesEligibleFailures(t *testing.T) {
 }
 
 func TestExecuteSinglePeerTargetsStopsOnNonRetryableFailure(t *testing.T) {
-	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
 	originalErr := &EvaluationError{Message: "chaincode rejected the query"}
 	var attempts int
 
@@ -76,7 +74,7 @@ func TestExecuteSinglePeerTargetsStopsOnNonRetryableFailure(t *testing.T) {
 		"Read",
 		peers,
 		peers,
-		func(fab.Peer) (string, error) {
+		func(peerTarget) (string, error) {
 			attempts++
 			return "", originalErr
 		},
@@ -90,7 +88,7 @@ func TestExecuteSinglePeerTargetsStopsOnNonRetryableFailure(t *testing.T) {
 }
 
 func TestExecuteSinglePeerTargetsReturnsCanonicalFailureAfterAllEligiblePeersFail(t *testing.T) {
-	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0"}, fakeSinglePeer{url: "grpcs://peer1"}}
 
 	_, err := executeSinglePeerTargets(
 		"submitAsync",
@@ -99,7 +97,7 @@ func TestExecuteSinglePeerTargetsReturnsCanonicalFailureAfterAllEligiblePeersFai
 		"Transfer",
 		peers,
 		peers,
-		func(peer fab.Peer) (string, error) {
+		func(peer peerTarget) (string, error) {
 			if peer.URL() == "grpcs://peer0" {
 				return "", context.DeadlineExceeded
 			}
@@ -169,7 +167,7 @@ func TestTransactionTargetingLastCallWins(t *testing.T) {
 }
 
 func TestResolveDiscoveredSinglePeersUsesAllDiscoveredPeers(t *testing.T) {
-	peers := []fab.Peer{
+	peers := []peerTarget{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
 	}
@@ -190,7 +188,7 @@ func TestResolveDiscoveredSinglePeersUsesAllDiscoveredPeers(t *testing.T) {
 }
 
 func TestResolveEndorsingPeerTargetsDeduplicatesCanonicalEndpoints(t *testing.T) {
-	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
 
 	resolved, err := resolveEndorsingPeerTargets(peers, []string{
 		"peer0.org1.example.com:7051",
@@ -205,7 +203,7 @@ func TestResolveEndorsingPeerTargetsDeduplicatesCanonicalEndpoints(t *testing.T)
 }
 
 func TestEvaluateWithSinglePeerTargetsExactlyOnePeerPerAttempt(t *testing.T) {
-	peers := []fab.Peer{
+	peers := []peerTarget{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
 	}
@@ -228,32 +226,59 @@ func TestEvaluateWithSinglePeerTargetsExactlyOnePeerPerAttempt(t *testing.T) {
 	}
 }
 
-func TestSubmitAsyncWithSinglePeerTargetsExactlyOnePeerPerAttempt(t *testing.T) {
-	peers := []fab.Peer{
-		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
-		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
-	}
-	harness := installSinglePeerRuntimeHarness(t, peers)
-	harness.submitErrors["grpcs://peer0.org1.example.com:7051"] = status.Error(codes.Unavailable, "peer unavailable")
+func TestEvaluateWithSinglePeerDoesNotRequireOrdererEndpoint(t *testing.T) {
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
+	installSinglePeerRuntimeHarness(t, peers)
 
-	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridge())
+	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer())
+	if _, err := tx.Evaluate(context.Background(), "asset1"); err != nil {
+		t.Fatalf("expected evaluate without orderer endpoint, got %v", err)
+	}
+}
+
+func TestSubmitAsyncWithSinglePeerRequiresOrdererEndpointLocally(t *testing.T) {
+	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer())
+	_, err := tx.SubmitAsync(context.Background(), "asset1")
+	var configErr *ConfigurationError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("expected ConfigurationError, got %T: %v", err, err)
+	}
+	if configErr.Field != "ordererEndpoint" {
+		t.Fatalf("expected ordererEndpoint field, got %q", configErr.Field)
+	}
+}
+
+func TestSubmitAsyncWithSinglePeerTargetsExactlyOnePeerPerAttempt(t *testing.T) {
+	ordererAddress, _, stop := startTestOrdererServer(t, common.Status_SUCCESS)
+	defer stop()
+	var attempts []string
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			attempts = append(attempts, "grpcs://peer0.org1.example.com:7051")
+			return nil, status.Error(codes.Unavailable, "peer unavailable")
+		}},
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			attempts = append(attempts, "grpcs://peer1.org1.example.com:8051")
+			return successfulProposalResponse("peer1", []byte("submitted")), nil
+		}},
+	}
+	installSinglePeerRuntimeHarness(t, peers)
+
+	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithOrderer(ordererAddress))
 	submitted, err := tx.SubmitAsync(context.Background(), "asset1")
 	if err != nil {
 		t.Fatalf("expected submit failover success, got %v", err)
 	}
-	if submitted.TransactionID() != "tx-grpcs://peer1.org1.example.com:8051" {
-		t.Fatalf("unexpected transaction ID: %q", submitted.TransactionID())
+	if submitted.TransactionID() == "" {
+		t.Fatal("expected non-empty transaction ID")
 	}
-	if got, want := harness.submitAttempts, [][]string{
-		{"grpcs://peer0.org1.example.com:7051"},
-		{"grpcs://peer1.org1.example.com:8051"},
-	}; !equalStringSlices(got, want) {
+	if got, want := attempts, []string{"grpcs://peer0.org1.example.com:7051", "grpcs://peer1.org1.example.com:8051"}; !equalStrings(got, want) {
 		t.Fatalf("submit attempts mismatch: got %v want %v", got, want)
 	}
 }
 
 func TestSinglePeerRoundRobinIsScopedToBridgeAndPeerSet(t *testing.T) {
-	peers := []fab.Peer{
+	peers := []peerTarget{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
 	}
@@ -283,7 +308,7 @@ func TestSinglePeerRoundRobinIsScopedToBridgeAndPeerSet(t *testing.T) {
 }
 
 func TestEvaluateWithSinglePeerDoesNotFailOverNonRetryableErrors(t *testing.T) {
-	peers := []fab.Peer{
+	peers := []peerTarget{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
 	}
@@ -302,20 +327,27 @@ func TestEvaluateWithSinglePeerDoesNotFailOverNonRetryableErrors(t *testing.T) {
 }
 
 func TestSubmitWithSinglePeerDoesNotFailOverCommitFailure(t *testing.T) {
-	peers := []fab.Peer{
-		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
-		fakeSinglePeer{url: "grpcs://peer1.org1.example.com:8051"},
+	ordererAddress, _, stop := startTestOrdererServer(t, common.Status_SUCCESS)
+	defer stop()
+	var attempts []string
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			attempts = append(attempts, "grpcs://peer0.org1.example.com:7051")
+			return successfulProposalResponse("peer0", []byte("submitted")), nil
+		}},
+		fakeExplicitPeer{url: "grpcs://peer1.org1.example.com:8051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			attempts = append(attempts, "grpcs://peer1.org1.example.com:8051")
+			return successfulProposalResponse("peer1", []byte("submitted")), nil
+		}},
 	}
-	harness := installSinglePeerRuntimeHarness(t, peers)
-	harness.commitErr = &CommitError{Message: "invalid commit", TransactionID: "tx-grpcs://peer0.org1.example.com:7051"}
+	installSinglePeerRuntimeHarness(t, peers)
 
-	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridge())
+	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithOrderer(ordererAddress))
 	_, err := tx.Submit(context.Background(), "asset1")
-	var commitErr *CommitError
-	if !errors.As(err, &commitErr) {
-		t.Fatalf("expected CommitError, got %T: %v", err, err)
+	if err == nil {
+		t.Fatal("expected commit wait failure")
 	}
-	if got, want := harness.submitAttempts, [][]string{{"grpcs://peer0.org1.example.com:7051"}}; !equalStringSlices(got, want) {
+	if got, want := attempts, []string{"grpcs://peer0.org1.example.com:7051"}; !equalStrings(got, want) {
 		t.Fatalf("submit attempts mismatch: got %v want %v", got, want)
 	}
 }
@@ -387,24 +419,20 @@ func equalStrings(a, b []string) bool {
 }
 
 type singlePeerRuntimeHarness struct {
-	peers          []fab.Peer
-	queryErrors    map[string]error
-	submitErrors   map[string]error
-	commitErr      error
-	queryAttempts  [][]string
-	submitAttempts [][]string
+	peers         []peerTarget
+	queryErrors   map[string]error
+	queryAttempts [][]string
 }
 
 type recordingPeerRuntime struct {
 	harness *singlePeerRuntimeHarness
 }
 
-func installSinglePeerRuntimeHarness(t *testing.T, peers []fab.Peer) *singlePeerRuntimeHarness {
+func installSinglePeerRuntimeHarness(t *testing.T, peers []peerTarget) *singlePeerRuntimeHarness {
 	t.Helper()
 	harness := &singlePeerRuntimeHarness{
-		peers:        peers,
-		queryErrors:  make(map[string]error),
-		submitErrors: make(map[string]error),
+		peers:       peers,
+		queryErrors: make(map[string]error),
 	}
 	previous := newPeerRuntime
 	newPeerRuntime = func(Config, string) (peerRuntime, error) {
@@ -418,11 +446,11 @@ func installSinglePeerRuntimeHarness(t *testing.T, peers []fab.Peer) *singlePeer
 
 func (r *recordingPeerRuntime) Close() {}
 
-func (r *recordingPeerRuntime) DiscoverPeers(string) ([]fab.Peer, error) {
-	return append([]fab.Peer(nil), r.harness.peers...), nil
+func (r *recordingPeerRuntime) DiscoverPeers(string) ([]peerTarget, error) {
+	return append([]peerTarget(nil), r.harness.peers...), nil
 }
 
-func (r *recordingPeerRuntime) QueryTargets(_ context.Context, _ string, _ string, _ string, _ [][]byte, peers []fab.Peer, _ map[string][]byte) ([]byte, error) {
+func (r *recordingPeerRuntime) QueryTargets(_ context.Context, _ string, _ string, _ string, _ [][]byte, peers []peerTarget, _ map[string][]byte) ([]byte, error) {
 	endpoints := peerEndpointsForTest(peers)
 	r.harness.queryAttempts = append(r.harness.queryAttempts, endpoints)
 	if len(peers) == 0 {
@@ -434,37 +462,28 @@ func (r *recordingPeerRuntime) QueryTargets(_ context.Context, _ string, _ strin
 	return []byte("query:" + peers[0].URL()), nil
 }
 
-func (r *recordingPeerRuntime) SubmitAsyncTargets(_ context.Context, _ string, _ string, _ string, _ [][]byte, peers []fab.Peer, _ map[string][]byte) (*peerSubmittedTransaction, error) {
-	endpoints := peerEndpointsForTest(peers)
-	r.harness.submitAttempts = append(r.harness.submitAttempts, endpoints)
-	if len(peers) == 0 {
-		return nil, errors.New("no peer target")
-	}
-	if err := r.harness.submitErrors[peers[0].URL()]; err != nil {
-		return nil, err
-	}
-	txID := "tx-" + peers[0].URL()
-	return &peerSubmittedTransaction{
-		response: &legacychannel.Response{
-			TransactionID: fab.TransactionID(txID),
-			Payload:       []byte("submit:" + peers[0].URL()),
-		},
-		waitForCommit: func(context.Context) (*CommitStatus, error) {
-			if r.harness.commitErr != nil {
-				return nil, r.harness.commitErr
-			}
-			return &CommitStatus{TransactionID: txID}, nil
-		},
-	}, nil
+func newSinglePeerTestBridge() *Bridge {
+	return newSinglePeerTestBridgeWithOrderer("orderer.example.com:7050")
 }
 
-func newSinglePeerTestBridge() *Bridge {
+func newSinglePeerTestBridgeWithOrderer(ordererEndpoint string) *Bridge {
 	return &Bridge{
 		config: NewConfig(
 			"gateway.example.com:7051",
 			testIdentity,
 			testSigner{},
-			WithOrderer("orderer.example.com:7050"),
+			WithOrderer(ordererEndpoint),
+		).normalized(),
+		roundRobin: newRoundRobinState(),
+	}
+}
+
+func newSinglePeerTestBridgeWithoutOrderer() *Bridge {
+	return &Bridge{
+		config: NewConfig(
+			"gateway.example.com:7051",
+			testIdentity,
+			testSigner{},
 		).normalized(),
 		roundRobin: newRoundRobinState(),
 	}
@@ -485,7 +504,7 @@ func newSinglePeerTestTransaction(t *testing.T, bridge *Bridge) *Transaction {
 	return tx
 }
 
-func peerEndpointsForTest(peers []fab.Peer) []string {
+func peerEndpointsForTest(peers []peerTarget) []string {
 	out := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		out = append(out, peer.URL())

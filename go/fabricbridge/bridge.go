@@ -23,15 +23,13 @@ import (
 
 // Bridge is the main entry point for the SDK.
 // By default it connects via fabric-gateway (Gateway gRPC service).
-// When peer targeting is used, it switches to fabric-sdk-go (Endorser gRPC service)
-// using a sequential pattern: disconnect gateway → connect peer → execute → disconnect peer → reconnect gateway.
+// Peer targeting uses direct Fabric discovery, peer Endorser, orderer submit, and Gateway commit status.
 type Bridge struct {
 	config          Config
 	gatewayClient   *fabricGateway.Gateway
 	grpcConnection  *grpc.ClientConn
 	connected       bool
 	gatewayEndpoint string
-	peerConnection  *PeerConnection
 	modeMu          sync.RWMutex
 	roundRobin      *roundRobinState
 }
@@ -101,11 +99,6 @@ func (b *Bridge) Disconnect() error {
 
 	var firstErr error
 
-	if b.peerConnection != nil {
-		b.peerConnection.Close()
-		b.peerConnection = nil
-	}
-
 	if b.gatewayClient != nil {
 		if err := b.gatewayClient.Close(); err != nil {
 			firstErr = err
@@ -157,7 +150,7 @@ func (b *Bridge) NewSignedProposal(message SignedMessage) (*SignedProposal, erro
 	b.modeMu.RLock()
 	defer b.modeMu.RUnlock()
 
-	if !b.connected || b.gatewayClient == nil {
+	if !b.connected {
 		return nil, &NotConnectedError{Component: "Bridge", Action: "resume signed proposal"}
 	}
 
@@ -188,6 +181,9 @@ func (b *Bridge) NewSignedProposal(message SignedMessage) (*SignedProposal, erro
 	if err := validateGatewayRouting(routing); err != nil {
 		return nil, err
 	}
+	if b.gatewayClient == nil {
+		return nil, &NotConnectedError{Component: "Bridge", Action: "resume signed gateway proposal"}
+	}
 
 	unsigned, err := b.gatewayClient.NewProposal(messageBytes)
 	if err != nil {
@@ -203,52 +199,6 @@ func (b *Bridge) NewSignedProposal(message SignedMessage) (*SignedProposal, erro
 	}
 
 	return &SignedProposal{proposal: proposal}, nil
-}
-
-// switchToPeerMode disconnects from the Gateway service and connects to peers
-// via fabric-sdk-go. channelName is used to build the connection profile.
-func (b *Bridge) switchToPeerMode(channelName string) error {
-	// Close gateway connection
-	if b.gatewayClient != nil {
-		b.gatewayClient.Close()
-		b.gatewayClient = nil
-	}
-	if b.grpcConnection != nil {
-		b.grpcConnection.Close()
-		b.grpcConnection = nil
-	}
-
-	// Connect via fabric-sdk-go (direct peer Endorser gRPC)
-	pc, err := NewPeerConnection(b.config, channelName)
-	if err != nil {
-		// Attempt to restore gateway connection on failure
-		if gw, grpcConn, gwErr := connectGateway(b.config); gwErr == nil {
-			b.gatewayClient = gw
-			b.grpcConnection = grpcConn
-		}
-		return &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
-	}
-
-	b.peerConnection = pc
-	return nil
-}
-
-// restoreGatewayMode disconnects the peer connection and reconnects to the Gateway service.
-// This is called internally after a peer-targeted transaction completes.
-func (b *Bridge) restoreGatewayMode() error {
-	if b.peerConnection != nil {
-		b.peerConnection.Close()
-		b.peerConnection = nil
-	}
-
-	gw, grpcConn, err := connectGateway(b.config)
-	if err != nil {
-		return err
-	}
-
-	b.gatewayClient = gw
-	b.grpcConnection = grpcConn
-	return nil
 }
 
 // createGRPCConnection creates the gRPC connection with TLS

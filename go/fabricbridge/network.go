@@ -13,7 +13,6 @@ import (
 	gatewayProto "github.com/hyperledger/fabric-protos-go-apiv2/gateway"
 	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -479,52 +478,40 @@ func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []s
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
+	defer pc.Close()
 
 	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
 	if err != nil {
-		pc.Close()
 		return nil, &DiscoveryError{Message: "discover peers for UseEndorsingPeers", Cause: err}
 	}
 	targets, err := resolveEndorsingPeerTargets(discovered, t.targeting.endorsingPeerNames())
 	if err != nil {
-		pc.Close()
 		return nil, err
 	}
-	proposal, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
+	proposal, txID, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
 	if err != nil {
-		pc.Close()
 		return nil, err
 	}
-	if _, err := buildPeerTransactionPayload(proposal, responses); err != nil {
-		pc.Close()
+	payload, err := buildPeerTransactionPayload(proposal, responses)
+	if err != nil {
+		return nil, &EndorsementError{Message: err.Error()}
+	}
+	result, err := proposalResultPayload(responses)
+	if err != nil {
 		return nil, &EndorsementError{Message: err.Error()}
 	}
 
-	// Convert args to byte arrays
-	byteArgs := make([][]byte, len(args))
-	for i, arg := range args {
-		byteArgs[i] = []byte(arg)
-	}
-
-	submitted, err := pc.SubmitAsyncTargets(
-		ctx,
-		t.contract.network.channel,
-		t.contract.chaincodeName,
-		t.transactionName,
-		byteArgs,
-		targets,
-		t.transientData,
-	)
+	submitted, err := (&EndorsedTransaction{
+		bytes:       payload,
+		result:      result,
+		txID:        txID,
+		bridge:      bridge,
+		channelName: t.contract.network.channel,
+	}).submitPeer(ctx)
 	if err != nil {
-		pc.Close()
-		return nil, &SubmitError{Message: fmt.Sprintf("peer-targeted submit failed: %v", err)}
+		return nil, err
 	}
-
-	return &SubmittedTransaction{
-		transactionID: string(submitted.response.TransactionID),
-		result:        submitted.response.Payload,
-		waitForCommit: submitted.waitForCommit,
-	}, nil
+	return submitted, nil
 }
 
 // Evaluate executes the transaction as a query with peer targeting if configured
@@ -553,56 +540,58 @@ func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []stri
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
 	}
-	defer func() {
-		// SubmitAsync success transfers ownership to the commit monitor.
-	}()
+	defer pc.Close()
 
 	discovered, err := pc.DiscoverPeers(t.contract.network.channel)
 	if err != nil {
-		pc.Close()
 		return nil, &DiscoveryError{Message: "discover peers for UseSinglePeer", Cause: err}
 	}
 	eligible, err := resolveDiscoveredSinglePeers(discovered)
 	if err != nil {
-		pc.Close()
 		return nil, err
 	}
 	ordered := orderSinglePeers(t.contract.network.channel, eligible, bridge.roundRobin)
 
-	byteArgs := make([][]byte, len(args))
-	for i, arg := range args {
-		byteArgs[i] = []byte(arg)
+	proposal, txID, err := t.buildOnlinePeerProposal(args)
+	if err != nil {
+		return nil, err
+	}
+	request, err := signedProposalRequest(proposal, bridge.config.Signer)
+	if err != nil {
+		return nil, &EndorsementError{Message: err.Error()}
 	}
 
-	submitted, err := executeSinglePeerTargets(
+	response, err := executeSinglePeerTargets(
 		"submitAsync",
 		t.contract.network.channel,
 		t.contract.chaincodeName,
 		t.transactionName,
 		eligible,
 		ordered,
-		func(peer legacyfab.Peer) (*peerSubmittedTransaction, error) {
-			return pc.SubmitAsyncTargets(
-				ctx,
-				t.contract.network.channel,
-				t.contract.chaincodeName,
-				t.transactionName,
-				byteArgs,
-				[]legacyfab.Peer{peer},
-				t.transientData,
-			)
+		func(peer peerTarget) (*proposalResponse, error) {
+			return endorsePeerTarget(ctx, request, peer)
 		},
 	)
 	if err != nil {
-		pc.Close()
 		return nil, err
 	}
+	responses := []*proposalResponse{response}
+	payload, err := buildPeerTransactionPayload(proposal, responses)
+	if err != nil {
+		return nil, &EndorsementError{Message: err.Error()}
+	}
+	result, err := proposalResultPayload(responses)
+	if err != nil {
+		return nil, &EndorsementError{Message: err.Error()}
+	}
 
-	return &SubmittedTransaction{
-		transactionID: string(submitted.response.TransactionID),
-		result:        submitted.response.Payload,
-		waitForCommit: submitted.waitForCommit,
-	}, nil
+	return (&EndorsedTransaction{
+		bytes:       payload,
+		result:      result,
+		txID:        txID,
+		bridge:      bridge,
+		channelName: t.contract.network.channel,
+	}).submitPeer(ctx)
 }
 
 func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string) ([]byte, error) {
@@ -636,14 +625,14 @@ func (t *Transaction) evaluateWithSinglePeer(ctx context.Context, args []string)
 		t.transactionName,
 		eligible,
 		ordered,
-		func(peer legacyfab.Peer) ([]byte, error) {
+		func(peer peerTarget) ([]byte, error) {
 			return pc.QueryTargets(
 				ctx,
 				t.contract.network.channel,
 				t.contract.chaincodeName,
 				t.transactionName,
 				byteArgs,
-				[]legacyfab.Peer{peer},
+				[]peerTarget{peer},
 				t.transientData,
 			)
 		},
@@ -669,7 +658,7 @@ func (t *Transaction) evaluateWithPeerTargeting(ctx context.Context, args []stri
 		return nil, err
 	}
 
-	_, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
+	_, _, responses, err := t.endorseExplicitPeerTargets(ctx, args, targets)
 	if err != nil {
 		return nil, &EvaluationError{Message: fmt.Sprintf("peer-targeted query failed: %v", err)}
 	}

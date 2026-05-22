@@ -9,23 +9,22 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
 )
 
-func (t *Transaction) endorseExplicitPeerTargets(ctx context.Context, args []string, targets []legacyfab.Peer) (*peerProto.Proposal, []*legacyfab.TransactionProposalResponse, error) {
-	proposal, err := t.buildOnlinePeerProposal(args)
+func (t *Transaction) endorseExplicitPeerTargets(ctx context.Context, args []string, targets []peerTarget) (*peerProto.Proposal, string, []*proposalResponse, error) {
+	proposal, txID, err := t.buildOnlinePeerProposal(args)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 	responses, err := endorseExplicitPeerTargets(ctx, proposal, t.contract.network.bridge.config.Signer, targets)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
-	return proposal, responses, nil
+	return proposal, txID, responses, nil
 }
 
-func (t *Transaction) buildOnlinePeerProposal(args []string) (*peerProto.Proposal, error) {
+func (t *Transaction) buildOnlinePeerProposal(args []string) (*peerProto.Proposal, string, error) {
 	cfg := t.contract.network.bridge.config
 	previous := t.proposalCreator
 	t.proposalCreator = &ProposalCreator{
@@ -35,32 +34,23 @@ func (t *Transaction) buildOnlinePeerProposal(args []string) (*peerProto.Proposa
 	defer func() {
 		t.proposalCreator = previous
 	}()
-	proposal, _, err := t.buildPeerProposal(args)
-	return proposal, err
+	return t.buildPeerProposal(args)
 }
 
-func endorseExplicitPeerTargets(ctx context.Context, proposal *peerProto.Proposal, signer Signer, targets []legacyfab.Peer) ([]*legacyfab.TransactionProposalResponse, error) {
+func endorseExplicitPeerTargets(ctx context.Context, proposal *peerProto.Proposal, signer Signer, targets []peerTarget) ([]*proposalResponse, error) {
 	if len(targets) == 0 {
 		return nil, &EndorsementError{Message: "explicit endorsement requires at least one peer"}
 	}
 
-	proposalBytes, err := proto.Marshal(proposal)
+	request, err := signedProposalRequest(proposal, signer)
 	if err != nil {
-		return nil, &EndorsementError{Message: fmt.Sprintf("marshal proposal: %v", err)}
+		return nil, &EndorsementError{Message: err.Error()}
 	}
-	digest := sha256.Sum256(proposalBytes)
-	signature, err := signer.Sign(digest[:])
-	if err != nil {
-		return nil, &EndorsementError{Message: fmt.Sprintf("sign proposal: %v", err)}
-	}
-	request := legacyfab.ProcessProposalRequest{
-		SignedProposal: &peerProto.SignedProposal{
-			ProposalBytes: proposalBytes,
-			Signature:     signature,
-		},
-	}
+	return endorseExplicitPeerRequest(ctx, request, targets)
+}
 
-	responses := make([]*legacyfab.TransactionProposalResponse, len(targets))
+func endorseExplicitPeerRequest(ctx context.Context, request processProposalRequest, targets []peerTarget) ([]*proposalResponse, error) {
+	responses := make([]*proposalResponse, len(targets))
 	errs := make([]error, len(targets))
 	var wg sync.WaitGroup
 	wg.Add(len(targets))
@@ -68,7 +58,7 @@ func endorseExplicitPeerTargets(ctx context.Context, proposal *peerProto.Proposa
 		i, target := i, target
 		go func() {
 			defer wg.Done()
-			response, err := target.ProcessTransactionProposal(ctx, request)
+			response, err := endorsePeerTarget(ctx, request, target)
 			if err != nil {
 				errs[i] = fmt.Errorf("%s: %w", target.URL(), err)
 				return
@@ -89,7 +79,29 @@ func endorseExplicitPeerTargets(ctx context.Context, proposal *peerProto.Proposa
 	return responses, nil
 }
 
-func validatePeerProposalResponses(responses []*legacyfab.TransactionProposalResponse) error {
+func signedProposalRequest(proposal *peerProto.Proposal, signer Signer) (processProposalRequest, error) {
+	proposalBytes, err := proto.Marshal(proposal)
+	if err != nil {
+		return processProposalRequest{}, fmt.Errorf("marshal proposal: %v", err)
+	}
+	digest := sha256.Sum256(proposalBytes)
+	signature, err := signer.Sign(digest[:])
+	if err != nil {
+		return processProposalRequest{}, fmt.Errorf("sign proposal: %v", err)
+	}
+	return processProposalRequest{
+		SignedProposal: &peerProto.SignedProposal{
+			ProposalBytes: proposalBytes,
+			Signature:     signature,
+		},
+	}, nil
+}
+
+func endorsePeerTarget(ctx context.Context, request processProposalRequest, target peerTarget) (*proposalResponse, error) {
+	return target.ProcessTransactionProposal(ctx, request)
+}
+
+func validatePeerProposalResponses(responses []*proposalResponse) error {
 	if len(responses) == 0 {
 		return fmt.Errorf("at least one proposal response is required")
 	}
@@ -109,7 +121,7 @@ func validatePeerProposalResponses(responses []*legacyfab.TransactionProposalRes
 	return nil
 }
 
-func validatePeerProposalResponse(response *legacyfab.TransactionProposalResponse) error {
+func validatePeerProposalResponse(response *proposalResponse) error {
 	if response == nil || response.ProposalResponse == nil {
 		return fmt.Errorf("proposal response is empty")
 	}

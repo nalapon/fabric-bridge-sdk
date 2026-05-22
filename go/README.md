@@ -1,12 +1,14 @@
 # Fabric Bridge Go SDK
 
-A Go SDK that provides a unified interface for both Hyperledger Fabric Gateway (modern) and Fabric SDK Go (deprecated) with peer-targeting support.
+Go SDK for Hyperledger Fabric applications that need both the normal Gateway path and bridge-owned direct endorsement paths.
 
-## Overview
+## Transaction Paths
 
-This SDK provides:
-- **Gateway Mode** (default): Uses the modern `fabric-gateway` SDK for standard transactions
-- **Peer-Targeting Mode**: Uses the deprecated `fabric-sdk-go` for sending transactions to specific peers
+- **Gateway**: default path. Uses the Fabric Gateway service for normal application transactions.
+- **Single peer**: call `UseSinglePeer()` to endorse through one discovered peer, then submit directly to the orderer and wait for commit status through Gateway.
+- **Explicit endorsement**: call `UseEndorsingPeers(...)` to endorse concurrently through the exact discovered peers supplied by the caller, then submit directly to the orderer and wait for commit status through Gateway.
+
+Fabric service discovery is part of the direct endorsement model. `DiscoverySeed` defaults to `GatewayEndpoint`, but production code should set it explicitly when gateway, discovery, and orderer endpoints are different.
 
 ## Installation
 
@@ -14,409 +16,197 @@ This SDK provides:
 go get github.com/kolokium/fabric-bridge-go/fabricbridge
 ```
 
-## Usage
+## Runnable Example
 
-### Basic Connection
+The main Go example is in `examples/basic`.
+
+```bash
+cd go
+
+export FABRIC_BRIDGE_GATEWAY_ENDPOINT=peer0.org1.example.com:7051
+export FABRIC_BRIDGE_DISCOVERY_SEED=peer0.org1.example.com:7051
+export FABRIC_BRIDGE_ORDERER_ENDPOINT=orderer.example.com:7050
+export FABRIC_BRIDGE_MSP_ID=Org1MSP
+export FABRIC_BRIDGE_CERT_PATH=/path/to/signcert.pem
+export FABRIC_BRIDGE_KEY_PATH=/path/to/private-key.pem
+export FABRIC_BRIDGE_TLS_ROOT_PATH=/path/to/tls-ca.pem
+export FABRIC_BRIDGE_CHANNEL=mychannel
+export FABRIC_BRIDGE_CHAINCODE=basic
+
+go run ./examples/basic
+```
+
+Set `FABRIC_BRIDGE_EXAMPLE_FLOW` to choose the path:
+
+```bash
+FABRIC_BRIDGE_EXAMPLE_FLOW=gateway go run ./examples/basic
+FABRIC_BRIDGE_EXAMPLE_FLOW=single-peer go run ./examples/basic
+
+export FABRIC_BRIDGE_ENDORSING_PEERS=peer0.org1.example.com:7051,peer0.org2.example.com:9051
+FABRIC_BRIDGE_EXAMPLE_FLOW=endorsing-peers go run ./examples/basic
+FABRIC_BRIDGE_EXAMPLE_FLOW=offline-gateway go run ./examples/basic
+FABRIC_BRIDGE_EXAMPLE_FLOW=offline-single-peer go run ./examples/basic
+FABRIC_BRIDGE_EXAMPLE_FLOW=offline-endorsing-peers go run ./examples/basic
+```
+
+## Basic Usage
 
 ```go
-package main
-
-import (
-    "context"
-    "log"
-    "time"
-    
-    "github.com/kolokium/fabric-bridge-go/fabricbridge"
+config := fabricbridge.NewConfig(
+    "peer0.org1.example.com:7051",
+    fabricbridge.Identity{
+        MSPId:       "Org1MSP",
+        Certificate: certificatePEM,
+    },
+    signer,
+    fabricbridge.WithDiscoverySeed("peer0.org1.example.com:7051"),
+    fabricbridge.WithOrderer("orderer.example.com:7050"),
+    fabricbridge.WithGatewayTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),
+    fabricbridge.WithDiscoveryTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),
+    fabricbridge.WithOrdererTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),
 )
 
-type SimpleSigner struct {
-    privateKey []byte
-}
-
-func (s *SimpleSigner) Sign(digest []byte) ([]byte, error) {
-    // Implement your signing logic here
-    return digest, nil
-}
-
-func main() {
-    ctx := context.Background()
-    
-    // Create signer
-    signer := &SimpleSigner{privateKey: loadPrivateKey()}
-    
-    // Create config
-    config := fabricbridge.NewConfig(
-        "peer0.org1.example.com:7051",
-        fabricbridge.Identity{
-            MSPId:       "Org1MSP",
-            Certificate: loadCertificate(),
-        },
-        signer,
-        fabricbridge.WithDiscovery(true),
-        fabricbridge.WithTLS(fabricbridge.TLSOptions{
-            TrustedRoots: loadTLSCert(),
-        }),
-    )
-    
-    // Connect
-    bridge, err := fabricbridge.Connect(ctx, config)
-    if err != nil {
-        log.Fatalf("Failed to connect: %v", err)
-    }
-    defer bridge.Disconnect()
-    
-    // Get network
-    network, err := bridge.Network(ctx, "mychannel")
-    if err != nil {
-        log.Fatalf("Failed to get network: %v", err)
-    }
-    
-    // Get contract
-    contract := network.Contract("mycc")
-    
-    // Execute query (gateway mode)
-    result, err := contract.Evaluate(ctx, "GetAllAssets")
-    if err != nil {
-        log.Printf("Query failed: %v", err)
-    }
-    
-    // Submit transaction (gateway mode, waits for commit)
-    tx, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
-    if err != nil {
-        log.Fatalf("Transaction failed: %v", err)
-    }
-    
-    log.Printf("Transaction ID: %s", tx.TransactionID())
-    log.Printf("Result: %s", tx.Result())
-    log.Printf("Block: %d, Status: %v", tx.CommitStatus().BlockNumber, tx.CommitStatus().Status)
-}
-```
-
-### Peer-Targeting Mode
-
-```go
-// Get contract with peer targeting support
-contract := network.Contract("mycc")
-
-// Create transaction with specific endorsing peers
-tx := contract.Transaction("CreateAsset")
-if err := tx.UseEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com"); err != nil {
-    log.Fatalf("Configure peer targeting failed: %v", err)
-}
-tx.SetTransientData(map[string][]byte{
-    "privateData": []byte("secret"),
-})
-
-// Submit to specific peers (requires OrdererEndpoint in config)
-result, err := tx.Submit(ctx, "asset1", "blue", "5", "Tom", "100")
-if err != nil {
-    log.Fatalf("Peer-targeted transaction failed: %v", err)
-}
-
-log.Printf("Transaction ID: %s", result.TransactionID())
-log.Printf("Block: %d", result.CommitStatus().BlockNumber)
-```
-
-## API Reference
-
-### Bridge
-
-The main entry point for connecting to the Fabric network.
-
-```go
-// Connect to the network
 bridge, err := fabricbridge.Connect(ctx, config)
-
-// Disconnect when done
-bridge.Disconnect()
-
-// Check connection status
-if bridge.IsConnected() {
-    // ...
+if err != nil {
+    return err
 }
+defer bridge.Disconnect()
 
-// Get network for a channel
 network, err := bridge.Network(ctx, "mychannel")
+if err != nil {
+    return err
+}
+contract := network.Contract("basic")
 ```
 
-### Network
-
-Represents a Fabric channel.
+## Gateway
 
 ```go
-// Get channel name
-channelName := network.ChannelName()
-
-// Get contract for chaincode
-contract := network.Contract("mycc")
-contract := network.Contract("mycc", "MyContract") // with contract name
-```
-
-### Contract
-
-Represents a smart contract.
-
-```go
-// Get chaincode name
-name := contract.ChaincodeName()
-
-// Evaluate (query) - read-only
-result, err := contract.Evaluate(ctx, "GetAsset", "asset1")
-
-// Submit transaction - write, waits for commit
-result, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5")
-
-// Submit transaction - write, do not wait for commit yet
-submitted, err := contract.SubmitAsync(ctx, "CreateAsset", "asset1", "blue", "5")
-
-// Create transaction builder for advanced options
-tx := contract.Transaction("CreateAsset")
-```
-
-### Transaction
-
-Builder for transactions with custom options.
-
-```go
-tx := contract.Transaction("CreateAsset")
-
-// Set specific endorsing peers (peer-targeting mode)
-if err := tx.UseEndorsingPeers("peer0.org1.example.com", "peer0.org2.example.com"); err != nil {
-    log.Fatalf("Configure peer targeting failed: %v", err)
+result, err := contract.Evaluate(ctx, "GetAllAssets")
+if err != nil {
+    return err
 }
 
-// Set transient data
-tx.SetTransientData(map[string][]byte{
-    "privateData": []byte("secret"),
+committed, err := contract.Submit(ctx, "CreateAsset", "asset1", "blue", "5", "Tom", "100")
+if err != nil {
+    return err
+}
+
+fmt.Println(committed.TransactionID(), committed.CommitStatus().Status, result)
+```
+
+## Single Peer
+
+`UseSinglePeer()` is for the bridge-specific case where the application wants one discovered peer to endorse the transaction.
+
+```go
+tx := contract.Transaction("CreateAsset")
+if err := tx.UseSinglePeer(); err != nil {
+    return err
+}
+
+committed, err := tx.Submit(ctx, "asset-single", "green", "7", "Ana", "200")
+if err != nil {
+    return err
+}
+
+fmt.Println(committed.TransactionID(), committed.CommitStatus().Status)
+```
+
+## Explicit Endorsement
+
+`UseEndorsingPeers(...)` is for caller-selected multi-endorsement. Every supplied peer must be present in Fabric discovery, and the SDK sends the proposal to all resolved targets.
+
+```go
+tx := contract.Transaction("CreateAsset")
+if err := tx.UseEndorsingPeers(
+    "peer0.org1.example.com:7051",
+    "peer0.org2.example.com:9051",
+); err != nil {
+    return err
+}
+
+committed, err := tx.Submit(ctx, "asset-explicit", "red", "9", "Maria", "300")
+if err != nil {
+    return err
+}
+
+fmt.Println(committed.TransactionID(), committed.CommitStatus().Status)
+```
+
+## Offline Signing
+
+Offline signing uses the same routing decision as the transaction builder:
+
+```go
+tx := contract.Transaction("CreateAsset").SetProposalCreator(fabricbridge.ProposalCreator{
+    MSPId:       "Org1MSP",
+    Certificate: certificatePEM,
 })
 
-// Submit and wait for commit
-result, err := tx.Submit(ctx, "asset1", "blue", "5")
+// Optional direct endorsement routing:
+// _ = tx.UseSinglePeer()
+// _ = tx.UseEndorsingPeers("peer0.org1.example.com:7051", "peer0.org2.example.com:9051")
 
-// Or submit async and wait later
-submitted, err := tx.SubmitAsync(ctx, "asset1", "blue", "5")
-status, err := submitted.WaitForCommit(ctx)
+unsigned, err := tx.NewUnsignedProposal(ctx, "asset-offline", "purple", "25", "Olivia", "500")
+if err != nil {
+    return err
+}
 
-// Or evaluate
-result, err := tx.Evaluate(ctx, "asset1")
+signature, err := signer.Sign(unsigned.Digest())
+if err != nil {
+    return err
+}
+
+signed, err := bridge.NewSignedProposal(unsigned.WithSignature(signature))
+if err != nil {
+    return err
+}
+endorsed, err := signed.Endorse(ctx)
+if err != nil {
+    return err
+}
+committed, err := endorsed.Submit(ctx)
+if err != nil {
+    return err
+}
 ```
 
-### CommitResult
-
-Result of a transaction returned by `Submit()`.
-
-```go
-// Get transaction ID
-txID := result.TransactionID()
-
-// Get result payload
-data := result.Result()
-
-// Access commit status
-status := result.CommitStatus()
-log.Printf("Status: Block %d, Code %v", status.BlockNumber, status.Status)
-```
-
-### SubmittedTransaction
-
-Result of a transaction returned by `SubmitAsync()`.
-
-```go
-// Get transaction ID
-txID := submitted.TransactionID()
-
-// Get result payload
-data := submitted.Result()
-
-// Wait for commit when you decide
-status, err := submitted.WaitForCommit(ctx)
-```
-
-## Configuration
-
-### Config Structure
+## Key Configuration
 
 ```go
 type Config struct {
-    GatewayPeer string           // Gateway peer endpoint (e.g., "peer0.org1.example.com:7051")
-    Identity    Identity         // Client identity
-    Signer      Signer           // Signing implementation
-    TLSOptions  *TLSOptions      // TLS configuration (optional)
-    Discovery   bool             // Enable discovery for peer targeting (default: true)
-    Timeouts    TimeoutConfig    // Timeout settings
-}
-
-type Identity struct {
-    MSPId       string  // MSP ID (e.g., "Org1MSP")
-    Certificate []byte  // X.509 certificate in PEM format
-}
-
-type TLSOptions struct {
-    TrustedRoots []byte  // Root CA certificates
-    Verify       bool     // Backward-compatible flag, verification is enabled by default with TrustedRoots
-    AllowInsecureTLS bool // Explicit opt-in to skip certificate verification
-    ClientCert   []byte  // Client certificate for mutual TLS (optional)
-    ClientKey    []byte  // Client key for mutual TLS (optional)
-}
-
-type TimeoutConfig struct {
-    Endorse   time.Duration  // Endorsement timeout (default: 30s)
-    Submit    time.Duration  // Submit timeout (default: 30s)
-    Commit    time.Duration  // Commit timeout (default: 60s)
-    Evaluate  time.Duration  // Evaluate timeout (default: 30s)
-    Discovery time.Duration  // Discovery timeout (default: 5s)
+    GatewayEndpoint string
+    DiscoverySeed   string
+    OrdererEndpoint string
+    Identity        Identity
+    Signer          Signer
+    GatewayTLS      *TLSOptions
+    DiscoveryTLS    *TLSOptions
+    OrdererTLS      *TLSOptions
+    Discovery       bool
+    Timeouts        TimeoutConfig
 }
 ```
 
-### Functional Options
+Important options:
 
-```go
-// With custom timeouts
-config := fabricbridge.NewConfig(
-    gatewayPeer,
-    identity,
-    signer,
-    fabricbridge.WithTimeout(fabricbridge.TimeoutConfig{
-        Endorse:  45 * time.Second,
-        Submit:   45 * time.Second,
-        Commit:   90 * time.Second,
-        Evaluate: 45 * time.Second,
-    }),
-)
+- `WithDiscoverySeed(endpoint)`: initial peer endpoint for Fabric service discovery.
+- `WithOrderer(endpoint)`: required for `UseSinglePeer()` and `UseEndorsingPeers()` submit flows.
+- `WithGatewayTLS(...)`, `WithDiscoveryTLS(...)`, `WithOrdererTLS(...)`: separate TLS roles for each endpoint.
+- `WithTimeout(...)`: operation timeouts, including `Discovery`.
 
-// Disable discovery
-config := fabricbridge.NewConfig(
-    gatewayPeer,
-    identity,
-    signer,
-    fabricbridge.WithDiscovery(false),
-)
+## Error Types
 
-// With TLS
-config := fabricbridge.NewConfig(
-    gatewayPeer,
-    identity,
-    signer,
-    fabricbridge.WithTLS(fabricbridge.TLSOptions{
-        TrustedRoots: loadRootCA(),
-        Verify:       true,
-    }),
-)
-```
-
-## Error Handling
-
-The SDK uses idiomatic Go error handling with custom error types:
-
-```go
-result, err := contract.Submit(ctx, "CreateAsset", "arg1")
-if err != nil {
-    // Check specific error types
-    var endorsementErr *fabricbridge.EndorsementError
-    if errors.As(err, &endorsementErr) {
-        log.Printf("Endorsement failed: %v", endorsementErr)
-    }
-    
-    var submitErr *fabricbridge.SubmitError
-    if errors.As(err, &submitErr) {
-        log.Printf("Submit failed: %v", submitErr)
-    }
-    
-    var timeoutErr *fabricbridge.TimeoutError
-    if errors.As(err, &timeoutErr) {
-        log.Printf("Timeout: %v", timeoutErr)
-    }
-}
-```
-
-### Error Types
-
-- `ConfigurationError` - Invalid configuration
-- `ConnectionError` - Connection failures
-- `EndorsementError` - Endorsement failures
-- `SubmitError` - Transaction submission failures
-- `CommitError` - Commit status retrieval failures
-- `EvaluationError` - Query evaluation failures
-- `DiscoveryError` - Discovery service failures
-- `PeerNotFoundError` - Peer not found in discovery
-- `TimeoutError` - Operation timeout
-- `NotConnectedError` - Bridge not connected
-
-## Architecture
-
-The SDK has two operational modes:
-
-### Gateway Mode (Default)
-- Uses `fabric-gateway` SDK (v1.10.1)
-- Modern, recommended approach
-- Automatic endorsement gathering
-- Simplified API
-- No peer targeting
-- `Submit()` waits for commit by default
-- `SubmitAsync()` returns a handle for `WaitForCommit(ctx)`
-
-### Peer-Targeting Mode
-- Uses `fabric-sdk-go` SDK (v1.0.0)
-- Deprecated but functional
-- Supports explicit peer selection
-- Used when `UseEndorsingPeers()` or `UseSinglePeer()` is called
-- Requires discovery to be enabled
-- `Submit()` and `SubmitAsync()` require `OrdererEndpoint`
-- Commit waiting is done afterwards through the gateway service using the transaction ID
-
-### Mode Selection
-
-The SDK automatically selects the mode based on usage:
-
-```go
-// Gateway mode (automatic)
-contract.Submit(ctx, "func", args...)
-
-// Peer-targeting mode (explicit peers)
-tx := contract.Transaction("func")
-if err := tx.UseEndorsingPeers("peer1", "peer2"); err != nil {
-    log.Fatalf("Configure peer targeting failed: %v", err)
-}
-tx.Submit(ctx, args...)
-```
-
-## Implementation Status
-
-✅ **Completed:**
-- Core bridge connection using fabric-gateway
-- Network and Contract abstractions
-- Transaction builder pattern
-- Idiomatic Go error handling
-- Context-first API design
-- Functional options pattern
-- TLS support
-- Peer connection management using fabric-sdk-go
-- Peer-targeting mode implementation
-
-🔜 **Future Enhancements:**
-- Event listening (block events, chaincode events)
-- Discovery service caching improvements
-- Connection pooling for peer connections
-- Retry policies with exponential backoff
-- Health checks and connection recovery
-- Wallet integration
-- More comprehensive examples
-
-## Dependencies
-
-```
-github.com/hyperledger/fabric-gateway v1.10.1
-google.golang.org/grpc v1.68.0
-```
-
-## License
-
-MIT
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-1. Code follows Go best practices
-2. Tests are included for new features
-3. Documentation is updated
-4. `go vet` and `go build` pass cleanly
+- `ConfigurationError`
+- `ConnectionError`
+- `DiscoveryError`
+- `PeerNotFoundError`
+- `SinglePeerExecutionError`
+- `EndorsementError`
+- `SubmitError`
+- `CommitError`
+- `EvaluationError`
+- `OfflineSigningError`
+- `TimeoutError`
+- `NotConnectedError`

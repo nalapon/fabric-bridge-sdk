@@ -11,7 +11,6 @@ import (
 	gossipProto "github.com/hyperledger/fabric-protos-go-apiv2/gossip"
 	mspProto "github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -22,7 +21,7 @@ type directDiscoveryClient struct {
 type directDiscoveredPeer struct {
 	url        string
 	mspID      string
-	properties fab.Properties
+	properties peerProperties
 	config     Config
 }
 
@@ -30,7 +29,7 @@ func newDirectDiscoveryClient(cfg Config) *directDiscoveryClient {
 	return &directDiscoveryClient{config: cfg.normalized()}
 }
 
-func (c *directDiscoveryClient) DiscoverPeers(ctx context.Context, channelName string) ([]fab.Peer, error) {
+func (c *directDiscoveryClient) DiscoverPeers(ctx context.Context, channelName string) ([]peerTarget, error) {
 	cfg := c.config.normalized()
 	if timeout := cfg.Timeouts.Discovery; timeout > 0 {
 		var cancel context.CancelFunc
@@ -115,7 +114,7 @@ func discoveryTLSCertHash(tlsOptions *TLSOptions) []byte {
 	return digest[:]
 }
 
-func discoveredPeersFromResponse(response *discoveryProto.Response, cfg Config) ([]fab.Peer, error) {
+func discoveredPeersFromResponse(response *discoveryProto.Response, cfg Config) ([]peerTarget, error) {
 	if response == nil {
 		return nil, fmt.Errorf("empty discovery response")
 	}
@@ -138,7 +137,7 @@ func discoveredPeersFromResponse(response *discoveryProto.Response, cfg Config) 
 	}
 	sort.Strings(orgIDs)
 
-	var peers []fab.Peer
+	var peers []peerTarget
 	for _, orgID := range orgIDs {
 		for _, peer := range members.GetPeersByOrg()[orgID].GetPeers() {
 			endpoint, err := peerEndpointFromDiscoveryPeer(peer)
@@ -171,7 +170,7 @@ func peerEndpointFromDiscoveryPeer(peer *discoveryProto.Peer) (string, error) {
 	return endpoint, nil
 }
 
-func discoveryPeerProperties(peer *discoveryProto.Peer) fab.Properties {
+func discoveryPeerProperties(peer *discoveryProto.Peer) peerProperties {
 	if peer == nil || peer.GetStateInfo() == nil {
 		return nil
 	}
@@ -183,10 +182,10 @@ func discoveryPeerProperties(peer *discoveryProto.Peer) fab.Properties {
 	if properties == nil {
 		return nil
 	}
-	out := fab.Properties{}
-	out[fab.PropertyLedgerHeight] = properties.GetLedgerHeight()
-	out[fab.PropertyLeftChannel] = properties.GetLeftChannel()
-	out[fab.PropertyChaincodes] = properties.GetChaincodes()
+	out := peerProperties{}
+	out[peerPropertyLedgerHeight] = properties.GetLedgerHeight()
+	out[peerPropertyLeftChannel] = properties.GetLeftChannel()
+	out[peerPropertyChaincodes] = properties.GetChaincodes()
 	return out
 }
 
@@ -198,29 +197,29 @@ func (p *directDiscoveredPeer) URL() string {
 	return p.url
 }
 
-func (p *directDiscoveredPeer) Properties() fab.Properties {
+func (p *directDiscoveredPeer) Properties() peerProperties {
 	return p.properties
 }
 
-func (p *directDiscoveredPeer) ProcessTransactionProposal(ctx context.Context, request fab.ProcessProposalRequest) (*fab.TransactionProposalResponse, error) {
+func (p *directDiscoveredPeer) ProcessTransactionProposal(ctx context.Context, request processProposalRequest) (*proposalResponse, error) {
 	cfg := p.config.normalized()
 	conn, err := createGRPCConnectionTo(p.url, cfg.DiscoveryTLS)
 	if err != nil {
-		return &fab.TransactionProposalResponse{Endorser: p.url}, err
+		return &proposalResponse{Endorser: p.url}, err
 	}
 	defer conn.Close()
 
-	proposalResponse, err := peerProto.NewEndorserClient(conn).ProcessProposal(ctx, request.SignedProposal)
+	response, err := peerProto.NewEndorserClient(conn).ProcessProposal(ctx, request.SignedProposal)
 	if err != nil {
-		return &fab.TransactionProposalResponse{Endorser: p.url}, err
+		return &proposalResponse{Endorser: p.url}, err
 	}
-	status := proposalResponse.GetResponse().GetStatus()
-	return &fab.TransactionProposalResponse{
+	status := response.GetResponse().GetStatus()
+	return &proposalResponse{
 		Endorser:         p.url,
 		Status:           status,
 		ChaincodeStatus:  status,
-		ProposalResponse: proposalResponse,
+		ProposalResponse: response,
 	}, nil
 }
 
-var _ fab.Peer = (*directDiscoveredPeer)(nil)
+var _ peerTarget = (*directDiscoveredPeer)(nil)

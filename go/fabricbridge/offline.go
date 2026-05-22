@@ -12,7 +12,6 @@ import (
 	gatewayProto "github.com/hyperledger/fabric-protos-go-apiv2/gateway"
 	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	peerProto "github.com/hyperledger/fabric-protos-go-apiv2/peer"
-	legacyfab "github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -238,11 +237,11 @@ func (p *SignedProposal) endorsePeer(ctx context.Context) (*EndorsedTransaction,
 	}, nil
 }
 
-func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*legacyfab.TransactionProposalResponse, *peerProto.Proposal, error) {
+func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*proposalResponse, *peerProto.Proposal, error) {
 	if p.routing == nil || (p.routing.Mode != "single-peer" && p.routing.Mode != "endorsing-peers") {
 		return nil, nil, &OfflineSigningError{Field: "routing", Message: "peer signed proposal requires peer routing"}
 	}
-	pc, err := NewPeerConnection(p.bridge.config, p.channelName)
+	pc, err := newPeerRuntime(p.bridge.config, p.channelName)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -256,41 +255,89 @@ func (p *SignedProposal) sendPeerProposal(ctx context.Context) ([]*legacyfab.Tra
 	if err := ensureUniqueDiscoveredPeerEndpoints(discovered, tlsEnabled); err != nil {
 		return nil, nil, err
 	}
-	var targets []legacyfab.Peer
-	for _, endpoint := range p.routing.Peers {
-		canonicalEndpoint, err := normalizeSnapshotPeerEndpoint(endpoint, tlsEnabled)
-		if err != nil {
-			return nil, nil, err
-		}
-		peer, ok := matchDiscoveredPeer(discovered, canonicalEndpoint)
-		if !ok {
-			return nil, nil, &PeerNotFoundError{PeerName: canonicalEndpoint, AvailablePeers: peerURLs(discovered)}
-		}
-		targets = append(targets, peer)
-	}
-	if len(targets) == 0 {
-		return nil, nil, &PeerNotFoundError{PeerName: "<routing.peers>", AvailablePeers: peerURLs(discovered)}
+
+	targets, err := resolveOfflineSnapshotPeerTargets(p.routing, discovered, tlsEnabled)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	proposal := &peerProto.Proposal{}
 	if err := proto.Unmarshal(p.proposalBytes, proposal); err != nil {
 		return nil, nil, &OfflineSigningError{Field: "bytes", Message: fmt.Sprintf("unmarshal proposal: %v", err)}
 	}
-	request := legacyfab.ProcessProposalRequest{
+	request := processProposalRequest{
 		SignedProposal: &peerProto.SignedProposal{
 			ProposalBytes: p.proposalBytes,
 			Signature:     p.signature,
 		},
 	}
-	responses := make([]*legacyfab.TransactionProposalResponse, 0, len(targets))
-	for _, target := range targets {
-		response, err := target.ProcessTransactionProposal(ctx, request)
+
+	var responses []*proposalResponse
+	switch p.routing.Mode {
+	case "single-peer":
+		response, err := endorsePeerTarget(ctx, request, targets[0])
 		if err != nil {
 			return nil, nil, err
 		}
-		responses = append(responses, response)
+		responses = []*proposalResponse{response}
+	case "endorsing-peers":
+		responses, err = endorseExplicitPeerRequest(ctx, request, targets)
+		if err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, &OfflineSigningError{Field: "routing.mode", Message: fmt.Sprintf("unsupported peer routing mode: %s", p.routing.Mode)}
 	}
 	return responses, proposal, nil
+}
+
+func resolveOfflineSnapshotPeerTargets(routing *OfflineSigningRouting, discovered []peerTarget, tlsEnabled bool) ([]peerTarget, error) {
+	if routing == nil {
+		return nil, &OfflineSigningError{Field: "routing", Message: "peer signed proposal requires peer routing"}
+	}
+	if len(routing.Peers) == 0 {
+		return nil, &PeerNotFoundError{PeerName: "<routing.peers>", AvailablePeers: peerURLs(discovered)}
+	}
+
+	switch routing.Mode {
+	case "single-peer":
+		if len(routing.Peers) != 1 {
+			return nil, &OfflineSigningError{Field: "routing.peers", Message: "single-peer offline signing requires exactly one peer endpoint"}
+		}
+		target, err := resolveOfflineSnapshotPeer(routing.Peers[0], discovered, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		return []peerTarget{target}, nil
+	case "endorsing-peers":
+		canonicalPeers, err := dedupePeerEndpointInputs(routing.Peers, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		targets := make([]peerTarget, 0, len(canonicalPeers))
+		for _, canonicalPeer := range canonicalPeers {
+			target, err := resolveOfflineSnapshotPeer(canonicalPeer, discovered, tlsEnabled)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, target)
+		}
+		return targets, nil
+	default:
+		return nil, &OfflineSigningError{Field: "routing.mode", Message: fmt.Sprintf("unsupported peer routing mode: %s", routing.Mode)}
+	}
+}
+
+func resolveOfflineSnapshotPeer(endpoint string, discovered []peerTarget, tlsEnabled bool) (peerTarget, error) {
+	canonicalEndpoint, err := normalizeSnapshotPeerEndpoint(endpoint, tlsEnabled)
+	if err != nil {
+		return nil, err
+	}
+	peer, ok := matchDiscoveredPeer(discovered, canonicalEndpoint)
+	if !ok {
+		return nil, &PeerNotFoundError{PeerName: canonicalEndpoint, AvailablePeers: peerURLs(discovered)}
+	}
+	return peer, nil
 }
 
 func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransaction, error) {
@@ -301,14 +348,8 @@ func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransac
 	}
 
 	envelope := &common.Envelope{Payload: append([]byte(nil), t.bytes...), Signature: signature}
-	client := gatewayProto.NewGatewayClient(t.bridge.grpcConnection)
-	_, err = client.Submit(ctx, &gatewayProto.SubmitRequest{
-		TransactionId:       t.txID,
-		ChannelId:           t.channelName,
-		PreparedTransaction: envelope,
-	})
-	if err != nil {
-		return nil, &SubmitError{Message: err.Error(), TransactionID: t.txID}
+	if err := submitEnvelopeToOrderer(ctx, t.bridge.config, envelope, t.txID); err != nil {
+		return nil, err
 	}
 	return &SubmittedTransaction{
 		transactionID: t.txID,
@@ -450,7 +491,7 @@ func unwrapProposalBytes(proposalBytes []byte) []byte {
 	return proposalBytes
 }
 
-func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*legacyfab.TransactionProposalResponse) ([]byte, error) {
+func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*proposalResponse) ([]byte, error) {
 	if len(responses) == 0 {
 		return nil, fmt.Errorf("at least one proposal response is required")
 	}
@@ -499,7 +540,7 @@ func buildPeerTransactionPayload(proposal *peerProto.Proposal, responses []*lega
 	return proto.Marshal(&common.Payload{Header: header, Data: transactionBytes})
 }
 
-func proposalResultPayload(responses []*legacyfab.TransactionProposalResponse) ([]byte, error) {
+func proposalResultPayload(responses []*proposalResponse) ([]byte, error) {
 	if len(responses) == 0 {
 		return nil, fmt.Errorf("at least one proposal response is required")
 	}

@@ -3,8 +3,6 @@ package fabricbridge
 import (
 	"errors"
 	"testing"
-
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 )
 
 func TestNormalizePeerEndpointIdentityAcceptsHostPortAndSchemes(t *testing.T) {
@@ -89,7 +87,7 @@ func TestDedupePeerEndpointInputsPreservesFirstOrder(t *testing.T) {
 }
 
 func TestEnsureUniqueDiscoveredPeerEndpointsRejectsDuplicates(t *testing.T) {
-	peers := []fab.Peer{
+	peers := []peerTarget{
 		fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"},
 		fakeSinglePeer{url: "peer0.org1.example.com:7051"},
 	}
@@ -113,7 +111,7 @@ func TestNormalizeSnapshotPeerEndpointWrapsMalformedEndpoint(t *testing.T) {
 }
 
 func TestResolveEndorsingPeerTargetsReportsMissingAsPeerNotFound(t *testing.T) {
-	peers := []fab.Peer{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
+	peers := []peerTarget{fakeSinglePeer{url: "grpcs://peer0.org1.example.com:7051"}}
 
 	_, err := resolveEndorsingPeerTargets(peers, []string{"peer1.org1.example.com:8051"})
 	var notFound *PeerNotFoundError

@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/kolokium/fabric-bridge-go/fabricbridge/internal/legacysdk/pkg/common/providers/fab"
 )
 
 type transactionTargetingKind string
@@ -72,8 +70,8 @@ func (s *roundRobinState) next(key string, size int) int {
 	return current % size
 }
 
-func orderSinglePeers(channelName string, peers []fab.Peer, rr *roundRobinState) []fab.Peer {
-	ordered := append([]fab.Peer(nil), peers...)
+func orderSinglePeers(channelName string, peers []peerTarget, rr *roundRobinState) []peerTarget {
+	ordered := append([]peerTarget(nil), peers...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return ordered[i].URL() < ordered[j].URL()
 	})
@@ -86,7 +84,7 @@ func orderSinglePeers(channelName string, peers []fab.Peer, rr *roundRobinState)
 	return append(ordered[start:], ordered[:start]...)
 }
 
-func resolveDiscoveredSinglePeers(discovered []fab.Peer) ([]fab.Peer, error) {
+func resolveDiscoveredSinglePeers(discovered []peerTarget) ([]peerTarget, error) {
 	tlsEnabled := discoveredPeersUseTLS(discovered)
 	if err := ensureUniqueDiscoveredPeerEndpoints(discovered, tlsEnabled); err != nil {
 		return nil, err
@@ -97,7 +95,7 @@ func resolveDiscoveredSinglePeers(discovered []fab.Peer) ([]fab.Peer, error) {
 	return discovered, nil
 }
 
-func resolveEndorsingPeerTargets(discovered []fab.Peer, names []string) ([]fab.Peer, error) {
+func resolveEndorsingPeerTargets(discovered []peerTarget, names []string) ([]peerTarget, error) {
 	if len(names) == 0 {
 		return nil, &ConfigurationError{
 			Field:   "endorsingPeers",
@@ -113,7 +111,7 @@ func resolveEndorsingPeerTargets(discovered []fab.Peer, names []string) ([]fab.P
 	if err != nil {
 		return nil, err
 	}
-	var resolved []fab.Peer
+	var resolved []peerTarget
 	var missing []string
 	for _, canonicalName := range canonicalNames {
 		peer, ok := matchDiscoveredPeer(discovered, canonicalName)
@@ -143,9 +141,9 @@ func executeSinglePeerTargets[T any](
 	channelName string,
 	chaincodeName string,
 	transactionName string,
-	eligible []fab.Peer,
-	ordered []fab.Peer,
-	execute func(fab.Peer) (T, error),
+	eligible []peerTarget,
+	ordered []peerTarget,
+	execute func(peerTarget) (T, error),
 ) (T, error) {
 	var zero T
 	var attempts []SinglePeerAttempt
@@ -173,7 +171,7 @@ func executeSinglePeerTargets[T any](
 	return zero, singlePeerExecutionError(operation, channelName, chaincodeName, transactionName, eligible, attempts)
 }
 
-func singlePeerExecutionError(operation, channelName, chaincodeName, transactionName string, eligible []fab.Peer, attempts []SinglePeerAttempt) *SinglePeerExecutionError {
+func singlePeerExecutionError(operation, channelName, chaincodeName, transactionName string, eligible []peerTarget, attempts []SinglePeerAttempt) *SinglePeerExecutionError {
 	return &SinglePeerExecutionError{
 		Message:         fmt.Sprintf("single-peer transaction failed after trying %d eligible peer(s)", len(attempts)),
 		Operation:       operation,
