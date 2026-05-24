@@ -3,6 +3,7 @@ import * as fabricGateway from '@hyperledger/fabric-gateway';
 import { createHash } from 'crypto';
 import gatewayProtoModule from '@hyperledger/fabric-protos/lib/gateway/gateway_pb.js';
 import identitiesProtoModule from '@hyperledger/fabric-protos/lib/msp/identities_pb.js';
+import peerTransactionProtoModule from '@hyperledger/fabric-protos/lib/peer/transaction_pb.js';
 import type * as GatewayProto from '@hyperledger/fabric-protos/lib/gateway/gateway_pb.js';
 import type { BridgeConfig, Signer } from '../types/config';
 import type { CommitStatus } from '../types/bridge';
@@ -12,6 +13,7 @@ import { log } from '../utils/logger';
 
 const gatewayProto = gatewayProtoModule as typeof import('@hyperledger/fabric-protos/lib/gateway/gateway_pb.js');
 const { SerializedIdentity } = identitiesProtoModule as typeof import('@hyperledger/fabric-protos/lib/msp/identities_pb.js');
+const peerTransactionProto = peerTransactionProtoModule as typeof import('@hyperledger/fabric-protos/lib/peer/transaction_pb.js');
 
 export class GatewayConnection {
   private client: grpc.Client | null = null;
@@ -23,19 +25,19 @@ export class GatewayConnection {
   }
 
   async connect(): Promise<Result<void, ConfigurationError | TimeoutError>> {
-    const { gatewayPeer, identity, signer, tlsOptions, timeouts } = this.config;
+    const { gatewayEndpoint, identity, signer, gatewayTls, timeouts } = this.config;
     const connectTimeout = timeouts?.discovery ?? 5000;
     
     log().info('GatewayConnection.connect() - Iniciando conexión');
     log().debug('GatewayConnection.connect() - Config:', {
-      gatewayPeer,
+      gatewayEndpoint,
       mspId: identity.mspId,
-      hasTrustedRoots: !!tlsOptions?.trustedRoots,
-      trustedRootsLength: tlsOptions?.trustedRoots?.length,
-      hasClientCert: !!tlsOptions?.clientCert,
-      clientCertLength: tlsOptions?.clientCert?.length,
-      hasClientKey: !!tlsOptions?.clientKey,
-      clientKeyLength: tlsOptions?.clientKey?.length,
+      hasTrustedRoots: !!gatewayTls?.trustedRoots,
+      trustedRootsLength: gatewayTls?.trustedRoots?.length,
+      hasClientCert: !!gatewayTls?.clientCert,
+      clientCertLength: gatewayTls?.clientCert?.length,
+      hasClientKey: !!gatewayTls?.clientKey,
+      clientKeyLength: gatewayTls?.clientKey?.length,
       connectTimeout,
     });
     
@@ -44,35 +46,35 @@ export class GatewayConnection {
         log().debug('GatewayConnection.connect() - Creando credenciales TLS');
         
         let tlsCredentials: grpc.ChannelCredentials;
-        if (tlsOptions?.trustedRoots) {
-          if (tlsOptions?.clientKey && tlsOptions?.clientCert) {
+        if (gatewayTls?.trustedRoots) {
+          if (gatewayTls?.clientKey && gatewayTls?.clientCert) {
             log().debug('GatewayConnection.connect() - Usando mTLS (certificado cliente)');
             tlsCredentials = grpc.credentials.createSsl(
-              tlsOptions.trustedRoots,
-              tlsOptions.clientKey,
-              tlsOptions.clientCert
+              gatewayTls.trustedRoots,
+              gatewayTls.clientKey,
+              gatewayTls.clientCert
             );
           } else {
             log().debug('GatewayConnection.connect() - Usando TLS normal (solo verificar servidor)');
-            tlsCredentials = grpc.credentials.createSsl(tlsOptions.trustedRoots);
+            tlsCredentials = grpc.credentials.createSsl(gatewayTls.trustedRoots);
           }
         } else {
           log().debug('GatewayConnection.connect() - Usando conexión insegura (sin TLS)');
           tlsCredentials = grpc.credentials.createInsecure();
         }
 
-        const hostname = tlsOptions?.sslTargetNameOverride ?? this.extractHostname(gatewayPeer);
+        const hostname = gatewayTls?.sslTargetNameOverride ?? this.extractHostname(gatewayEndpoint);
         const clientOptions: grpc.ChannelOptions = hostname ? {
           'grpc.ssl_target_name_override': hostname,
         } : {};
 
         log().debug('GatewayConnection.connect() - Creando gRPC Client:', {
-          endpoint: gatewayPeer,
+          endpoint: gatewayEndpoint,
           hostname,
           hasSslOverride: !!hostname,
         });
         
-        this.client = new grpc.Client(gatewayPeer, tlsCredentials, clientOptions);
+        this.client = new grpc.Client(gatewayEndpoint, tlsCredentials, clientOptions);
         
         log().debug('GatewayConnection.connect() - Esperando conexión ready (timeout:', connectTimeout, 'ms)');
         
@@ -113,7 +115,7 @@ export class GatewayConnection {
         if (e instanceof Error && e.message.includes('timeout')) {
           log().error('GatewayConnection.connect() - Timeout error:', e.message);
           return new TimeoutError({
-            message: `Failed to connect to gateway peer: ${gatewayPeer}`,
+            message: `Failed to connect to gateway endpoint: ${gatewayEndpoint}`,
             operation: 'connect',
             timeout: connectTimeout,
           });
@@ -121,7 +123,7 @@ export class GatewayConnection {
         log().error('GatewayConnection.connect() - Configuration error:', e instanceof Error ? e.message : String(e));
         return new ConfigurationError({
           message: `Failed to connect to gateway: ${e instanceof Error ? e.message : String(e)}`,
-          field: 'gatewayPeer',
+          field: 'gatewayEndpoint',
         });
       },
     });
@@ -189,13 +191,15 @@ export class GatewayConnection {
           );
         });
 
+        const validationCode = response.getResult();
+        const validationStatus = txValidationCodeName(validationCode);
         const status: CommitStatus = {
           blockNumber: BigInt(response.getBlockNumber()),
-          status: response.getResult() === 0 ? 'VALID' : 'INVALID',
+          status: validationStatus,
           transactionId,
         };
 
-        if (status.status !== 'VALID') {
+        if (validationCode !== peerTransactionProto.TxValidationCode.VALID) {
           throw new CommitError({
             message: 'transaction committed with invalid validation code',
             transactionId,
@@ -245,4 +249,13 @@ export class GatewayConnection {
     const parts = endpoint.split(':');
     return parts[0] || undefined;
   }
+}
+
+function txValidationCodeName(code: number): string {
+  for (const [name, value] of Object.entries(peerTransactionProto.TxValidationCode)) {
+    if (value === code) {
+      return name;
+    }
+  }
+  return `UNKNOWN_VALIDATION_CODE_${code}`;
 }

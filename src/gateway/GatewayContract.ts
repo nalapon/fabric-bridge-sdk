@@ -15,7 +15,6 @@ import type {
   BridgeUnsignedProposal,
   CommitStatus,
   SignedMessage,
-  SinglePeerOptions,
   ProposalCreator,
 } from '../types/bridge';
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
@@ -179,13 +178,13 @@ class GatewayTransaction implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  UseSinglePeer(_options: SinglePeerOptions = {}): BridgeResult<BridgeTransaction> {
+  UseSinglePeer(): BridgeResult<BridgeTransaction> {
     return Result.err(new ConfigurationError({
       message: 'UseSinglePeer() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions.',
     }));
   }
 
-  UseEndorsingPeers(_peerNames: string[]): BridgeResult<BridgeTransaction> {
+  UseEndorsingPeers(..._peerNames: string[]): BridgeResult<BridgeTransaction> {
     return Result.err(new ConfigurationError({
       message: 'UseEndorsingPeers() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions.',
     }));
@@ -451,42 +450,6 @@ class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {
     }
 
     return Result.ok(new GatewayCommitResult(submitted.value, status.value));
-  }
-
-  SigningRequest() {
-    return signingRequest(this.Bytes(), this.Digest());
-  }
-
-  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage> {
-    return signedMessage(this.SigningRequest(), signature);
-  }
-
-  async SubmitWithSignature(signature: Buffer | Uint8Array | string): Promise<BridgeResult<BridgeCommitResult>> {
-    const signed = this.WithSignature(signature);
-    if (!signed.isOk()) return Result.err(signed.error);
-
-    const decoded = decodeSignedMessage(signed.value);
-    if (!decoded.isOk()) return Result.err(decoded.error);
-
-    try {
-      const transaction = this.gateway.newTransaction(decoded.value.bytes);
-      if (!Buffer.from(transaction.getDigest()).equals(decoded.value.digest)) {
-        return Result.err(new OfflineSigningError({
-          field: 'digest',
-          message: 'digest does not match transaction bytes',
-        }));
-      }
-
-      const signedTransaction = this.gateway.newSignedTransaction(decoded.value.bytes, decoded.value.signature);
-      const submitted = await signedTransaction.submit();
-      const submittedTx = new GatewaySubmittedTx(submitted, this.timeouts);
-      const status = await submittedTx.WaitForCommit();
-      if (!status.isOk()) return Result.err(status.error);
-
-      return Result.ok(new GatewayCommitResult(submittedTx, status.value));
-    } catch (error) {
-      return Result.err(new SubmitError({ message: (error as Error).message, transactionId: this.TransactionID() }));
-    }
   }
 }
 

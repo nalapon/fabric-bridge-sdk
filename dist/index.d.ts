@@ -26,13 +26,17 @@ interface TlsOptions {
     sslTargetNameOverride?: string;
 }
 interface BridgeConfig {
-    gatewayPeer: string;
+    gatewayEndpoint: string;
+    discoverySeed?: string;
+    ordererEndpoint?: string;
     identity: {
         mspId: string;
         credentials: Buffer;
     };
     signer: Signer;
-    tlsOptions?: TlsOptions;
+    gatewayTls?: TlsOptions;
+    discoveryTls?: TlsOptions;
+    ordererTls?: TlsOptions;
     discovery?: boolean;
     timeouts?: TimeoutConfig;
 }
@@ -80,7 +84,6 @@ declare const SinglePeerExecutionError_base: better_result.TaggedErrorClass<"Sin
     channel: string;
     chaincode: string;
     transaction: string;
-    candidates?: string[];
     eligiblePeers: string[];
     attempts: Array<{
         peer: string;
@@ -150,8 +153,8 @@ interface BridgeContract {
 interface BridgeTransaction {
     getName(): string;
     getChaincodeName(): string;
-    UseSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
-    UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
+    UseSinglePeer(): BridgeResult<BridgeTransaction>;
+    UseEndorsingPeers(...peerNames: string[]): BridgeResult<BridgeTransaction>;
     SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
     SetProposalCreator(proposalCreator: ProposalCreator): BridgeTransaction;
     Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
@@ -200,17 +203,8 @@ interface BridgeEndorsedTransaction {
     Digest(): Buffer;
     Result(): Buffer;
     TransactionID(): string;
-    SigningRequest(): SigningRequest;
-    WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage>;
     SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>>;
     Submit(): Promise<BridgeResult<BridgeCommitResult>>;
-    SubmitWithSignature(signature: Buffer | Uint8Array | string): Promise<BridgeResult<BridgeCommitResult>>;
-}
-type PeerSelectionPolicy = 'round-robin' | 'random';
-interface SinglePeerOptions {
-    candidates?: string[];
-    policy?: PeerSelectionPolicy;
-    failover?: boolean;
 }
 interface BridgeCommitResult {
     Result(): Buffer;
@@ -224,7 +218,7 @@ interface BridgeSubmittedTx {
 }
 interface CommitStatus {
     blockNumber: bigint;
-    status: 'VALID' | 'INVALID';
+    status: string;
     transactionId: string;
 }
 
@@ -244,8 +238,7 @@ declare class FabricBridge {
 /**
  * Creates a private-key signer that returns the signature synchronously.
  *
- * Use this signer when peer targeting is enabled through fabric-network. The
- * legacy fabric-network signing path cannot await Promise-returning signers.
+ * Use this signer when an integration needs a synchronous bridge signer.
  */
 declare function createSyncPrivateKeySigner(key: KeyObject): Signer;
 
@@ -259,4 +252,4 @@ declare function setLogger(newLogger: Logger): void;
 declare function enableDebugLogging(): void;
 declare function disableDebugLogging(): void;
 
-export { type BridgeCommitResult, type BridgeConfig, type BridgeContract, type BridgeEndorsedTransaction, type BridgeError, type BridgeNetwork, type BridgeResult, type BridgeSignedProposal, type BridgeSubmittedTx, type BridgeTransaction, type BridgeUnsignedProposal, CommitError, type CommitStatus, ConfigurationError, DEFAULT_TIMEOUTS, DiscoveryError, EndorsementError, EvaluationError, FabricBridge, type Logger, NotConnectedError, OfflineSigningError, type OfflineSigningRouting, PeerNotFoundError, type PeerSelectionPolicy, type ProposalCreator, type SignedMessage, type Signer, type SigningRequest, SinglePeerExecutionError, type SinglePeerOptions, SubmitError, type TimeoutConfig, TimeoutError, type TlsOptions, createSyncPrivateKeySigner, disableDebugLogging, enableDebugLogging, setLogger };
+export { type BridgeCommitResult, type BridgeConfig, type BridgeContract, type BridgeEndorsedTransaction, type BridgeError, type BridgeNetwork, type BridgeResult, type BridgeSignedProposal, type BridgeSubmittedTx, type BridgeTransaction, type BridgeUnsignedProposal, CommitError, type CommitStatus, ConfigurationError, DEFAULT_TIMEOUTS, DiscoveryError, EndorsementError, EvaluationError, FabricBridge, type Logger, NotConnectedError, OfflineSigningError, type OfflineSigningRouting, PeerNotFoundError, type ProposalCreator, type SignedMessage, type Signer, type SigningRequest, SinglePeerExecutionError, SubmitError, type TimeoutConfig, TimeoutError, type TlsOptions, createSyncPrivateKeySigner, disableDebugLogging, enableDebugLogging, setLogger };

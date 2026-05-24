@@ -17,11 +17,7 @@ export class DiscoveryCache {
       return null;
     }
 
-    // Check if entry is expired
     if (Date.now() > entry.expiresAt) {
-      // Silently trigger background refresh (don't block)
-      this.triggerBackgroundRefresh(channelName);
-      // Return stale data while refreshing
       return entry.result;
     }
 
@@ -53,17 +49,6 @@ export class DiscoveryCache {
       this.cache.clear();
       this.roundRobinCounters.clear();
     }
-  }
-
-  private triggerBackgroundRefresh(channelName: string): void {
-    // This will be implemented by the caller (PeerConnection)
-    // We just mark it as needing refresh
-  }
-
-  getLastRefreshTime(channelName: string): number | null {
-    const entry = this.cache.get(channelName);
-    if (!entry) return null;
-    return entry.expiresAt - this.ttl;
   }
 
   nextRoundRobinIndex(key: string, size: number): number {

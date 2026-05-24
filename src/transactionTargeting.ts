@@ -1,12 +1,10 @@
 import { Result } from 'better-result';
 import { ConfigurationError } from './errors/index';
-import type { BridgeResult, BridgeTransaction, PeerSelectionPolicy, SinglePeerOptions } from './types/bridge';
-
-const VALID_POLICIES = new Set<PeerSelectionPolicy>(['round-robin', 'random']);
+import type { BridgeResult, BridgeTransaction } from './types/bridge';
 
 type TargetingState =
   | { kind: 'gateway-default' }
-  | { kind: 'single-peer'; options: SinglePeerOptions }
+  | { kind: 'single-peer' }
   | { kind: 'endorsing-peers'; peerNames: string[] };
 
 export class TransactionTargeting {
@@ -16,22 +14,8 @@ export class TransactionTargeting {
     return new TransactionTargeting({ kind: 'gateway-default' });
   }
 
-  static singlePeer(options: SinglePeerOptions = {}): BridgeResult<TransactionTargeting> {
-    if (options.policy !== undefined && !VALID_POLICIES.has(options.policy)) {
-      return Result.err(new ConfigurationError({
-        field: 'singlePeer.policy',
-        message: `unsupported peer selection policy: ${String(options.policy)}`,
-      }));
-    }
-
-    return Result.ok(new TransactionTargeting({
-      kind: 'single-peer',
-      options: {
-        failover: true,
-        ...options,
-        candidates: options.candidates?.length ? [...options.candidates] : undefined,
-      },
-    }));
+  static singlePeer(): BridgeResult<TransactionTargeting> {
+    return Result.ok(new TransactionTargeting({ kind: 'single-peer' }));
   }
 
   static endorsingPeers(peerNames: string[]): BridgeResult<TransactionTargeting> {
@@ -56,20 +40,16 @@ export class TransactionTargeting {
     return this.state.kind === 'single-peer';
   }
 
-  singlePeerOptions(): SinglePeerOptions | null {
-    return this.state.kind === 'single-peer' ? this.state.options : null;
-  }
-
   endorsingPeerNames(): string[] {
     return this.state.kind === 'endorsing-peers' ? [...this.state.peerNames] : [];
   }
 
   applyToPeerTransaction(transaction: BridgeTransaction): BridgeResult<BridgeTransaction> {
     if (this.state.kind === 'single-peer') {
-      return transaction.UseSinglePeer(this.state.options);
+      return transaction.UseSinglePeer();
     }
     if (this.state.kind === 'endorsing-peers') {
-      return transaction.UseEndorsingPeers(this.state.peerNames);
+      return transaction.UseEndorsingPeers(...this.state.peerNames);
     }
     return Result.ok(transaction);
   }

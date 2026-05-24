@@ -45,8 +45,8 @@ export interface BridgeTransaction {
   getName(): string;
   getChaincodeName(): string;
 
-  UseSinglePeer(options?: SinglePeerOptions): BridgeResult<BridgeTransaction>;
-  UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction>;
+  UseSinglePeer(): BridgeResult<BridgeTransaction>;
+  UseEndorsingPeers(...peerNames: string[]): BridgeResult<BridgeTransaction>;
   SetTransientData(transientData: Record<string, Buffer>): BridgeTransaction;
   SetProposalCreator(proposalCreator: ProposalCreator): BridgeTransaction;
   Submit(...args: unknown[]): Promise<BridgeResult<BridgeCommitResult>>;
@@ -97,19 +97,8 @@ export interface BridgeEndorsedTransaction {
   Digest(): Buffer;
   Result(): Buffer;
   TransactionID(): string;
-  SigningRequest(): SigningRequest;
-  WithSignature(signature: Buffer | Uint8Array | string): BridgeResult<SignedMessage>;
   SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>>;
   Submit(): Promise<BridgeResult<BridgeCommitResult>>;
-  SubmitWithSignature(signature: Buffer | Uint8Array | string): Promise<BridgeResult<BridgeCommitResult>>;
-}
-
-export type PeerSelectionPolicy = 'round-robin' | 'random';
-
-export interface SinglePeerOptions {
-  candidates?: string[];
-  policy?: PeerSelectionPolicy;
-  failover?: boolean;
 }
 
 export interface BridgeCommitResult {
@@ -126,6 +115,6 @@ export interface BridgeSubmittedTx {
 
 export interface CommitStatus {
   blockNumber: bigint;
-  status: 'VALID' | 'INVALID';
+  status: string;
   transactionId: string;
 }

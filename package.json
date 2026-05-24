@@ -1,7 +1,7 @@
 {
   "name": "fabric-bridge-sdk",
   "version": "0.1.0",
-  "description": "Bridge SDK combining fabric-gateway and fabric-network with peer targeting support",
+  "description": "Bridge SDK combining Fabric Gateway with direct peer targeting support",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -53,7 +53,6 @@
     "@hyperledger/fabric-protos": "^0.3.7",
     "@noble/curves": "^1.9.4",
     "better-result": "^2.7.0",
-    "fabric-network": "^2.2.20",
     "google-protobuf": "^3.21.4"
   },
   "engines": {

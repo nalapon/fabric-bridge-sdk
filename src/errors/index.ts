@@ -22,7 +22,6 @@ export class SinglePeerExecutionError extends TaggedError('SinglePeerExecutionEr
   channel: string;
   chaincode: string;
   transaction: string;
-  candidates?: string[];
   eligiblePeers: string[];
   attempts: Array<{ peer: string; cause: string; failover: FailoverDecision }>;
 }>() {}

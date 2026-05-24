@@ -4,6 +4,7 @@ import * as fabricGateway from "@hyperledger/fabric-gateway";
 import { createHash } from "crypto";
 import gatewayProtoModule from "@hyperledger/fabric-protos/lib/gateway/gateway_pb.js";
 import identitiesProtoModule from "@hyperledger/fabric-protos/lib/msp/identities_pb.js";
+import peerTransactionProtoModule from "@hyperledger/fabric-protos/lib/peer/transaction_pb.js";
 
 // src/errors/index.ts
 import { TaggedError } from "better-result";
@@ -67,6 +68,7 @@ function log() {
 // src/gateway/GatewayConnection.ts
 var gatewayProto = gatewayProtoModule;
 var { SerializedIdentity } = identitiesProtoModule;
+var peerTransactionProto = peerTransactionProtoModule;
 var GatewayConnection = class {
   client = null;
   gateway = null;
@@ -75,50 +77,50 @@ var GatewayConnection = class {
     this.config = config;
   }
   async connect() {
-    const { gatewayPeer, identity, signer, tlsOptions, timeouts } = this.config;
+    const { gatewayEndpoint, identity, signer, gatewayTls, timeouts } = this.config;
     const connectTimeout = timeouts?.discovery ?? 5e3;
     log().info("GatewayConnection.connect() - Iniciando conexi\xF3n");
     log().debug("GatewayConnection.connect() - Config:", {
-      gatewayPeer,
+      gatewayEndpoint,
       mspId: identity.mspId,
-      hasTrustedRoots: !!tlsOptions?.trustedRoots,
-      trustedRootsLength: tlsOptions?.trustedRoots?.length,
-      hasClientCert: !!tlsOptions?.clientCert,
-      clientCertLength: tlsOptions?.clientCert?.length,
-      hasClientKey: !!tlsOptions?.clientKey,
-      clientKeyLength: tlsOptions?.clientKey?.length,
+      hasTrustedRoots: !!gatewayTls?.trustedRoots,
+      trustedRootsLength: gatewayTls?.trustedRoots?.length,
+      hasClientCert: !!gatewayTls?.clientCert,
+      clientCertLength: gatewayTls?.clientCert?.length,
+      hasClientKey: !!gatewayTls?.clientKey,
+      clientKeyLength: gatewayTls?.clientKey?.length,
       connectTimeout
     });
     return Result.tryPromise({
       try: async () => {
         log().debug("GatewayConnection.connect() - Creando credenciales TLS");
         let tlsCredentials;
-        if (tlsOptions?.trustedRoots) {
-          if (tlsOptions?.clientKey && tlsOptions?.clientCert) {
+        if (gatewayTls?.trustedRoots) {
+          if (gatewayTls?.clientKey && gatewayTls?.clientCert) {
             log().debug("GatewayConnection.connect() - Usando mTLS (certificado cliente)");
             tlsCredentials = grpc.credentials.createSsl(
-              tlsOptions.trustedRoots,
-              tlsOptions.clientKey,
-              tlsOptions.clientCert
+              gatewayTls.trustedRoots,
+              gatewayTls.clientKey,
+              gatewayTls.clientCert
             );
           } else {
             log().debug("GatewayConnection.connect() - Usando TLS normal (solo verificar servidor)");
-            tlsCredentials = grpc.credentials.createSsl(tlsOptions.trustedRoots);
+            tlsCredentials = grpc.credentials.createSsl(gatewayTls.trustedRoots);
           }
         } else {
           log().debug("GatewayConnection.connect() - Usando conexi\xF3n insegura (sin TLS)");
           tlsCredentials = grpc.credentials.createInsecure();
         }
-        const hostname = tlsOptions?.sslTargetNameOverride ?? this.extractHostname(gatewayPeer);
+        const hostname = gatewayTls?.sslTargetNameOverride ?? this.extractHostname(gatewayEndpoint);
         const clientOptions = hostname ? {
           "grpc.ssl_target_name_override": hostname
         } : {};
         log().debug("GatewayConnection.connect() - Creando gRPC Client:", {
-          endpoint: gatewayPeer,
+          endpoint: gatewayEndpoint,
           hostname,
           hasSslOverride: !!hostname
         });
-        this.client = new grpc.Client(gatewayPeer, tlsCredentials, clientOptions);
+        this.client = new grpc.Client(gatewayEndpoint, tlsCredentials, clientOptions);
         log().debug("GatewayConnection.connect() - Esperando conexi\xF3n ready (timeout:", connectTimeout, "ms)");
         await Promise.race([
           new Promise((resolve, reject) => {
@@ -153,7 +155,7 @@ var GatewayConnection = class {
         if (e instanceof Error && e.message.includes("timeout")) {
           log().error("GatewayConnection.connect() - Timeout error:", e.message);
           return new TimeoutError({
-            message: `Failed to connect to gateway peer: ${gatewayPeer}`,
+            message: `Failed to connect to gateway endpoint: ${gatewayEndpoint}`,
             operation: "connect",
             timeout: connectTimeout
           });
@@ -161,7 +163,7 @@ var GatewayConnection = class {
         log().error("GatewayConnection.connect() - Configuration error:", e instanceof Error ? e.message : String(e));
         return new ConfigurationError({
           message: `Failed to connect to gateway: ${e instanceof Error ? e.message : String(e)}`,
-          field: "gatewayPeer"
+          field: "gatewayEndpoint"
         });
       }
     });
@@ -180,13 +182,13 @@ var GatewayConnection = class {
       }));
     }
     const commitTimeout = this.config.timeouts?.commit ?? 6e4;
-    const serializedIdentity2 = new SerializedIdentity();
-    serializedIdentity2.setMspid(this.config.identity.mspId);
-    serializedIdentity2.setIdBytes(this.config.identity.credentials);
+    const serializedIdentity3 = new SerializedIdentity();
+    serializedIdentity3.setMspid(this.config.identity.mspId);
+    serializedIdentity3.setIdBytes(this.config.identity.credentials);
     const request = new gatewayProto.CommitStatusRequest();
     request.setChannelId(channelName);
     request.setTransactionId(transactionId);
-    request.setIdentity(serializedIdentity2.serializeBinary());
+    request.setIdentity(serializedIdentity3.serializeBinary());
     const requestBytes = request.serializeBinary();
     const signature = await this.config.signer(createHash("sha256").update(requestBytes).digest());
     const signedRequest = new gatewayProto.SignedCommitStatusRequest();
@@ -216,12 +218,14 @@ var GatewayConnection = class {
             }
           );
         });
+        const validationCode = response.getResult();
+        const validationStatus = txValidationCodeName(validationCode);
         const status = {
           blockNumber: BigInt(response.getBlockNumber()),
-          status: response.getResult() === 0 ? "VALID" : "INVALID",
+          status: validationStatus,
           transactionId
         };
-        if (status.status !== "VALID") {
+        if (validationCode !== peerTransactionProto.TxValidationCode.VALID) {
           throw new CommitError({
             message: "transaction committed with invalid validation code",
             transactionId,
@@ -266,6 +270,14 @@ var GatewayConnection = class {
     return parts[0] || void 0;
   }
 };
+function txValidationCodeName(code) {
+  for (const [name, value] of Object.entries(peerTransactionProto.TxValidationCode)) {
+    if (value === code) {
+      return name;
+    }
+  }
+  return `UNKNOWN_VALIDATION_CODE_${code}`;
+}
 
 // src/gateway/GatewayContract.ts
 import "@hyperledger/fabric-gateway";
@@ -287,7 +299,6 @@ var DEFAULT_TIMEOUTS = {
 import { createHash as createHash2 } from "crypto";
 import * as fabricGatewayProtos from "@hyperledger/fabric-protos";
 import { Result as Result2 } from "better-result";
-import fabproto6 from "fabric-protos";
 function toBase64(bytes) {
   return Buffer.from(bytes).toString("base64");
 }
@@ -368,14 +379,16 @@ function validateProposalRouting(routing) {
 }
 function proposalCreatorIdentity(proposalBytes) {
   try {
-    const proposal = fabproto6.protos.Proposal.decode(
+    const proposal = fabricGatewayProtos.peer.Proposal.deserializeBinary(
       unwrapProposalBytes(proposalBytes)
     );
-    const header = fabproto6.common.Header.decode(proposal.header);
-    const signatureHeader = fabproto6.common.SignatureHeader.decode(
-      header.signature_header
+    const header = fabricGatewayProtos.common.Header.deserializeBinary(
+      proposal.getHeader_asU8()
     );
-    return Result2.ok(Buffer.from(signatureHeader.creator));
+    const signatureHeader = fabricGatewayProtos.common.SignatureHeader.deserializeBinary(
+      header.getSignatureHeader_asU8()
+    );
+    return Result2.ok(Buffer.from(signatureHeader.getCreator_asU8()));
   } catch (error) {
     return Result2.err(
       new OfflineSigningError({
@@ -389,8 +402,8 @@ function proposalCreatorMSPID(proposalBytes) {
   const creator = proposalCreatorIdentity(proposalBytes);
   if (!creator.isOk()) return Result2.err(creator.error);
   try {
-    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
-    return Result2.ok(identity.mspid);
+    const identity = fabricGatewayProtos.msp.SerializedIdentity.deserializeBinary(creator.value);
+    return Result2.ok(identity.getMspid());
   } catch (error) {
     return Result2.err(
       new OfflineSigningError({
@@ -404,8 +417,8 @@ function proposalCreatorCertificate(proposalBytes) {
   const creator = proposalCreatorIdentity(proposalBytes);
   if (!creator.isOk()) return Result2.err(creator.error);
   try {
-    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
-    return Result2.ok(Buffer.from(identity.id_bytes));
+    const identity = fabricGatewayProtos.msp.SerializedIdentity.deserializeBinary(creator.value);
+    return Result2.ok(Buffer.from(identity.getIdBytes_asU8()));
   } catch (error) {
     return Result2.err(
       new OfflineSigningError({
@@ -417,16 +430,34 @@ function proposalCreatorCertificate(proposalBytes) {
 }
 function unwrapProposalBytes(proposalBytes) {
   const bytes = Buffer.from(proposalBytes);
+  if (isFabricProposalBytes(bytes)) {
+    return bytes;
+  }
   try {
     const proposedTransaction = fabricGatewayProtos.gateway.ProposedTransaction.deserializeBinary(bytes);
     const signedProposal = proposedTransaction.getProposal();
     const rawProposalBytes = signedProposal?.getProposalBytes_asU8();
     if (rawProposalBytes && rawProposalBytes.length > 0) {
-      return Buffer.from(rawProposalBytes);
+      const candidate = Buffer.from(rawProposalBytes);
+      if (isFabricProposalBytes(candidate)) {
+        return candidate;
+      }
     }
   } catch {
   }
   return bytes;
+}
+function isFabricProposalBytes(bytes) {
+  try {
+    const proposal = fabricGatewayProtos.peer.Proposal.deserializeBinary(bytes);
+    if (proposal.getHeader_asU8().length === 0 || proposal.getPayload_asU8().length === 0) {
+      return false;
+    }
+    const header = fabricGatewayProtos.common.Header.deserializeBinary(proposal.getHeader_asU8());
+    return header.getChannelHeader_asU8().length > 0 && header.getSignatureHeader_asU8().length > 0;
+  } catch {
+    return false;
+  }
 }
 function decodeBase64(value, field) {
   if (typeof value !== "string" || value.length === 0) {
@@ -565,12 +596,12 @@ var GatewayTransaction = class {
   getChaincodeName() {
     return this.chaincodeName;
   }
-  UseSinglePeer(_options = {}) {
+  UseSinglePeer() {
     return Result3.err(new ConfigurationError({
       message: "UseSinglePeer() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions."
     }));
   }
-  UseEndorsingPeers(_peerNames) {
+  UseEndorsingPeers(..._peerNames) {
     return Result3.err(new ConfigurationError({
       message: "UseEndorsingPeers() is not supported in gateway mode. Use FabricBridge with discovery enabled for peer-targeted transactions."
     }));
@@ -791,35 +822,6 @@ var GatewayEndorsedTransaction = class {
     }
     return Result3.ok(new GatewayCommitResult(submitted.value, status.value));
   }
-  SigningRequest() {
-    return signingRequest(this.Bytes(), this.Digest());
-  }
-  WithSignature(signature) {
-    return signedMessage(this.SigningRequest(), signature);
-  }
-  async SubmitWithSignature(signature) {
-    const signed = this.WithSignature(signature);
-    if (!signed.isOk()) return Result3.err(signed.error);
-    const decoded = decodeSignedMessage(signed.value);
-    if (!decoded.isOk()) return Result3.err(decoded.error);
-    try {
-      const transaction = this.gateway.newTransaction(decoded.value.bytes);
-      if (!Buffer.from(transaction.getDigest()).equals(decoded.value.digest)) {
-        return Result3.err(new OfflineSigningError({
-          field: "digest",
-          message: "digest does not match transaction bytes"
-        }));
-      }
-      const signedTransaction = this.gateway.newSignedTransaction(decoded.value.bytes, decoded.value.signature);
-      const submitted = await signedTransaction.submit();
-      const submittedTx = new GatewaySubmittedTx(submitted, this.timeouts);
-      const status = await submittedTx.WaitForCommit();
-      if (!status.isOk()) return Result3.err(status.error);
-      return Result3.ok(new GatewayCommitResult(submittedTx, status.value));
-    } catch (error) {
-      return Result3.err(new SubmitError({ message: error.message, transactionId: this.TransactionID() }));
-    }
-  }
 };
 var GatewayCommitResult = class {
   submitted;
@@ -958,9 +960,8 @@ function copyProposalCreator(input) {
   };
 }
 
-// src/peer/PeerConnection.ts
-import * as fabricNetwork from "fabric-network";
-import { Result as Result4 } from "better-result";
+// src/peer/PeerDiscoverySession.ts
+import { Result as Result6 } from "better-result";
 
 // src/cache/DiscoveryCache.ts
 var DiscoveryCache = class _DiscoveryCache {
@@ -978,7 +979,6 @@ var DiscoveryCache = class _DiscoveryCache {
       return null;
     }
     if (Date.now() > entry.expiresAt) {
-      this.triggerBackgroundRefresh(channelName);
       return entry.result;
     }
     return entry.result;
@@ -1007,13 +1007,6 @@ var DiscoveryCache = class _DiscoveryCache {
       this.roundRobinCounters.clear();
     }
   }
-  triggerBackgroundRefresh(channelName) {
-  }
-  getLastRefreshTime(channelName) {
-    const entry = this.cache.get(channelName);
-    if (!entry) return null;
-    return entry.expiresAt - this.ttl;
-  }
   nextRoundRobinIndex(key, size) {
     if (size <= 0) {
       return 0;
@@ -1024,325 +1017,21 @@ var DiscoveryCache = class _DiscoveryCache {
   }
 };
 
-// src/fabricIdentity.ts
-import * as fabricCommon from "fabric-common";
-var fabricCommonRuntime = fabricCommon;
-function createProposalIdentityContext(baseIdentityContext, proposalCreator) {
-  const user = createIdentityOnlyUser("proposal creator", proposalCreator.mspId, proposalCreator.credentials);
-  return baseIdentityContext.client.newIdentityContext(user).calculateTransactionId();
-}
-function createBridgeIdentityProvider(config) {
-  return {
-    type: "bridge-x509",
-    getCryptoSuite() {
-      return fabricCommonRuntime.User.newCryptoSuite();
-    },
-    fromJson(data) {
-      return data;
-    },
-    toJson(identity) {
-      return identity;
-    },
-    async getUserContext(_identity, name) {
-      return createSigningUser(name, config.identity.mspId, config.identity.credentials, config);
-    }
-  };
-}
-function createIdentityOnlyUser(name, mspId, certificate) {
-  const cryptoSuite = fabricCommonRuntime.User.newCryptoSuite();
-  const user = new fabricCommonRuntime.User(name);
-  user.setCryptoSuite(cryptoSuite);
-  user._mspId = mspId;
-  user._identity = new fabricCommonRuntime.Identity(certificate.toString(), void 0, mspId, cryptoSuite);
-  user._signingIdentity = void 0;
-  return user;
-}
-async function createSigningUser(name, mspId, certificate, config) {
-  const cryptoSuite = fabricCommonRuntime.User.newCryptoSuite();
-  const user = new fabricCommonRuntime.User(name);
-  user.setCryptoSuite(cryptoSuite);
-  const publicKey = await cryptoSuite.createKeyFromRaw(certificate.toString());
-  const signer = {
-    sign: (digest) => {
-      const signature = config.signer(digest);
-      if (signature instanceof Promise) {
-        throw new Error(
-          "BridgeConfig.signer must return synchronously when used with fabric-network peer mode. Use createSyncPrivateKeySigner() for private-key bridge identities."
-        );
-      }
-      return Buffer.from(signature);
-    }
-  };
-  user._mspId = mspId;
-  user.setSigningIdentity(new fabricCommonRuntime.SigningIdentity(
-    certificate.toString(),
-    publicKey,
-    mspId,
-    cryptoSuite,
-    signer
-  ));
-  return user;
-}
+// src/peer/DirectDiscoveryClient.ts
+import * as grpc2 from "@grpc/grpc-js";
+import { createHash as createHash4, X509Certificate } from "crypto";
+import discoveryGrpcModule from "@hyperledger/fabric-protos/lib/discovery/protocol_grpc_pb.js";
+import discoveryProtoModule from "@hyperledger/fabric-protos/lib/discovery/protocol_pb.js";
+import gossipProtoModule from "@hyperledger/fabric-protos/lib/gossip/message_pb.js";
+import identitiesProtoModule2 from "@hyperledger/fabric-protos/lib/msp/identities_pb.js";
+import { Result as Result5 } from "better-result";
 
-// src/peer/PeerConnection.ts
-function isLocalhostEndpoint(endpoint) {
-  const [host] = endpoint.split(":");
-  return host === "localhost" || host === "127.0.0.1" || host === "::1" || !!host && host.startsWith("127.");
-}
-function sanitizeEndpoint(endpoint) {
-  if (!endpoint) {
-    return "";
-  }
-  return endpoint.trim().replace(/^"+|"+$/g, "");
-}
-function endpointUsesTLS(config) {
-  return !!config.tlsOptions?.trustedRoots;
-}
-var PeerConnection = class {
-  gateway = null;
-  config;
-  discoveryCache;
-  constructor(config, discoveryCache) {
-    this.config = config;
-    this.discoveryCache = discoveryCache;
-  }
-  async connect() {
-    const { identity, tlsOptions, timeouts } = this.config;
-    const connectTimeout = timeouts?.discovery ?? 5e3;
-    log().info("PeerConnection.connect() - Iniciando conexi\xF3n");
-    log().debug("PeerConnection.connect() - Config:", {
-      gatewayPeer: this.config.gatewayPeer,
-      mspId: identity.mspId,
-      hasTrustedRoots: !!tlsOptions?.trustedRoots,
-      trustedRootsLength: tlsOptions?.trustedRoots?.length,
-      hasClientCert: !!tlsOptions?.clientCert,
-      clientCertLength: tlsOptions?.clientCert?.length,
-      hasClientKey: !!tlsOptions?.clientKey,
-      clientKeyLength: tlsOptions?.clientKey?.length,
-      discovery: this.config.discovery,
-      connectTimeout
-    });
-    return Result4.tryPromise({
-      try: async () => {
-        const bridgeIdentity = {
-          type: "bridge-x509",
-          mspId: identity.mspId,
-          credentials: {
-            certificate: identity.credentials.toString()
-          }
-        };
-        const asLocalhost = isLocalhostEndpoint(this.config.gatewayPeer);
-        log().debug(`PeerConnection.connect() - Auto-detected asLocalhost: ${asLocalhost} (from ${this.config.gatewayPeer})`);
-        const gatewayOptions = {
-          identity: bridgeIdentity,
-          identityProvider: createBridgeIdentityProvider(this.config),
-          discovery: {
-            enabled: this.config.discovery ?? true,
-            asLocalhost
-          },
-          eventHandlerOptions: {
-            commitTimeout: Math.round(
-              Math.min(this.config.timeouts?.commit ?? 5e3, 5e3) / 1e3
-            )
-          },
-          tlsInfo: tlsOptions?.clientCert && tlsOptions?.clientKey ? {
-            certificate: tlsOptions.clientCert.toString(),
-            key: tlsOptions.clientKey.toString()
-          } : void 0
-        };
-        log().debug("PeerConnection.connect() - GatewayOptions:", {
-          identity: identity.mspId,
-          discoveryEnabled: gatewayOptions.discovery?.enabled,
-          discoveryAsLocalhost: gatewayOptions.discovery?.asLocalhost,
-          hasTlsInfo: !!gatewayOptions.tlsInfo
-        });
-        this.gateway = new fabricNetwork.Gateway();
-        log().debug("PeerConnection.connect() - Creando connection profile");
-        const connectionProfile = this.createMinimalConnectionProfile();
-        log().debug("PeerConnection.connect() - Connection profile:", JSON.stringify({
-          name: connectionProfile.name,
-          version: connectionProfile.version,
-          organization: connectionProfile.client?.organization,
-          peerCount: connectionProfile.peers ? Object.keys(connectionProfile.peers).length : 0
-        }, null, 2));
-        log().debug("PeerConnection.connect() - Llamando a gateway.connect()");
-        await this.gateway.connect(connectionProfile, gatewayOptions);
-        log().info("PeerConnection.connect() - Conexi\xF3n exitosa");
-      },
-      catch: (e) => {
-        log().error("PeerConnection.connect() - Error:", e instanceof Error ? e.message : String(e));
-        if (e instanceof Error && e.message.includes("timeout")) {
-          return new TimeoutError({
-            message: `Failed to connect to peer network: ${e.message}`,
-            operation: "connect",
-            timeout: connectTimeout
-          });
-        }
-        return new ConfigurationError({
-          message: `Failed to connect to peer network: ${e instanceof Error ? e.message : String(e)}`
-        });
-      }
-    });
-  }
-  getGateway() {
-    if (!this.gateway) {
-      throw new Error("Peer gateway not connected. Call connect() first.");
-    }
-    return this.gateway;
-  }
-  async disconnect() {
-    log().info("PeerConnection.disconnect() - Desconectando");
-    this.gateway?.disconnect();
-    this.gateway = null;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  async discover(channelName) {
-    log().debug("PeerConnection.discover() - Iniciando discovery para canal:", channelName);
-    const cached = this.discoveryCache.get(channelName);
-    if (cached && !this.discoveryCache.isStale(channelName)) {
-      log().debug("PeerConnection.discover() - Usando cache para canal:", channelName);
-      return Result4.ok(cached);
-    }
-    try {
-      if (!this.gateway) {
-        log().error("PeerConnection.discover() - Gateway no conectado");
-        throw new Error("Not connected");
-      }
-      log().debug("PeerConnection.discover() - Obteniendo network para canal:", channelName);
-      const network = await this.gateway.getNetwork(channelName);
-      const discoveryService = network.discoveryService;
-      if (!discoveryService) {
-        log().error("PeerConnection.discover() - Discovery service no disponible");
-        throw new Error("Discovery service not available");
-      }
-      log().debug("PeerConnection.discover() - Parseando resultados de discovery");
-      const result = this.parseDiscoveryResults(discoveryService, channelName);
-      log().info("PeerConnection.discover() - Discovery exitoso:", {
-        channelName,
-        peerCount: result.peers.size,
-        ordererCount: result.orderers.length,
-        mspCount: result.msps.size
-      });
-      this.discoveryCache.set(channelName, result);
-      return Result4.ok(result);
-    } catch (error) {
-      log().error("PeerConnection.discover() - Error:", error instanceof Error ? error.message : String(error));
-      if (cached) {
-        log().debug("PeerConnection.discover() - Usando cache stale como fallback");
-        setTimeout(() => this.discover(channelName).catch(() => {
-        }), 0);
-        return Result4.ok(cached);
-      }
-      return Result4.err(
-        new DiscoveryError({
-          message: `Discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-          cause: error instanceof Error ? error : void 0
-        })
-      );
-    }
-  }
-  createMinimalConnectionProfile() {
-    const { gatewayPeer, tlsOptions, identity } = this.config;
-    const [hostPart] = gatewayPeer.split(":");
-    const host = hostPart || "localhost";
-    const mspId = identity.mspId;
-    const peerName = tlsOptions?.sslTargetNameOverride ?? host;
-    const profile = {
-      name: "bridge-network",
-      version: "1.0",
-      client: {
-        organization: mspId,
-        connection: {
-          timeout: {
-            peer: {
-              endorser: this.config.timeouts?.endorse || 3e4
-            }
-          }
-        }
-      },
-      organizations: {},
-      peers: {}
-    };
-    profile.organizations[mspId] = {
-      mspid: mspId,
-      peers: [peerName]
-    };
-    profile.peers[peerName] = {
-      url: `${tlsOptions ? "grpcs" : "grpc"}://${gatewayPeer}`,
-      tlsCACerts: tlsOptions?.trustedRoots ? {
-        pem: tlsOptions.trustedRoots.toString()
-      } : void 0,
-      grpcOptions: {
-        "ssl-target-name-override": peerName
-      }
-    };
-    return profile;
-  }
-  parseDiscoveryResults(discoveryService, channelName) {
-    const results = discoveryService.discoveryResults || {};
-    const peers = /* @__PURE__ */ new Map();
-    const orderers = [];
-    const msps = /* @__PURE__ */ new Map();
-    const discoveredPeers = results.peers_by_org || {};
-    for (const [mspId, orgInfo] of Object.entries(discoveredPeers)) {
-      const peersList = orgInfo.peers || [];
-      for (const peer2 of peersList) {
-        const endpoint = this.normalizePeerEndpointIdentity(sanitizeEndpoint(peer2.endpoint));
-        if (peers.has(endpoint)) {
-          throw new Error(`Discovery returned duplicate peer endpoint identity: ${endpoint}`);
-        }
-        const peerName = endpointHost(endpoint) || "unknown";
-        peers.set(endpoint, {
-          name: peerName,
-          endpoint,
-          mspId,
-          chaincodes: peer2.chaincodes?.map((cc) => cc.name) || [],
-          ledgerHeight: BigInt(peer2.ledger_height?.high || 0) << BigInt(32) | BigInt(peer2.ledger_height?.low || 0)
-        });
-      }
-    }
-    const discoveredOrderers = results.orderers || {};
-    for (const [mspId, ordererInfo] of Object.entries(discoveredOrderers)) {
-      const endpoints = ordererInfo.endpoints || [];
-      for (const endpoint of endpoints) {
-        orderers.push({
-          endpoint: `${endpoint.host}:${endpoint.port}`,
-          mspId
-        });
-      }
-    }
-    const discoveredMsps = results.msps || {};
-    for (const [mspId, mspInfo] of Object.entries(discoveredMsps)) {
-      msps.set(mspId, {
-        id: mspId,
-        tlsRootCerts: mspInfo.tls_root_certs?.map(
-          (cert) => Buffer.from(cert)
-        ) || []
-      });
-    }
-    return {
-      timestamp: Date.now(),
-      channelName,
-      peers,
-      orderers,
-      msps
-    };
-  }
-  matchPeerByEndpointIdentity(discoveryResult, endpoint) {
-    const canonicalEndpoint = this.normalizePeerEndpointIdentity(endpoint);
-    return discoveryResult.peers.get(canonicalEndpoint) ?? null;
-  }
-  normalizePeerEndpointIdentity(endpoint) {
-    return normalizePeerEndpointIdentity(endpoint, endpointUsesTLS(this.config));
-  }
-};
-function normalizePeerEndpointIdentity(raw, tlsEnabled) {
+// src/peer/endpointIdentity.ts
+import { Result as Result4 } from "better-result";
+function normalizePeerEndpointIdentityResult(raw, tlsEnabled) {
   const value = raw.trim();
   if (!value) {
-    throw new ConfigurationError({
-      field: "peerEndpoint",
-      message: "peer endpoint must be a non-empty host:port value"
-    });
+    return endpointConfigurationError("peer endpoint must be a non-empty host:port value");
   }
   const lower = value.toLowerCase();
   let scheme = tlsEnabled ? "grpcs" : "grpc";
@@ -1350,41 +1039,49 @@ function normalizePeerEndpointIdentity(raw, tlsEnabled) {
   if (lower.startsWith("grpc://") || lower.startsWith("grpcs://")) {
     const parsed = new URL(value);
     if (parsed.protocol !== "grpc:" && parsed.protocol !== "grpcs:") {
-      throw new ConfigurationError({
-        field: "peerEndpoint",
-        message: `peer endpoint scheme must be grpc or grpcs: ${raw}`
-      });
+      return endpointConfigurationError(`peer endpoint scheme must be grpc or grpcs: ${raw}`);
     }
     if (!["", "/"].includes(parsed.pathname) || parsed.search || parsed.hash || !parsed.hostname || !parsed.port) {
-      throw new ConfigurationError({
-        field: "peerEndpoint",
-        message: `peer endpoint must be grpc(s)://host:port: ${raw}`
-      });
+      return endpointConfigurationError(`peer endpoint must be grpc(s)://host:port: ${raw}`);
     }
     scheme = parsed.protocol.slice(0, -1);
     hostPort = `${parsed.hostname}:${parsed.port}`;
   } else if (value.includes("://")) {
-    throw new ConfigurationError({
-      field: "peerEndpoint",
-      message: `peer endpoint scheme must be grpc or grpcs: ${raw}`
-    });
+    return endpointConfigurationError(`peer endpoint scheme must be grpc or grpcs: ${raw}`);
   }
   const separator = hostPort.lastIndexOf(":");
   if (separator <= 0 || separator === hostPort.length - 1) {
-    throw new ConfigurationError({
-      field: "peerEndpoint",
-      message: `peer endpoint must include host:port: ${raw}`
-    });
+    return endpointConfigurationError(`peer endpoint must include host:port: ${raw}`);
   }
   const host = hostPort.slice(0, separator).toLowerCase();
   const port = hostPort.slice(separator + 1);
   if (!/^\d+$/.test(port)) {
-    throw new ConfigurationError({
-      field: "peerEndpoint",
-      message: `peer endpoint port must be numeric: ${raw}`
-    });
+    return endpointConfigurationError(`peer endpoint port must be numeric: ${raw}`);
   }
-  return `${scheme}://${host}:${port}`;
+  return Result4.ok(`${scheme}://${host}:${port}`);
+}
+function normalizePeerEndpointIdentity(raw, tlsEnabled) {
+  const normalized = normalizePeerEndpointIdentityResult(raw, tlsEnabled);
+  if (!normalized.isOk()) {
+    throw normalized.error;
+  }
+  return normalized.value;
+}
+function dedupePeerEndpointInputsResult(inputs, tlsEnabled) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const input of inputs) {
+    const canonical = normalizePeerEndpointIdentityResult(input, tlsEnabled);
+    if (!canonical.isOk()) {
+      return Result4.err(canonical.error);
+    }
+    if (seen.has(canonical.value)) {
+      continue;
+    }
+    out.push(canonical.value);
+    seen.add(canonical.value);
+  }
+  return Result4.ok(out);
 }
 function endpointHost(endpoint) {
   try {
@@ -1394,70 +1091,312 @@ function endpointHost(endpoint) {
     return separator > 0 ? endpoint.slice(0, separator) : endpoint;
   }
 }
+function endpointConfigurationError(message) {
+  return Result4.err(
+    new ConfigurationError({
+      field: "peerEndpoint",
+      message
+    })
+  );
+}
+
+// src/peer/DirectDiscoveryClient.ts
+var discoveryGrpc = discoveryGrpcModule;
+var discoveryProto = discoveryProtoModule;
+var gossipProto = gossipProtoModule;
+var { SerializedIdentity: SerializedIdentity2 } = identitiesProtoModule2;
+var DirectDiscoveryClient = class {
+  constructor(config) {
+    this.config = config;
+  }
+  config;
+  async discover(channelName) {
+    const discoverySeed = this.config.discoverySeed || this.config.gatewayEndpoint;
+    const discoveryTls = this.config.discoveryTls;
+    const timeout = this.config.timeouts?.discovery ?? 5e3;
+    const client = new discoveryGrpc.DiscoveryClient(
+      discoverySeed,
+      createDiscoveryCredentials(discoveryTls),
+      channelOptions(discoverySeed, discoveryTls)
+    );
+    try {
+      const request = await newSignedDiscoveryRequest(this.config, channelName);
+      const response = await discoverWithDeadline(client, request, timeout);
+      const discovery = discoveryResultFromResponseResult(
+        response,
+        channelName,
+        !!discoveryTls?.trustedRoots
+      );
+      if (!discovery.isOk()) {
+        return Result5.err(discovery.error);
+      }
+      return Result5.ok(discovery.value);
+    } catch (error) {
+      if (error instanceof ConfigurationError) {
+        return Result5.err(error);
+      }
+      if (error instanceof TimeoutError) {
+        return Result5.err(error);
+      }
+      return Result5.err(
+        new DiscoveryError({
+          message: `Discovery failed from ${discoverySeed}: ${error instanceof Error ? error.message : String(error)}`,
+          cause: error instanceof Error ? error : void 0
+        })
+      );
+    } finally {
+      client.close();
+    }
+  }
+};
+async function newSignedDiscoveryRequest(config, channelName) {
+  const identity = new SerializedIdentity2();
+  identity.setMspid(config.identity.mspId);
+  identity.setIdBytes(config.identity.credentials);
+  const auth = new discoveryProto.AuthInfo();
+  auth.setClientIdentity(identity.serializeBinary());
+  auth.setClientTlsCertHash(discoveryTLSCertHash(config.discoveryTls));
+  const query = new discoveryProto.Query();
+  query.setChannel(channelName);
+  query.setPeerQuery(new discoveryProto.PeerMembershipQuery());
+  const request = new discoveryProto.Request();
+  request.setAuthentication(auth);
+  request.setQueriesList([query]);
+  const payload = request.serializeBinary();
+  const signature = await config.signer(createHash4("sha256").update(payload).digest());
+  const signed = new discoveryProto.SignedRequest();
+  signed.setPayload(payload);
+  signed.setSignature(signature);
+  return signed;
+}
+function discoveryResultFromResponseResult(response, channelName, tlsEnabled) {
+  if (!response) {
+    return Result5.err(new DiscoveryError({ message: "empty discovery response" }));
+  }
+  const results = response.getResultsList();
+  if (results.length !== 1) {
+    return Result5.err(
+      new DiscoveryError({ message: `expected 1 discovery result, got ${results.length}` })
+    );
+  }
+  const result = results[0];
+  const discoveryError = result.getError();
+  if (discoveryError) {
+    return Result5.err(
+      new DiscoveryError({ message: `discovery service error: ${discoveryError.getContent()}` })
+    );
+  }
+  const members = result.getMembers();
+  if (!members) {
+    return Result5.err(new DiscoveryError({ message: "expected peer membership result" }));
+  }
+  const peers = /* @__PURE__ */ new Map();
+  const orgEntries = [];
+  members.getPeersByOrgMap().forEach((orgPeers, mspId) => {
+    orgEntries.push([mspId, orgPeers]);
+  });
+  orgEntries.sort(([left], [right]) => left.localeCompare(right));
+  for (const [mspId, orgPeers] of orgEntries) {
+    for (const peer5 of orgPeers.getPeersList()) {
+      const rawEndpoint = peerEndpointFromDiscoveryPeerResult(peer5);
+      if (!rawEndpoint.isOk()) {
+        return Result5.err(rawEndpoint.error);
+      }
+      const endpoint = normalizePeerEndpointIdentityResult(
+        rawEndpoint.value,
+        tlsEnabled
+      );
+      if (!endpoint.isOk()) {
+        return Result5.err(endpoint.error);
+      }
+      if (peers.has(endpoint.value)) {
+        return Result5.err(
+          new DiscoveryError({
+            message: `Discovery returned duplicate peer endpoint identity: ${endpoint.value}`
+          })
+        );
+      }
+      const properties = discoveryPeerProperties(peer5);
+      peers.set(endpoint.value, {
+        name: endpointHost(endpoint.value),
+        endpoint: endpoint.value,
+        mspId,
+        chaincodes: properties.chaincodes,
+        ledgerHeight: properties.ledgerHeight
+      });
+    }
+  }
+  return Result5.ok({
+    timestamp: Date.now(),
+    channelName,
+    peers,
+    orderers: [],
+    msps: /* @__PURE__ */ new Map()
+  });
+}
+function createDiscoveryCredentials(tlsOptions) {
+  if (!tlsOptions?.trustedRoots) {
+    return grpc2.credentials.createInsecure();
+  }
+  if (tlsOptions.clientKey && tlsOptions.clientCert) {
+    return grpc2.credentials.createSsl(
+      tlsOptions.trustedRoots,
+      tlsOptions.clientKey,
+      tlsOptions.clientCert
+    );
+  }
+  return grpc2.credentials.createSsl(tlsOptions.trustedRoots);
+}
+function channelOptions(endpoint, tlsOptions) {
+  const hostname = tlsOptions?.sslTargetNameOverride ?? endpointHost(endpoint);
+  return hostname ? { "grpc.ssl_target_name_override": hostname } : {};
+}
+function discoverWithDeadline(client, request, timeout) {
+  return new Promise((resolve, reject) => {
+    client.discover(
+      request,
+      { deadline: Date.now() + timeout },
+      (error, response) => {
+        if (error) {
+          if (error.message.toLowerCase().includes("deadline")) {
+            reject(
+              new TimeoutError({
+                message: error.message,
+                operation: "discovery",
+                timeout
+              })
+            );
+            return;
+          }
+          reject(error);
+          return;
+        }
+        if (!response) {
+          reject(new Error("empty discovery response"));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+function discoveryTLSCertHash(tlsOptions) {
+  if (!tlsOptions?.clientCert) {
+    return createHash4("sha256").update(Buffer.alloc(0)).digest();
+  }
+  try {
+    return createHash4("sha256").update(new X509Certificate(tlsOptions.clientCert).raw).digest();
+  } catch {
+    return createHash4("sha256").update(Buffer.alloc(0)).digest();
+  }
+}
+function peerEndpointFromDiscoveryPeerResult(peer5) {
+  const membershipInfo = peer5.getMembershipInfo();
+  if (!membershipInfo) {
+    return Result5.err(new DiscoveryError({ message: "discovered peer has no membership info" }));
+  }
+  const message = gossipProto.GossipMessage.deserializeBinary(membershipInfo.getPayload_asU8());
+  const endpoint = message.getAliveMsg()?.getMembership()?.getEndpoint();
+  if (!endpoint) {
+    return Result5.err(new DiscoveryError({ message: "discovered peer has no endpoint" }));
+  }
+  return Result5.ok(endpoint);
+}
+function discoveryPeerProperties(peer5) {
+  const stateInfo = peer5.getStateInfo();
+  if (!stateInfo) {
+    return { chaincodes: [], ledgerHeight: BigInt(0) };
+  }
+  try {
+    const message = gossipProto.GossipMessage.deserializeBinary(stateInfo.getPayload_asU8());
+    const properties = message.getStateInfo()?.getProperties();
+    if (!properties) {
+      return { chaincodes: [], ledgerHeight: BigInt(0) };
+    }
+    return {
+      chaincodes: properties.getChaincodesList().map((chaincode) => chaincode.getName()),
+      ledgerHeight: BigInt(properties.getLedgerHeight())
+    };
+  } catch {
+    return { chaincodes: [], ledgerHeight: BigInt(0) };
+  }
+}
+
+// src/peer/PeerDiscoverySession.ts
+function endpointUsesTLS(config) {
+  return !!config.discoveryTls?.trustedRoots;
+}
+var PeerDiscoverySession = class {
+  constructor(config, discoveryCache) {
+    this.config = config;
+    this.discoveryCache = discoveryCache;
+  }
+  config;
+  discoveryCache;
+  async discover(channelName) {
+    log().debug("PeerDiscoverySession.discover() - channel:", channelName);
+    const cached = this.discoveryCache.get(channelName);
+    if (cached && !this.discoveryCache.isStale(channelName)) {
+      return Result6.ok(cached);
+    }
+    try {
+      const discovered = await new DirectDiscoveryClient(this.config).discover(channelName);
+      if (!discovered.isOk()) {
+        throw discovered.error;
+      }
+      this.discoveryCache.set(channelName, discovered.value);
+      return Result6.ok(discovered.value);
+    } catch (error) {
+      if (cached) {
+        setTimeout(() => this.discover(channelName).catch(() => {
+        }), 0);
+        return Result6.ok(cached);
+      }
+      return Result6.err(
+        new DiscoveryError({
+          message: `Discovery failed: ${error instanceof Error ? error.message : String(error)}`,
+          cause: error instanceof Error ? error : void 0
+        })
+      );
+    }
+  }
+  matchPeerByEndpointIdentity(discoveryResult, endpoint) {
+    return discoveryResult.peers.get(this.normalizePeerEndpointIdentity(endpoint)) ?? null;
+  }
+  normalizePeerEndpointIdentity(endpoint) {
+    return normalizePeerEndpointIdentity(endpoint, endpointUsesTLS(this.config));
+  }
+  usesDiscoveryTLS() {
+    return endpointUsesTLS(this.config);
+  }
+};
 
 // src/peer/PeerContract.ts
-import "fabric-network";
-import { Result as Result6 } from "better-result";
-import {
-  asBuffer,
-  getTransactionResponse
-} from "fabric-network/lib/impl/gatewayutils.js";
+import { Result as Result10 } from "better-result";
+import * as fabricProtos3 from "@hyperledger/fabric-protos";
 
 // src/peer/peerSelection.ts
-function selectSinglePeers(discovery, peerConnection, discoveryCache, options) {
-  const candidates = options?.candidates?.filter((candidate) => candidate.trim() !== "");
-  const eligible = candidates && candidates.length > 0 ? resolveCandidatePeers(discovery, peerConnection, candidates) : Array.from(discovery.peers.values());
+import { Result as Result7 } from "better-result";
+function selectSinglePeersResult(discovery, discoveryCache) {
+  const eligible = Array.from(discovery.peers.values());
   if (eligible.length === 0) {
-    throw new PeerNotFoundError({
-      peerName: candidates && candidates.length > 0 ? candidates.join(", ") : "<discovered peers>",
-      availablePeers: Array.from(discovery.peers.keys())
-    });
+    return Result7.err(
+      new PeerNotFoundError({
+        peerName: "<discovered peers>",
+        availablePeers: Array.from(discovery.peers.keys())
+      })
+    );
   }
-  const policy = options?.policy ?? "round-robin";
   const sorted = [...eligible].sort((a, b) => a.name.localeCompare(b.name));
-  const orderedPeers = policy === "random" ? randomOrder(sorted) : roundRobinOrder(sorted, discoveryCache, discovery.channelName, candidates);
-  return {
-    orderedPeers,
-    candidates
-  };
+  const orderedPeers = roundRobinOrder(sorted, discoveryCache, discovery.channelName);
+  return Result7.ok({
+    orderedPeers
+  });
 }
-function resolveCandidatePeers(discovery, peerConnection, candidates) {
-  const resolved = [];
-  const missing = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const candidate of candidates) {
-    const canonicalCandidate = peerConnection.normalizePeerEndpointIdentity(candidate);
-    if (seen.has(canonicalCandidate)) {
-      continue;
-    }
-    const peer2 = peerConnection.matchPeerByEndpointIdentity(discovery, canonicalCandidate);
-    if (!peer2) {
-      missing.push(canonicalCandidate);
-      continue;
-    }
-    resolved.push(peer2);
-    seen.add(peer2.endpoint);
-  }
-  if (missing.length > 0) {
-    throw new PeerNotFoundError({
-      peerName: missing.join(", "),
-      availablePeers: Array.from(discovery.peers.keys())
-    });
-  }
-  return resolved;
-}
-function roundRobinOrder(peers, discoveryCache, channelName, candidates) {
-  const key = `${channelName}:${peers.map((peer2) => peer2.endpoint).join("|")}:${candidates?.join("|") ?? "*"}`;
+function roundRobinOrder(peers, discoveryCache, channelName) {
+  const key = `${channelName}:${peers.map((peer5) => peer5.endpoint).join("|")}`;
   const start = discoveryCache.nextRoundRobinIndex(key, peers.length);
   return peers.slice(start).concat(peers.slice(0, start));
-}
-function randomOrder(peers) {
-  const out = [...peers];
-  for (let i = out.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
 }
 
 // src/peer/failoverEligibility.ts
@@ -1508,8 +1447,7 @@ function isKnownNonRetryable(error) {
 }
 
 // src/transactionTargeting.ts
-import { Result as Result5 } from "better-result";
-var VALID_POLICIES = /* @__PURE__ */ new Set(["round-robin", "random"]);
+import { Result as Result8 } from "better-result";
 var TransactionTargeting = class _TransactionTargeting {
   constructor(state) {
     this.state = state;
@@ -1518,30 +1456,17 @@ var TransactionTargeting = class _TransactionTargeting {
   static gatewayDefault() {
     return new _TransactionTargeting({ kind: "gateway-default" });
   }
-  static singlePeer(options = {}) {
-    if (options.policy !== void 0 && !VALID_POLICIES.has(options.policy)) {
-      return Result5.err(new ConfigurationError({
-        field: "singlePeer.policy",
-        message: `unsupported peer selection policy: ${String(options.policy)}`
-      }));
-    }
-    return Result5.ok(new _TransactionTargeting({
-      kind: "single-peer",
-      options: {
-        failover: true,
-        ...options,
-        candidates: options.candidates?.length ? [...options.candidates] : void 0
-      }
-    }));
+  static singlePeer() {
+    return Result8.ok(new _TransactionTargeting({ kind: "single-peer" }));
   }
   static endorsingPeers(peerNames) {
     if (peerNames.length === 0) {
-      return Result5.err(new ConfigurationError({
+      return Result8.err(new ConfigurationError({
         field: "endorsingPeers",
         message: "UseEndorsingPeers requires at least one peer"
       }));
     }
-    return Result5.ok(new _TransactionTargeting({
+    return Result8.ok(new _TransactionTargeting({
       kind: "endorsing-peers",
       peerNames: [...peerNames]
     }));
@@ -1552,60 +1477,313 @@ var TransactionTargeting = class _TransactionTargeting {
   isSinglePeer() {
     return this.state.kind === "single-peer";
   }
-  singlePeerOptions() {
-    return this.state.kind === "single-peer" ? this.state.options : null;
-  }
   endorsingPeerNames() {
     return this.state.kind === "endorsing-peers" ? [...this.state.peerNames] : [];
   }
   applyToPeerTransaction(transaction) {
     if (this.state.kind === "single-peer") {
-      return transaction.UseSinglePeer(this.state.options);
+      return transaction.UseSinglePeer();
     }
     if (this.state.kind === "endorsing-peers") {
-      return transaction.UseEndorsingPeers(this.state.peerNames);
+      return transaction.UseEndorsingPeers(...this.state.peerNames);
     }
-    return Result5.ok(transaction);
+    return Result8.ok(transaction);
   }
 };
 
+// src/peer/PeerProposalBuilder.ts
+import * as fabricProtos2 from "@hyperledger/fabric-protos";
+import { createHash as createHash5, randomBytes as randomBytes2 } from "crypto";
+import timestampModule2 from "google-protobuf/google/protobuf/timestamp_pb.js";
+var { Timestamp: Timestamp2 } = timestampModule2;
+function buildPeerProposal(options) {
+  const creator = serializedIdentity2(options.proposalCreator);
+  const nonce = options.nonce ? Buffer.from(options.nonce) : randomBytes2(24);
+  const transactionId = createHash5("sha256").update(Buffer.concat([nonce, creator])).digest("hex");
+  const chaincodeId = new fabricProtos2.peer.ChaincodeID();
+  chaincodeId.setName(options.chaincodeName);
+  const chaincodeInput = new fabricProtos2.peer.ChaincodeInput();
+  chaincodeInput.setArgsList([options.transactionName, ...options.args].map(asBytes2));
+  const chaincodeSpec = new fabricProtos2.peer.ChaincodeSpec();
+  chaincodeSpec.setType(fabricProtos2.peer.ChaincodeSpec.Type.GOLANG);
+  chaincodeSpec.setChaincodeId(chaincodeId);
+  chaincodeSpec.setInput(chaincodeInput);
+  const invocationSpec = new fabricProtos2.peer.ChaincodeInvocationSpec();
+  invocationSpec.setChaincodeSpec(chaincodeSpec);
+  const payload = new fabricProtos2.peer.ChaincodeProposalPayload();
+  payload.setInput(invocationSpec.serializeBinary());
+  const transientMap = payload.getTransientmapMap();
+  for (const [key, value] of Object.entries(options.transientData ?? {})) {
+    transientMap.set(key, value);
+  }
+  const chaincodeHeaderExtension = new fabricProtos2.peer.ChaincodeHeaderExtension();
+  chaincodeHeaderExtension.setChaincodeId(chaincodeId);
+  const channelHeader = new fabricProtos2.common.ChannelHeader();
+  channelHeader.setType(fabricProtos2.common.HeaderType.ENDORSER_TRANSACTION);
+  channelHeader.setChannelId(options.channelName);
+  channelHeader.setTxId(transactionId);
+  channelHeader.setTimestamp(Timestamp2.fromDate(options.timestamp ?? /* @__PURE__ */ new Date()));
+  channelHeader.setExtension$(chaincodeHeaderExtension.serializeBinary());
+  const signatureHeader = new fabricProtos2.common.SignatureHeader();
+  signatureHeader.setCreator(creator);
+  signatureHeader.setNonce(nonce);
+  const header = new fabricProtos2.common.Header();
+  header.setChannelHeader(channelHeader.serializeBinary());
+  header.setSignatureHeader(signatureHeader.serializeBinary());
+  const proposal = new fabricProtos2.peer.Proposal();
+  proposal.setHeader(header.serializeBinary());
+  proposal.setPayload(payload.serializeBinary());
+  const bytes = Buffer.from(proposal.serializeBinary());
+  return {
+    bytes,
+    digest: createHash5("sha256").update(bytes).digest(),
+    transactionId
+  };
+}
+function serializedIdentity2(proposalCreator) {
+  const identity = new fabricProtos2.msp.SerializedIdentity();
+  identity.setMspid(proposalCreator.mspId);
+  identity.setIdBytes(proposalCreator.credentials);
+  return Buffer.from(identity.serializeBinary());
+}
+function asBytes2(value) {
+  return typeof value === "string" ? Buffer.from(value) : value;
+}
+
+// src/peer/DirectPeerRuntime.ts
+import * as grpc3 from "@grpc/grpc-js";
+import commonProtoModule from "@hyperledger/fabric-protos/lib/common/common_pb.js";
+import ordererGrpcModule from "@hyperledger/fabric-protos/lib/orderer/ab_grpc_pb.js";
+import peerGrpcModule from "@hyperledger/fabric-protos/lib/peer/peer_grpc_pb.js";
+import peerProposalModule from "@hyperledger/fabric-protos/lib/peer/proposal_pb.js";
+import { Result as Result9 } from "better-result";
+var commonProto = commonProtoModule;
+var ordererGrpc = ordererGrpcModule;
+var peerGrpc = peerGrpcModule;
+var peerProposal = peerProposalModule;
+var DirectPeerRuntime = class {
+  constructor(config) {
+    this.config = config;
+  }
+  config;
+  async processProposal(peerEndpoint, proposalBytes, signature) {
+    const client = new peerGrpc.EndorserClient(
+      endpointAddress(peerEndpoint),
+      createCredentials(this.config.discoveryTls),
+      channelOptions2(peerEndpoint, this.config.discoveryTls)
+    );
+    try {
+      const request = new peerProposal.SignedProposal();
+      request.setProposalBytes(proposalBytes);
+      request.setSignature(signature);
+      const response = await processProposalWithDeadline(
+        client,
+        request,
+        this.config.timeouts?.endorse ?? 3e4
+      );
+      return adaptProposalResponse(response);
+    } finally {
+      client.close();
+    }
+  }
+  async submitEnvelope(transactionBytes, signature, transactionId) {
+    const ordererEndpoint = this.config.ordererEndpoint;
+    if (!ordererEndpoint) {
+      throw new ConfigurationError({
+        field: "ordererEndpoint",
+        message: "ordererEndpoint is required for direct endorsement submit"
+      });
+    }
+    const client = new ordererGrpc.AtomicBroadcastClient(
+      ordererEndpoint,
+      createCredentials(this.config.ordererTls),
+      channelOptions2(ordererEndpoint, this.config.ordererTls)
+    );
+    try {
+      const envelope = new commonProto.Envelope();
+      envelope.setPayload(transactionBytes);
+      envelope.setSignature(signature);
+      await broadcastEnvelopeWithDeadline(
+        client,
+        envelope,
+        transactionId,
+        this.config.timeouts?.submit ?? 3e4
+      );
+    } finally {
+      client.close();
+    }
+  }
+  async waitForCommit(channelName, transactionId) {
+    const gatewayConnection = new GatewayConnection(this.config);
+    const connected = await gatewayConnection.connect();
+    if (!connected.isOk()) {
+      return Result9.err(connected.error);
+    }
+    try {
+      return await gatewayConnection.getCommitStatus(channelName, transactionId);
+    } finally {
+      await gatewayConnection.disconnect();
+    }
+  }
+};
+async function signDirectTransactionPayload(config, transactionPayload) {
+  return Buffer.from(await config.signer(digestBytes(transactionPayload)));
+}
+function processProposalWithDeadline(client, request, timeout) {
+  return new Promise((resolve, reject) => {
+    client.processProposal(
+      request,
+      { deadline: Date.now() + timeout },
+      (error, response) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (!response) {
+          reject(new EndorsementError({ message: "empty proposal response" }));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+function adaptProposalResponse(proposalResponse) {
+  const response = proposalResponse.getResponse();
+  const endorsement = proposalResponse.getEndorsement();
+  const status = response?.getStatus() ?? 0;
+  if (status < 200 || status >= 400) {
+    throw new EndorsementError({
+      message: `proposal response was not successful, status ${status}: ${response?.getMessage() ?? ""}`
+    });
+  }
+  if (!endorsement) {
+    throw new EndorsementError({ message: "proposal response has no endorsement" });
+  }
+  return {
+    response: response ? {
+      status,
+      message: response.getMessage(),
+      payload: Buffer.from(response.getPayload_asU8())
+    } : void 0,
+    payload: Buffer.from(proposalResponse.getPayload_asU8()),
+    endorsement: {
+      endorser: Buffer.from(endorsement.getEndorser_asU8()),
+      signature: Buffer.from(endorsement.getSignature_asU8())
+    }
+  };
+}
+function broadcastEnvelopeWithDeadline(client, envelope, transactionId, timeout) {
+  return new Promise((resolve, reject) => {
+    const stream = client.broadcast({ deadline: Date.now() + timeout });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      stream.end();
+      if (error) reject(error);
+      else resolve();
+    };
+    stream.on("data", (response) => {
+      const status = response.getStatus();
+      if (status !== commonProto.Status.SUCCESS) {
+        finish(
+          new SubmitError({
+            message: `orderer rejected transaction: status=${status} info=${response.getInfo()}`,
+            transactionId
+          })
+        );
+        return;
+      }
+      finish();
+    });
+    stream.on("error", (error) => {
+      finish(
+        new SubmitError({
+          message: error instanceof Error ? error.message : String(error),
+          transactionId
+        })
+      );
+    });
+    stream.on("end", () => {
+      finish(
+        new SubmitError({
+          message: "orderer broadcast ended without response",
+          transactionId
+        })
+      );
+    });
+    stream.write(envelope);
+  });
+}
+function createCredentials(tlsOptions) {
+  if (!tlsOptions?.trustedRoots) {
+    return grpc3.credentials.createInsecure();
+  }
+  if (tlsOptions.clientKey && tlsOptions.clientCert) {
+    return grpc3.credentials.createSsl(
+      tlsOptions.trustedRoots,
+      tlsOptions.clientKey,
+      tlsOptions.clientCert
+    );
+  }
+  return grpc3.credentials.createSsl(tlsOptions.trustedRoots);
+}
+function channelOptions2(endpoint, tlsOptions) {
+  const hostname = tlsOptions?.sslTargetNameOverride ?? endpointHost2(endpoint);
+  return hostname ? { "grpc.ssl_target_name_override": hostname } : {};
+}
+function endpointAddress(endpoint) {
+  if (endpoint.startsWith("grpc://") || endpoint.startsWith("grpcs://")) {
+    const parsed = new URL(endpoint);
+    return `${parsed.hostname}:${parsed.port}`;
+  }
+  return endpoint;
+}
+function endpointHost2(endpoint) {
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    const separator = endpoint.lastIndexOf(":");
+    return separator > 0 ? endpoint.slice(0, separator) : endpoint;
+  }
+}
+
 // src/peer/PeerContract.ts
-import fabproto62 from "fabric-protos";
+function hasEndorsement(response) {
+  return !!response.endorsement;
+}
 var PeerNetwork = class {
-  gateway;
   channelName;
   timeouts;
+  config;
   peerConnection;
   discoveryCache;
-  networkPromise = null;
-  constructor(gateway3, channelName, config, peerConnection, discoveryCache) {
-    this.gateway = gateway3;
+  constructor(channelName, config, peerConnection, discoveryCache) {
     this.channelName = channelName;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
-    this.networkPromise = this.gateway.getNetwork(channelName);
   }
   async getContract(chaincodeName) {
-    const network = await this.networkPromise;
-    const contract = network.getContract(chaincodeName);
     return new PeerContract(
-      contract,
       chaincodeName,
       this.timeouts,
+      this.config,
       this.peerConnection,
       this.discoveryCache,
       this.channelName
     );
   }
 };
-async function NewPeerSignedProposal(gateway3, config, message) {
+async function NewPeerSignedProposal(peerConnection, config, message) {
   const decoded = decodePeerSignedMessage(message);
   if (!decoded.isOk()) {
-    return Result6.err(decoded.error);
+    return Result10.err(decoded.error);
   }
   if (!decoded.value.routing || decoded.value.routing.mode === "gateway-default") {
-    return Result6.err(
+    return Result10.err(
       new OfflineSigningError({
         field: "routing",
         message: "peer signed proposal requires peer routing"
@@ -1614,23 +1792,34 @@ async function NewPeerSignedProposal(gateway3, config, message) {
   }
   const routingPeers = normalizeSnapshotPeerEndpoints(
     decoded.value.routing.peers,
-    !!config.tlsOptions?.trustedRoots
+    !!config.discoveryTls?.trustedRoots
   );
   if (!routingPeers.isOk()) {
-    return Result6.err(routingPeers.error);
+    return Result10.err(routingPeers.error);
+  }
+  if (decoded.value.routing.mode === "single-peer" && routingPeers.value.length !== 1) {
+    return Result10.err(
+      new OfflineSigningError({
+        field: "routing.peers",
+        message: "single-peer routing requires exactly one peer endpoint"
+      })
+    );
   }
   const routing = { ...decoded.value.routing, peers: routingPeers.value };
   try {
-    const proposal = fabproto62.protos.Proposal.decode(decoded.value.bytes);
-    const header = fabproto62.common.Header.decode(proposal.header);
-    const channelHeader = fabproto62.common.ChannelHeader.decode(
-      header.channel_header
+    const proposal = fabricProtos3.peer.Proposal.deserializeBinary(
+      decoded.value.bytes
     );
-    const channelName = channelHeader.channel_id;
-    const network = await gateway3.getNetwork(channelName);
-    return Result6.ok(
+    const header = fabricProtos3.common.Header.deserializeBinary(
+      proposal.getHeader_asU8()
+    );
+    const channelHeader = fabricProtos3.common.ChannelHeader.deserializeBinary(
+      header.getChannelHeader_asU8()
+    );
+    const channelName = channelHeader.getChannelId();
+    return Result10.ok(
       new PeerSignedProposal(
-        network,
+        peerConnection,
         channelName,
         config,
         decoded.value.bytes,
@@ -1639,7 +1828,7 @@ async function NewPeerSignedProposal(gateway3, config, message) {
       )
     );
   } catch (error) {
-    return Result6.err(
+    return Result10.err(
       new ConfigurationError({
         message: error instanceof Error ? error.message : String(error)
       })
@@ -1647,16 +1836,16 @@ async function NewPeerSignedProposal(gateway3, config, message) {
   }
 }
 var PeerContract = class {
-  contract;
   chaincodeName;
   timeouts;
+  config;
   peerConnection;
   discoveryCache;
   channelName;
-  constructor(contract, chaincodeName, timeouts, peerConnection, discoveryCache, channelName) {
-    this.contract = contract;
+  constructor(chaincodeName, timeouts, config, peerConnection, discoveryCache, channelName) {
     this.chaincodeName = chaincodeName;
     this.timeouts = timeouts;
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
@@ -1681,8 +1870,8 @@ var PeerContract = class {
     return new PeerTransaction(
       name,
       this.chaincodeName,
-      this.contract,
       this.timeouts,
+      this.config,
       this.peerConnection,
       this.discoveryCache,
       this.channelName
@@ -1692,19 +1881,19 @@ var PeerContract = class {
 var PeerTransaction = class {
   name;
   chaincodeName;
-  contract;
   timeouts;
+  config;
   peerConnection;
   discoveryCache;
   channelName;
   targeting = TransactionTargeting.gatewayDefault();
   transientData = {};
   proposalCreator;
-  constructor(name, chaincodeName, contract, timeouts, peerConnection, discoveryCache, channelName) {
+  constructor(name, chaincodeName, timeouts, config, peerConnection, discoveryCache, channelName) {
     this.name = name;
     this.chaincodeName = chaincodeName;
-    this.contract = contract;
     this.timeouts = timeouts;
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
@@ -1715,21 +1904,28 @@ var PeerTransaction = class {
   getChaincodeName() {
     return this.chaincodeName;
   }
-  UseSinglePeer(options = {}) {
-    const targeting = TransactionTargeting.singlePeer(options);
+  UseSinglePeer() {
+    const targeting = TransactionTargeting.singlePeer();
     if (!targeting.isOk()) {
-      return Result6.err(targeting.error);
+      return Result10.err(targeting.error);
     }
     this.targeting = targeting.value;
-    return Result6.ok(this);
+    return Result10.ok(this);
   }
-  UseEndorsingPeers(peerNames) {
-    const targeting = TransactionTargeting.endorsingPeers(peerNames);
+  UseEndorsingPeers(...peerNames) {
+    const canonicalPeerNames = dedupePeerEndpointInputsResult(
+      peerNames,
+      this.peerConnection.usesDiscoveryTLS()
+    );
+    if (!canonicalPeerNames.isOk()) {
+      return Result10.err(canonicalPeerNames.error);
+    }
+    const targeting = TransactionTargeting.endorsingPeers(canonicalPeerNames.value);
     if (!targeting.isOk()) {
-      return Result6.err(targeting.error);
+      return Result10.err(targeting.error);
     }
     this.targeting = targeting.value;
-    return Result6.ok(this);
+    return Result10.ok(this);
   }
   SetTransientData(transientData) {
     this.transientData = copyTransientData2(transientData);
@@ -1742,13 +1938,13 @@ var PeerTransaction = class {
   async Submit(...args) {
     const submittedResult = await this.SubmitAsync(...args);
     if (!submittedResult.isOk()) {
-      return Result6.err(submittedResult.error);
+      return Result10.err(submittedResult.error);
     }
     const commitStatus = await submittedResult.value.WaitForCommit();
     if (!commitStatus.isOk()) {
-      return Result6.err(commitStatus.error);
+      return Result10.err(commitStatus.error);
     }
-    return Result6.ok(
+    return Result10.ok(
       new PeerCommitResult(submittedResult.value, commitStatus.value)
     );
   }
@@ -1760,12 +1956,9 @@ var PeerTransaction = class {
       this.chaincodeName
     );
     const normalizedArgs = normalizeArgs2(args);
-    return Result6.tryPromise({
+    return Result10.tryPromise({
       try: async () => {
-        const submitted = this.targeting.isSinglePeer() ? await this.submitAsyncSinglePeer(normalizedArgs) : await this.submitAsyncInternal(
-          await this.createPreparedTransaction(),
-          normalizedArgs
-        );
+        const submitted = this.targeting.isSinglePeer() ? await this.submitAsyncSinglePeer(normalizedArgs) : await this.submitAsyncEndorsingPeers(normalizedArgs);
         return new PeerSubmittedTx(
           submitted.result,
           submitted.transactionId,
@@ -1778,13 +1971,13 @@ var PeerTransaction = class {
   async Evaluate(...args) {
     const normalizedArgs = normalizeArgs2(args);
     try {
-      const result = this.targeting.isSinglePeer() ? await this.evaluateSinglePeer(normalizedArgs) : await (await this.createPreparedTransaction()).evaluate(...normalizedArgs);
-      return Result6.ok(Buffer.from(result));
+      const result = this.targeting.isSinglePeer() ? await this.evaluateSinglePeer(normalizedArgs) : await this.evaluateEndorsingPeers(normalizedArgs);
+      return Result10.ok(Buffer.from(result));
     } catch (error) {
       if (error instanceof SinglePeerExecutionError || error instanceof PeerNotFoundError || error instanceof DiscoveryError || error instanceof TimeoutError) {
-        return Result6.err(error);
+        return Result10.err(error);
       }
-      return Result6.err(
+      return Result10.err(
         new EvaluationError({
           message: error.message
         })
@@ -1795,7 +1988,7 @@ var PeerTransaction = class {
     const normalizedArgs = normalizeArgs2(args);
     try {
       if (!this.proposalCreator) {
-        return Result6.err(
+        return Result10.err(
           new ConfigurationError({
             field: "proposalCreator",
             message: "proposalCreator is required to build an unsigned proposal for offline signing"
@@ -1803,87 +1996,43 @@ var PeerTransaction = class {
         );
       }
       if (this.targeting.isSinglePeer()) {
-        const selected = (await this.resolveSinglePeerEndorsers())[0];
+        const selected = (await this.resolveSinglePeerTargets())[0];
         if (!selected) {
           throw new PeerNotFoundError({
             peerName: "<single-peer>",
             availablePeers: []
           });
         }
-        const transaction2 = await this.createPreparedTransactionForPeers([
-          selected.endorser
-        ]);
-        return Result6.ok(
-          this.buildUnsignedProposal(transaction2, normalizedArgs, {
+        return Result10.ok(
+          this.buildUnsignedProposal(normalizedArgs, {
             mode: "single-peer",
-            peers: [selected.peerName]
+            peers: [selected.endpoint]
           })
         );
       }
       const endorsingPeerNames = this.targeting.endorsingPeerNames();
-      const transaction = await this.createPreparedTransaction();
       const peers = endorsingPeerNames.length > 0 ? await this.resolvedEndorsingPeerSnapshot(endorsingPeerNames) : [];
       const routing = peers.length > 0 ? { mode: "endorsing-peers", peers } : { mode: "gateway-default" };
-      return Result6.ok(
-        this.buildUnsignedProposal(transaction, normalizedArgs, routing)
-      );
+      return Result10.ok(this.buildUnsignedProposal(normalizedArgs, routing));
     } catch (error) {
-      return Result6.err(this.mapSubmitError(error));
+      return Result10.err(this.mapSubmitError(error));
     }
   }
-  buildUnsignedProposal(transaction, stringArgs, routing) {
-    const tx = transaction;
-    const network = tx.contract.network;
-    const channel = network.getChannel();
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    const proposalBuildRequest = tx.newBuildProposalRequest(stringArgs);
-    const identityContext = createProposalIdentityContext(
-      tx.identityContext,
-      this.proposalCreator
-    );
-    const bytes = Buffer.from(
-      endorsement.build(identityContext, proposalBuildRequest)
-    );
+  buildUnsignedProposal(stringArgs, routing) {
+    const proposal = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData2(this.transientData),
+      proposalCreator: this.proposalCreator
+    });
     return new PeerUnsignedProposal(
-      bytes,
-      digestBytes(bytes),
-      endorsement.getTransactionId(),
+      proposal.bytes,
+      proposal.digest,
+      proposal.transactionId,
       routing
     );
-  }
-  async createPreparedTransaction() {
-    const transaction = this.contract.createTransaction(this.name);
-    if (Object.keys(this.transientData).length > 0) {
-      transaction.setTransient(copyTransientData2(this.transientData));
-    }
-    const endorsingPeerNames = this.targeting.endorsingPeerNames();
-    if (endorsingPeerNames.length > 0) {
-      const discoveryResult = await this.ensureDiscovery();
-      if (!discoveryResult.isOk()) {
-        throw discoveryResult.error;
-      }
-      const endorsingPeers = this.matchPeersToEndorsers(
-        discoveryResult.value,
-        endorsingPeerNames
-      );
-      if (!endorsingPeers.isOk()) {
-        throw endorsingPeers.error;
-      }
-      if (endorsingPeers.value.length > 0) {
-        transaction.setEndorsingPeers(endorsingPeers.value);
-      }
-    }
-    return transaction;
-  }
-  async createPreparedTransactionForPeers(peers) {
-    const transaction = this.contract.createTransaction(this.name);
-    if (Object.keys(this.transientData).length > 0) {
-      transaction.setTransient(copyTransientData2(this.transientData));
-    }
-    if (peers.length > 0) {
-      transaction.setEndorsingPeers(peers);
-    }
-    return transaction;
   }
   async resolvedEndorsingPeerSnapshot(peerNames) {
     const discoveryResult = await this.ensureDiscovery();
@@ -1894,51 +2043,62 @@ var PeerTransaction = class {
     if (!peerInfos.isOk()) {
       throw peerInfos.error;
     }
-    return peerInfos.value.map((peer2) => peer2.endpoint);
+    return peerInfos.value.map((peer5) => peer5.endpoint);
   }
-  async resolveSinglePeerEndorsers() {
+  async resolveSinglePeerTargets() {
     const discoveryResult = await this.ensureDiscovery();
     if (!discoveryResult.isOk()) {
       throw discoveryResult.error;
     }
-    const selection = selectSinglePeers(
+    const selection = selectSinglePeersResult(
       discoveryResult.value,
-      this.peerConnection,
-      this.discoveryCache,
-      this.targeting.singlePeerOptions() ?? void 0
+      this.discoveryCache
     );
-    const endorsers = this.matchPeerInfosToEndorsers(
-      discoveryResult.value,
-      selection.orderedPeers
-    );
-    if (!endorsers.isOk()) {
-      throw endorsers.error;
+    if (!selection.isOk()) {
+      throw selection.error;
     }
-    return endorsers.value;
+    return selection.value.orderedPeers;
+  }
+  async resolveEndorsingPeerTargets() {
+    const discoveryResult = await this.ensureDiscovery();
+    if (!discoveryResult.isOk()) {
+      throw discoveryResult.error;
+    }
+    const peerInfos = this.resolvePeerInfos(
+      discoveryResult.value,
+      this.targeting.endorsingPeerNames()
+    );
+    if (!peerInfos.isOk()) {
+      throw peerInfos.error;
+    }
+    return peerInfos.value;
   }
   async submitAsyncSinglePeer(stringArgs) {
     return this.executeSinglePeer("submitAsync", async (selected) => {
-      const transaction = await this.createPreparedTransactionForPeers([
-        selected.endorser
-      ]);
-      return this.submitAsyncInternal(transaction, stringArgs);
+      return this.submitAsyncToSinglePeer(selected, stringArgs);
     });
+  }
+  async submitAsyncEndorsingPeers(stringArgs) {
+    return this.submitAsyncToEndorsers(
+      await this.resolveEndorsingPeerTargets(),
+      stringArgs
+    );
   }
   async evaluateSinglePeer(stringArgs) {
     return this.executeSinglePeer("evaluate", async (selected) => {
-      const transaction = await this.createPreparedTransactionForPeers([
-        selected.endorser
-      ]);
-      return Buffer.from(
-        await transaction.evaluate(...stringArgs)
-      );
+      return this.evaluateSinglePeerTarget(selected, stringArgs);
     });
   }
+  async evaluateEndorsingPeers(stringArgs) {
+    return this.evaluateEndorsers(
+      await this.resolveEndorsingPeerTargets(),
+      stringArgs
+    );
+  }
   async executeSinglePeer(operation, execute) {
-    const peers = await this.resolveSinglePeerEndorsers();
+    const peers = await this.resolveSinglePeerTargets();
     const attempts = [];
-    const failover = this.targeting.singlePeerOptions()?.failover ?? true;
-    const peersToTry = failover ? peers : peers.slice(0, 1);
+    const peersToTry = peers;
     for (let index = 0; index < peersToTry.length; index += 1) {
       const selected = peersToTry[index];
       try {
@@ -1946,14 +2106,14 @@ var PeerTransaction = class {
       } catch (error) {
         const decision = classifyFailover(error);
         attempts.push({
-          peer: selected.peerName,
+          peer: selected.endpoint,
           cause: error instanceof Error ? error.message : String(error),
           failover: decision
         });
         if (!decision.eligible) {
           throw error;
         }
-        if (!failover || index === peersToTry.length - 1) {
+        if (index === peersToTry.length - 1) {
           throw this.singlePeerExecutionError(operation, peers, attempts);
         }
         const next = peersToTry[index + 1];
@@ -1963,8 +2123,8 @@ var PeerTransaction = class {
           channel: this.channelName,
           chaincode: this.chaincodeName,
           transaction: this.name,
-          failedPeer: selected.peerName,
-          nextPeer: next.peerName,
+          failedPeer: selected.endpoint,
+          nextPeer: next.endpoint,
           attempt: index + 1,
           maxAttempts: peersToTry.length,
           reason: decision.reason,
@@ -1974,222 +2134,118 @@ var PeerTransaction = class {
     }
     throw this.singlePeerExecutionError(operation, peers, attempts);
   }
-  async submitAsyncInternal(transaction, stringArgs) {
-    const tx = transaction;
-    const network = tx.contract.network;
-    const channel = network.getChannel();
-    const transactionOptions = tx.gatewayOptions.eventHandlerOptions ?? {};
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    const proposalBuildRequest = tx.newBuildProposalRequest(stringArgs);
-    endorsement.build(tx.identityContext, proposalBuildRequest);
-    endorsement.sign(tx.identityContext);
-    const proposalSendRequest = {};
-    if (Number.isInteger(transactionOptions.endorseTimeout)) {
-      proposalSendRequest.requestTimeout = transactionOptions.endorseTimeout * 1e3;
-    }
-    if (tx.endorsingPeers) {
-      proposalSendRequest.targets = tx.endorsingPeers;
-    } else if (tx.contract.network.discoveryService) {
-      proposalSendRequest.handler = await tx.contract.getDiscoveryHandler();
-      if (tx.endorsingOrgs) {
-        proposalSendRequest.requiredOrgs = tx.endorsingOrgs;
-      }
-    } else if (tx.endorsingOrgs) {
-      const targets = tx.endorsingOrgs.map((mspid) => channel.getEndorsers(mspid)).flat();
-      proposalSendRequest.targets = targets;
-    } else {
-      proposalSendRequest.targets = channel.getEndorsers();
-    }
-    const proposalResponse = await endorsement.send(proposalSendRequest);
-    const result = this.getResponsePayload(proposalResponse);
-    const transactionId = endorsement.getTransactionId();
-    const peers = tx.endorsingPeers ?? channel.getEndorsers();
-    const commitWaiter = await this.createCommitWaiter(
-      network,
-      peers,
-      transactionId
+  async submitAsyncToSinglePeer(peer5, stringArgs) {
+    const prepared = await this.sendDirectSinglePeerProposal(peer5, stringArgs);
+    const result = getPeerProposalPayload({
+      responses: [prepared.proposalResponse]
+    });
+    const transactionPayload = buildPeerTransactionPayload(prepared.proposal, [
+      prepared.proposalResponse
+    ]);
+    const runtime = new DirectPeerRuntime(this.config);
+    await runtime.submitEnvelope(
+      transactionPayload,
+      await signDirectTransactionPayload(this.config, transactionPayload),
+      prepared.transactionId
     );
-    try {
-      const commit = endorsement.newCommit();
-      commit.build(tx.identityContext);
-      commit.sign(tx.identityContext);
-      const commitSendRequest = {};
-      if (Number.isInteger(transactionOptions.commitTimeout)) {
-        commitSendRequest.requestTimeout = transactionOptions.commitTimeout * 1e3;
-      }
-      if (proposalSendRequest.handler) {
-        commitSendRequest.handler = proposalSendRequest.handler;
-      } else {
-        commitSendRequest.targets = channel.getCommitters();
-      }
-      const commitResponse = await commit.send(commitSendRequest);
-      if (commitResponse.status !== "SUCCESS") {
-        const message = `Failed to commit transaction ${transactionId}, orderer response status: ${commitResponse.status}`;
-        commitWaiter.fail(
-          new SubmitError({
-            message,
-            transactionId
-          })
-        );
-        throw new SubmitError({
-          message,
-          transactionId
-        });
-      }
-    } catch (error) {
-      commitWaiter.fail(error);
-      throw error;
-    }
     return {
       result,
-      transactionId,
-      waitForCommit: commitWaiter.waitForCommit
+      transactionId: prepared.transactionId,
+      waitForCommit: () => runtime.waitForCommit(this.channelName, prepared.transactionId)
     };
   }
-  async createCommitWaiter(network, peers, transactionId) {
-    let settled = false;
-    let timeoutHandle;
-    let resolvePromise;
-    let rejectPromise;
-    const cleanup = (listener2) => {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
+  async evaluateSinglePeerTarget(peer5, stringArgs) {
+    const prepared = await this.sendDirectSinglePeerProposal(peer5, stringArgs);
+    return getPeerProposalPayload({ responses: [prepared.proposalResponse] });
+  }
+  async sendDirectSinglePeerProposal(peer5, stringArgs) {
+    const built = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData2(this.transientData),
+      proposalCreator: {
+        mspId: this.config.identity.mspId,
+        credentials: this.config.identity.credentials
       }
-      try {
-        network.removeCommitListener(listener2);
-      } catch {
-      }
-    };
-    const commitPromise = new Promise((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
     });
-    const listener = (error, event) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup(listener);
-      if (error) {
-        rejectPromise?.(
-          new CommitError({
-            message: error.message,
-            transactionId
-          })
-        );
-        return;
-      }
-      if (!event) {
-        rejectPromise?.(
-          new CommitError({
-            message: "Missing commit event",
-            transactionId
-          })
-        );
-        return;
-      }
-      const blockEvent = event.getBlockEvent();
-      const status = {
-        blockNumber: BigInt(blockEvent.blockNumber.toString()),
-        status: event.isValid ? "VALID" : "INVALID",
-        transactionId
-      };
-      if (!event.isValid) {
-        rejectPromise?.(
-          new CommitError({
-            message: "transaction committed with invalid validation code",
-            transactionId,
-            status: "INVALID"
-          })
-        );
-        return;
-      }
-      resolvePromise?.(status);
-    };
-    await network.addCommitListener(listener, peers, transactionId);
-    timeoutHandle = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup(listener);
-      rejectPromise?.(
-        new TimeoutError({
-          message: `Commit event listener timeout for transaction ${transactionId}`,
-          operation: "commit",
-          timeout: this.timeouts.commit
-        })
-      );
-    }, this.timeouts.commit);
+    const signature = Buffer.from(await this.config.signer(built.digest));
     return {
-      waitForCommit: async () => Result6.tryPromise({
-        try: async () => commitPromise,
-        catch: (error) => this.mapCommitError(error, transactionId)
-      }),
-      fail: (error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup(listener);
-        rejectPromise?.(error);
+      proposal: fabricProtos3.peer.Proposal.deserializeBinary(built.bytes),
+      proposalResponse: await new DirectPeerRuntime(
+        this.config
+      ).processProposal(peer5.endpoint, built.bytes, signature),
+      transactionId: built.transactionId
+    };
+  }
+  async submitAsyncToEndorsers(peers, stringArgs) {
+    const prepared = await this.sendDirectExplicitProposal(peers, stringArgs);
+    const result = getPeerProposalPayload({
+      responses: prepared.proposalResponses
+    });
+    const transactionPayload = buildPeerTransactionPayload(
+      prepared.proposal,
+      prepared.proposalResponses
+    );
+    const runtime = new DirectPeerRuntime(this.config);
+    await runtime.submitEnvelope(
+      transactionPayload,
+      await signDirectTransactionPayload(this.config, transactionPayload),
+      prepared.transactionId
+    );
+    return {
+      result,
+      transactionId: prepared.transactionId,
+      waitForCommit: () => runtime.waitForCommit(this.channelName, prepared.transactionId)
+    };
+  }
+  async evaluateEndorsers(peers, stringArgs) {
+    const prepared = await this.sendDirectExplicitProposal(peers, stringArgs);
+    return getPeerProposalPayload({ responses: prepared.proposalResponses });
+  }
+  async sendDirectExplicitProposal(peers, stringArgs) {
+    const built = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData2(this.transientData),
+      proposalCreator: {
+        mspId: this.config.identity.mspId,
+        credentials: this.config.identity.credentials
       }
+    });
+    const signature = Buffer.from(await this.config.signer(built.digest));
+    const runtime = new DirectPeerRuntime(this.config);
+    const settled = await Promise.all(
+      peers.map(async (peer5) => ({
+        peer: peer5,
+        response: await runtime.processProposal(
+          peer5.endpoint,
+          built.bytes,
+          signature
+        )
+      }))
+    );
+    const proposalResponses = settled.map((item) => item.response);
+    validateExplicitProposalResponses(proposalResponses);
+    return {
+      proposal: fabricProtos3.peer.Proposal.deserializeBinary(built.bytes),
+      proposalResponses,
+      transactionId: built.transactionId
     };
   }
   async ensureDiscovery() {
     const discovery = this.discoveryCache.get(this.channelName);
     if (discovery) {
-      return Result6.ok(discovery);
+      return Result10.ok(discovery);
     }
     const result = await this.peerConnection.discover(this.channelName);
     if (!result.isOk()) {
-      return Result6.err(result.error);
+      return Result10.err(result.error);
     }
-    return Result6.ok(result.value);
-  }
-  matchPeersToEndorsers(discovery, peerNames) {
-    const endorsers = [];
-    const availablePeers = Array.from(discovery.peers.keys());
-    const network = this.contract.network;
-    const channel = network?.getChannel?.() || network?.channel;
-    if (!channel) {
-      return Result6.err(
-        new PeerNotFoundError({
-          peerName: peerNames.join(", "),
-          availablePeers
-        })
-      );
-    }
-    const peerInfos = this.resolvePeerInfos(discovery, peerNames);
-    if (!peerInfos.isOk()) {
-      return Result6.err(peerInfos.error);
-    }
-    const notFound = [];
-    for (const peerInfo of peerInfos.value) {
-      const endorser = channel.getEndorser?.(peerInfo.endpoint);
-      if (endorser) {
-        endorsers.push(endorser);
-        continue;
-      }
-      const allEndorsers = channel.getEndorsers?.() || [];
-      const matched = allEndorsers.find(
-        (candidate) => candidate.name === peerInfo.endpoint
-      );
-      if (matched) {
-        endorsers.push(matched);
-      } else {
-        notFound.push(peerInfo.endpoint);
-      }
-    }
-    if (notFound.length > 0) {
-      return Result6.err(
-        new PeerNotFoundError({
-          peerName: notFound.join(", "),
-          availablePeers
-        })
-      );
-    }
-    return Result6.ok(endorsers);
+    return Result10.ok(result.value);
   }
   resolvePeerInfos(discovery, peerNames) {
     const peerInfos = [];
@@ -2212,50 +2268,14 @@ var PeerTransaction = class {
       peerInfos.push(peerInfo);
     }
     if (notFound.length > 0) {
-      return Result6.err(
+      return Result10.err(
         new PeerNotFoundError({
           peerName: notFound.join(", "),
           availablePeers: Array.from(discovery.peers.keys())
         })
       );
     }
-    return Result6.ok(peerInfos);
-  }
-  matchPeerInfosToEndorsers(discovery, peers) {
-    const endorsers = [];
-    const notFound = [];
-    const availablePeers = Array.from(discovery.peers.keys());
-    const network = this.contract.network;
-    const channel = network?.getChannel?.() || network?.channel;
-    if (!channel) {
-      return Result6.err(
-        new PeerNotFoundError({
-          peerName: peers.map((peer2) => peer2.name).join(", "),
-          availablePeers
-        })
-      );
-    }
-    const allEndorsers = channel.getEndorsers?.() || [];
-    for (const peer2 of peers) {
-      const endpointWithoutScheme = stripGrpcScheme(peer2.endpoint);
-      const endorser = channel.getEndorser?.(peer2.endpoint) ?? channel.getEndorser?.(endpointWithoutScheme) ?? allEndorsers.find(
-        (candidate) => candidate.name === peer2.endpoint || candidate.name === endpointWithoutScheme || candidate.endpoint === peer2.endpoint || candidate.endpoint === endpointWithoutScheme
-      );
-      if (endorser) {
-        endorsers.push({ peerName: peer2.endpoint, endorser });
-      } else {
-        notFound.push(peer2.endpoint);
-      }
-    }
-    if (notFound.length > 0) {
-      return Result6.err(
-        new PeerNotFoundError({
-          peerName: notFound.join(", "),
-          availablePeers
-        })
-      );
-    }
-    return Result6.ok(endorsers);
+    return Result10.ok(peerInfos);
   }
   singlePeerExecutionError(operation, eligiblePeers, attempts) {
     return new SinglePeerExecutionError({
@@ -2264,34 +2284,9 @@ var PeerTransaction = class {
       channel: this.channelName,
       chaincode: this.chaincodeName,
       transaction: this.name,
-      candidates: this.targeting.singlePeerOptions()?.candidates,
-      eligiblePeers: eligiblePeers.map((peer2) => peer2.peerName),
+      eligiblePeers: eligiblePeers.map((peer5) => peer5.endpoint),
       attempts
     });
-  }
-  getResponsePayload(proposalResponse) {
-    const validEndorsementResponse = proposalResponse.responses.find(
-      (endorsementResponse) => endorsementResponse.endorsement
-    );
-    if (!validEndorsementResponse) {
-      const errorInfos = [];
-      for (const error of proposalResponse.errors ?? []) {
-        errorInfos.push(
-          `peer=${error?.connection?.name ?? "unknown"}, status=grpc, message=${error?.message ?? "unknown error"}`
-        );
-      }
-      for (const response of proposalResponse.responses ?? []) {
-        errorInfos.push(
-          `peer=${response?.connection?.name ?? "unknown"}, status=${response?.response?.status ?? "unknown"}, message=${response?.response?.message ?? "unknown error"}`
-        );
-      }
-      throw new EndorsementError({
-        message: errorInfos.length > 0 ? `No valid responses from any peers. Errors:
-    ${errorInfos.join("\n    ")}` : "No valid responses from any peers"
-      });
-    }
-    const payload = getTransactionResponse(validEndorsementResponse).payload;
-    return asBuffer(payload);
   }
   mapSubmitError(error) {
     if (error instanceof EndorsementError || error instanceof SubmitError || error instanceof TimeoutError || error instanceof SinglePeerExecutionError || error instanceof PeerNotFoundError || error instanceof DiscoveryError || error instanceof ConfigurationError) {
@@ -2306,22 +2301,6 @@ var PeerTransaction = class {
     }
     return new SubmitError({
       message: error.message
-    });
-  }
-  mapCommitError(error, transactionId) {
-    if (error instanceof CommitError || error instanceof TimeoutError) {
-      return error;
-    }
-    if (error.message?.includes("timeout") || error.message?.includes("Timeout") || error.message?.includes("TIMEOUT")) {
-      return new TimeoutError({
-        message: error.message,
-        operation: "commit",
-        timeout: this.timeouts.commit
-      });
-    }
-    return new CommitError({
-      message: error.message,
-      transactionId
     });
   }
 };
@@ -2398,41 +2377,35 @@ var PeerUnsignedProposal = class {
   }
 };
 var PeerSignedProposal = class {
-  network;
+  peerConnection;
   channelName;
   config;
-  timeouts;
   bytes;
   signature;
   routing;
   transactionId;
-  chaincodeName;
   proposal;
-  header;
-  constructor(network, channelName, config, bytes, signature, routing) {
-    this.network = network;
+  constructor(peerConnection, channelName, config, bytes, signature, routing) {
+    this.peerConnection = peerConnection;
     this.channelName = channelName;
     this.config = config;
-    this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
     this.bytes = Buffer.from(bytes);
     this.signature = Buffer.from(signature);
     this.routing = {
       mode: routing.mode,
       peers: uniqueCanonicalPeerEndpoints(
         routing.peers,
-        !!config.tlsOptions?.trustedRoots
+        !!config.discoveryTls?.trustedRoots
       )
     };
-    this.proposal = fabproto62.protos.Proposal.decode(this.bytes);
-    this.header = fabproto62.common.Header.decode(this.proposal.header);
-    const channelHeader = fabproto62.common.ChannelHeader.decode(
-      this.header.channel_header
+    this.proposal = fabricProtos3.peer.Proposal.deserializeBinary(this.bytes);
+    const header = fabricProtos3.common.Header.deserializeBinary(
+      this.proposal.getHeader_asU8()
     );
-    const extension = fabproto62.protos.ChaincodeHeaderExtension.decode(
-      channelHeader.extension
+    const channelHeader = fabricProtos3.common.ChannelHeader.deserializeBinary(
+      header.getChannelHeader_asU8()
     );
-    this.transactionId = channelHeader.tx_id;
-    this.chaincodeName = extension.chaincode_id?.name ?? "";
+    this.transactionId = channelHeader.getTxId();
   }
   TransactionID() {
     return this.transactionId;
@@ -2441,14 +2414,14 @@ var PeerSignedProposal = class {
     try {
       const proposalResponse = await this.sendProposal();
       const payload = getPeerProposalPayload(proposalResponse);
-      const txPayload = this.buildTransactionPayload(
+      const txPayload = buildPeerTransactionPayload(
+        this.proposal,
         proposalResponse.responses
       );
-      return Result6.ok(
+      return Result10.ok(
         new PeerEndorsedTransaction(
-          this.network,
           this.config,
-          this.timeouts,
+          this.channelName,
           txPayload,
           payload,
           this.transactionId
@@ -2456,9 +2429,9 @@ var PeerSignedProposal = class {
       );
     } catch (error) {
       if (error instanceof EndorsementError || error instanceof PeerNotFoundError || error instanceof DiscoveryError || error instanceof ConfigurationError) {
-        return Result6.err(error);
+        return Result10.err(error);
       }
-      return Result6.err(
+      return Result10.err(
         new EndorsementError({
           message: error instanceof Error ? error.message : String(error)
         })
@@ -2468,12 +2441,12 @@ var PeerSignedProposal = class {
   async Evaluate() {
     try {
       const proposalResponse = await this.sendProposal();
-      return Result6.ok(getPeerProposalPayload(proposalResponse));
+      return Result10.ok(getPeerProposalPayload(proposalResponse));
     } catch (error) {
       if (error instanceof PeerNotFoundError || error instanceof DiscoveryError || error instanceof ConfigurationError) {
-        return Result6.err(error);
+        return Result10.err(error);
       }
-      return Result6.err(
+      return Result10.err(
         new EvaluationError({
           message: error instanceof Error ? error.message : String(error)
         })
@@ -2481,25 +2454,23 @@ var PeerSignedProposal = class {
     }
   }
   async sendProposal() {
-    const channel = this.network.getChannel();
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    endorsement._reset();
-    endorsement._payload = this.bytes;
-    endorsement._signature = this.signature;
-    endorsement._action.proposal = this.proposal;
-    endorsement._action.header = this.header;
-    endorsement._action.transactionId = this.transactionId;
-    const targets = await this.resolveEndorsers(channel);
-    const proposalResponse = await endorsement.send({ targets });
-    endorsement._proposalResponses = proposalResponse.responses;
-    endorsement._proposalErrors = proposalResponse.errors;
-    return proposalResponse;
+    const endpoints = await this.resolveSnapshottedPeerEndpoints();
+    const runtime = new DirectPeerRuntime(this.config);
+    const responses = await Promise.all(
+      endpoints.map(
+        (endpoint) => runtime.processProposal(endpoint, this.bytes, this.signature)
+      )
+    );
+    if (this.routing.mode === "endorsing-peers") {
+      validateExplicitProposalResponses(responses);
+    }
+    return { responses, errors: [] };
   }
-  async resolveEndorsers(channel) {
+  async resolveSnapshottedPeerEndpoints() {
     const discovery = await discoveredPeerEndpoints(
-      this.network,
+      this.peerConnection,
       this.channelName,
-      !!this.config.tlsOptions?.trustedRoots
+      !!this.config.discoveryTls?.trustedRoots
     );
     const missingFromDiscovery = this.routing.peers.filter(
       (endpoint) => !discovery.has(endpoint)
@@ -2510,74 +2481,18 @@ var PeerSignedProposal = class {
         availablePeers: Array.from(discovery)
       });
     }
-    const allEndorsers = channel.getEndorsers?.() ?? [];
-    const targets = this.routing.peers.map((endpoint) => {
-      const endorserName = stripGrpcScheme(endpoint);
-      return channel.getEndorser?.(endpoint) ?? channel.getEndorser?.(endorserName) ?? allEndorsers.find(
-        (candidate) => candidate.name === endpoint || candidate.name === endorserName
-      );
-    }).filter(Boolean);
-    if (targets.length !== this.routing.peers.length) {
-      throw new PeerNotFoundError({
-        peerName: this.routing.peers.join(", "),
-        availablePeers: allEndorsers.map(
-          (endorser) => endorser.name ?? "<unknown>"
-        )
-      });
-    }
-    return targets;
-  }
-  buildTransactionPayload(proposalResponses) {
-    const validResponses = proposalResponses.filter(
-      (response) => response?.endorsement
-    );
-    if (validResponses.length === 0) {
-      throw new EndorsementError({ message: "No valid endorsements found" });
-    }
-    const endorsements = validResponses.map((response) => response.endorsement);
-    const proposalResponse = validResponses[0];
-    const chaincodeEndorsedAction = fabproto62.protos.ChaincodeEndorsedAction.create({
-      proposal_response_payload: proposalResponse.payload,
-      endorsements
-    });
-    const originalProposalPayload = fabproto62.protos.ChaincodeProposalPayload.decode(this.proposal.payload);
-    const proposalPayloadNoTransient = fabproto62.protos.ChaincodeProposalPayload.create({
-      input: originalProposalPayload.input
-    });
-    const proposalPayloadNoTransientBytes = fabproto62.protos.ChaincodeProposalPayload.encode(
-      proposalPayloadNoTransient
-    ).finish();
-    const actionPayload = fabproto62.protos.ChaincodeActionPayload.create({
-      action: chaincodeEndorsedAction,
-      chaincode_proposal_payload: proposalPayloadNoTransientBytes
-    });
-    const actionPayloadBytes = fabproto62.protos.ChaincodeActionPayload.encode(actionPayload).finish();
-    const transactionAction = fabproto62.protos.TransactionAction.create({
-      header: this.header.signature_header,
-      payload: actionPayloadBytes
-    });
-    const transaction = fabproto62.protos.Transaction.create({
-      actions: [transactionAction]
-    });
-    const transactionBytes = fabproto62.protos.Transaction.encode(transaction).finish();
-    const payload = fabproto62.common.Payload.create({
-      header: this.header,
-      data: transactionBytes
-    });
-    return Buffer.from(fabproto62.common.Payload.encode(payload).finish());
+    return [...this.routing.peers];
   }
 };
 var PeerEndorsedTransaction = class {
-  network;
   config;
-  timeouts;
+  channelName;
   bytes;
   result;
   transactionId;
-  constructor(network, config, timeouts, bytes, result, transactionId) {
-    this.network = network;
+  constructor(config, channelName, bytes, result, transactionId) {
     this.config = config;
-    this.timeouts = timeouts;
+    this.channelName = channelName;
     this.bytes = Buffer.from(bytes);
     this.result = Buffer.from(result);
     this.transactionId = transactionId;
@@ -2594,45 +2509,23 @@ var PeerEndorsedTransaction = class {
   TransactionID() {
     return this.transactionId;
   }
-  SigningRequest() {
-    return signingRequest(this.bytes, this.Digest());
-  }
-  WithSignature(signature) {
-    return signedMessage(this.SigningRequest(), signature);
-  }
   async SubmitAsync() {
-    return this.submitAsyncWithSignature(await this.config.signer(digestBytes(this.bytes)));
-  }
-  async submitAsyncWithSignature(signature) {
     try {
-      const channel = this.network.getChannel();
-      const peers = channel.getEndorsers?.() ?? [];
-      const commitWaiter = await createPeerCommitWaiter(
-        this.network,
-        peers,
-        this.transactionId,
-        this.timeouts.commit
+      const runtime = new DirectPeerRuntime(this.config);
+      await runtime.submitEnvelope(
+        this.bytes,
+        await signDirectTransactionPayload(this.config, this.bytes),
+        this.transactionId
       );
-      const commit = channel.newCommit("_offline");
-      commit._reset();
-      commit._payload = this.bytes;
-      commit._signature = Buffer.from(signature);
-      const response = await commit.send({ targets: channel.getCommitters() });
-      if (response.status !== "SUCCESS") {
-        throw new SubmitError({
-          message: `Failed to commit transaction ${this.transactionId}, orderer response status: ${response.status}`,
-          transactionId: this.transactionId
-        });
-      }
-      return Result6.ok(
+      return Result10.ok(
         new PeerSubmittedTx(
           this.result,
           this.transactionId,
-          commitWaiter.waitForCommit
+          () => runtime.waitForCommit(this.channelName, this.transactionId)
         )
       );
     } catch (error) {
-      return Result6.err(
+      return Result10.err(
         error instanceof SubmitError ? error : new SubmitError({
           message: error instanceof Error ? error.message : String(error),
           transactionId: this.transactionId
@@ -2642,44 +2535,25 @@ var PeerEndorsedTransaction = class {
   }
   async Submit() {
     const submitted = await this.SubmitAsync();
-    if (!submitted.isOk()) return Result6.err(submitted.error);
+    if (!submitted.isOk()) return Result10.err(submitted.error);
     const status = await submitted.value.WaitForCommit();
-    if (!status.isOk()) return Result6.err(status.error);
-    return Result6.ok(new PeerCommitResult(submitted.value, status.value));
-  }
-  async SubmitWithSignature(signature) {
-    const signed = this.WithSignature(signature);
-    if (!signed.isOk()) return Result6.err(signed.error);
-    const decoded = decodeSignedMessage(signed.value);
-    if (!decoded.isOk()) return Result6.err(decoded.error);
-    if (!decoded.value.digest.equals(this.Digest())) {
-      return Result6.err(
-        new OfflineSigningError({
-          field: "digest",
-          message: "digest does not match transaction bytes"
-        })
-      );
-    }
-    const submitted = await this.submitAsyncWithSignature(decoded.value.signature);
-    if (!submitted.isOk()) return Result6.err(submitted.error);
-    const status = await submitted.value.WaitForCommit();
-    if (!status.isOk()) return Result6.err(status.error);
-    return Result6.ok(new PeerCommitResult(submitted.value, status.value));
+    if (!status.isOk()) return Result10.err(status.error);
+    return Result10.ok(new PeerCommitResult(submitted.value, status.value));
   }
 };
 function decodePeerSignedMessage(message) {
   const decoded = decodeSignedMessage(message);
-  if (!decoded.isOk()) return Result6.err(decoded.error);
+  if (!decoded.isOk()) return Result10.err(decoded.error);
   const actualDigest = digestBytes(decoded.value.bytes);
   if (!actualDigest.equals(decoded.value.digest)) {
-    return Result6.err(
+    return Result10.err(
       new OfflineSigningError({
         field: "digest",
         message: "digest does not match proposal bytes"
       })
     );
   }
-  return Result6.ok(decoded.value);
+  return Result10.ok(decoded.value);
 }
 function getPeerProposalPayload(proposalResponse) {
   const valid = proposalResponse.responses?.find(
@@ -2690,7 +2564,84 @@ function getPeerProposalPayload(proposalResponse) {
       message: noValidPeerResponsesMessage(proposalResponse)
     });
   }
-  return asBuffer(getTransactionResponse(valid).payload);
+  if (valid.response?.payload) {
+    return Buffer.from(valid.response.payload);
+  }
+  throw new EndorsementError({
+    message: "proposal response has no chaincode result payload"
+  });
+}
+function validateExplicitProposalResponses(proposalResponses) {
+  if (proposalResponses.length === 0) {
+    throw new EndorsementError({
+      message: "at least one proposal response is required"
+    });
+  }
+  const first = proposalResponses[0];
+  validateExplicitProposalResponse(first);
+  const firstPayload = Buffer.from(first.payload ?? []);
+  for (const response of proposalResponses.slice(1)) {
+    validateExplicitProposalResponse(response);
+    if (!firstPayload.equals(Buffer.from(response.payload ?? []))) {
+      throw new EndorsementError({
+        message: "proposal response payloads do not match"
+      });
+    }
+  }
+}
+function validateExplicitProposalResponse(response) {
+  if (!response) {
+    throw new EndorsementError({ message: "proposal response is empty" });
+  }
+  const status = response.response?.status ?? 0;
+  if (status < 200 || status >= 400) {
+    throw new EndorsementError({
+      message: `proposal response was not successful, status ${status}: ${response.response?.message ?? ""}`
+    });
+  }
+  if (!response.endorsement) {
+    throw new EndorsementError({
+      message: "proposal response has no endorsement"
+    });
+  }
+}
+function buildPeerTransactionPayload(proposal, proposalResponses) {
+  const validResponses = proposalResponses.filter(hasEndorsement);
+  if (validResponses.length === 0) {
+    throw new EndorsementError({ message: "No valid endorsements found" });
+  }
+  const header = fabricProtos3.common.Header.deserializeBinary(
+    proposal.getHeader_asU8()
+  );
+  const endorsements = validResponses.map((response) => {
+    const endorsement = new fabricProtos3.peer.Endorsement();
+    endorsement.setEndorser(response.endorsement.endorser);
+    endorsement.setSignature(response.endorsement.signature);
+    return endorsement;
+  });
+  const proposalResponse = validResponses[0];
+  const chaincodeEndorsedAction = new fabricProtos3.peer.ChaincodeEndorsedAction();
+  chaincodeEndorsedAction.setProposalResponsePayload(proposalResponse.payload);
+  chaincodeEndorsedAction.setEndorsementsList(endorsements);
+  const originalProposalPayload = fabricProtos3.peer.ChaincodeProposalPayload.deserializeBinary(
+    proposal.getPayload_asU8()
+  );
+  const proposalPayloadNoTransient = new fabricProtos3.peer.ChaincodeProposalPayload();
+  proposalPayloadNoTransient.setInput(originalProposalPayload.getInput_asU8());
+  const actionPayload = new fabricProtos3.peer.ChaincodeActionPayload();
+  actionPayload.setAction(chaincodeEndorsedAction);
+  actionPayload.setChaincodeProposalPayload(
+    proposalPayloadNoTransient.serializeBinary()
+  );
+  const transactionAction = new fabricProtos3.peer.TransactionAction();
+  transactionAction.setHeader(header.getSignatureHeader_asU8());
+  transactionAction.setPayload(actionPayload.serializeBinary());
+  const transaction = new fabricProtos3.peer.Transaction();
+  transaction.setActionsList([transactionAction]);
+  const payload = new fabricProtos3.common.Payload();
+  payload.setHeader(header);
+  payload.setData(transaction.serializeBinary());
+  return Buffer.from(payload.serializeBinary());
 }
 function noValidPeerResponsesMessage(proposalResponse) {
   const errorInfos = [];
@@ -2701,81 +2652,11 @@ function noValidPeerResponsesMessage(proposalResponse) {
   }
   for (const response of proposalResponse.responses ?? []) {
     errorInfos.push(
-      `peer=${response?.connection?.name ?? "unknown"}, status=${response?.response?.status ?? "unknown"}, message=${response?.response?.message ?? "unknown error"}`
+      `status=${response.response?.status ?? "unknown"}, message=${response.response?.message ?? "unknown error"}`
     );
   }
   return errorInfos.length > 0 ? `No valid responses from any peers. Errors:
     ${errorInfos.join("\n    ")}` : "No valid responses from any peers";
-}
-async function createPeerCommitWaiter(network, peers, transactionId, timeout) {
-  let settled = false;
-  let timeoutHandle;
-  let resolvePromise;
-  let rejectPromise;
-  const commitPromise = new Promise((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  const cleanup = (listener2) => {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    try {
-      network.removeCommitListener(listener2);
-    } catch {
-    }
-  };
-  const listener = (error, event) => {
-    if (settled) return;
-    settled = true;
-    cleanup(listener);
-    if (error) {
-      rejectPromise?.(
-        new CommitError({ message: error.message, transactionId })
-      );
-      return;
-    }
-    if (!event) {
-      rejectPromise?.(
-        new CommitError({ message: "Missing commit event", transactionId })
-      );
-      return;
-    }
-    const blockEvent = event.getBlockEvent();
-    const status = {
-      blockNumber: BigInt(blockEvent.blockNumber.toString()),
-      status: event.isValid ? "VALID" : "INVALID",
-      transactionId
-    };
-    if (!event.isValid) {
-      rejectPromise?.(
-        new CommitError({
-          message: "transaction committed with invalid validation code",
-          transactionId,
-          status: "INVALID"
-        })
-      );
-      return;
-    }
-    resolvePromise?.(status);
-  };
-  await network.addCommitListener(listener, peers, transactionId);
-  timeoutHandle = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    cleanup(listener);
-    rejectPromise?.(
-      new TimeoutError({
-        message: `Commit event listener timeout for transaction ${transactionId}`,
-        operation: "commit",
-        timeout
-      })
-    );
-  }, timeout);
-  return {
-    waitForCommit: async () => Result6.tryPromise({
-      try: async () => commitPromise,
-      catch: (error) => error
-    })
-  };
 }
 function normalizeArgs2(args) {
   return args.map((arg) => {
@@ -2790,62 +2671,48 @@ function normalizeArgs2(args) {
 function uniqueCanonicalPeerEndpoints(peers, tlsEnabled) {
   return uniquePeerEndpoints(
     peers,
-    (peer2) => normalizePeerEndpointIdentity(peer2, tlsEnabled)
+    (peer5) => normalizePeerEndpointIdentity(peer5, tlsEnabled)
   );
 }
 function normalizeSnapshotPeerEndpoints(peers, tlsEnabled) {
-  try {
-    return Result6.ok(uniqueCanonicalPeerEndpoints(peers, tlsEnabled));
-  } catch (error) {
-    return Result6.err(
-      new OfflineSigningError({
-        field: "routing.peers",
-        message: error instanceof Error ? error.message : String(error)
-      })
-    );
-  }
-}
-async function discoveredPeerEndpoints(network, channelName, tlsEnabled) {
-  const service = network.discoveryService;
-  if (service?.getDiscoveryResults) {
-    await service.getDiscoveryResults(true);
-  }
-  const results = service?.discoveryResults ?? {};
-  const out = /* @__PURE__ */ new Set();
-  for (const orgInfo of Object.values(results.peers_by_org ?? {})) {
-    for (const peer2 of orgInfo.peers ?? []) {
-      if (!peer2.endpoint) {
-        continue;
-      }
-      const endpoint = normalizePeerEndpointIdentity(peer2.endpoint, tlsEnabled);
-      if (out.has(endpoint)) {
-        throw new DiscoveryError({
-          message: `Discovery returned duplicate peer endpoint identity for channel ${channelName}: ${endpoint}`
-        });
-      }
-      out.add(endpoint);
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const peer5 of peers) {
+    const normalized = normalizePeerEndpointIdentityResult(peer5, tlsEnabled);
+    if (!normalized.isOk()) {
+      return Result10.err(
+        new OfflineSigningError({
+          field: "routing.peers",
+          message: normalized.error.message
+        })
+      );
     }
+    if (seen.has(normalized.value)) {
+      continue;
+    }
+    seen.add(normalized.value);
+    out.push(normalized.value);
   }
-  return out;
+  return Result10.ok(out);
+}
+async function discoveredPeerEndpoints(peerConnection, channelName, _tlsEnabled) {
+  const discovery = await peerConnection.discover(channelName);
+  if (!discovery.isOk()) {
+    throw discovery.error;
+  }
+  return new Set(discovery.value.peers.keys());
 }
 function uniquePeerEndpoints(peers, normalize) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  for (const peer2 of peers) {
-    const canonical = normalize(peer2);
+  for (const peer5 of peers) {
+    const canonical = normalize(peer5);
     if (!seen.has(canonical)) {
       seen.add(canonical);
       out.push(canonical);
     }
   }
   return out;
-}
-function stripGrpcScheme(endpoint) {
-  const lower = endpoint.toLowerCase();
-  if (lower.startsWith("grpc://") || lower.startsWith("grpcs://")) {
-    return endpoint.slice(endpoint.indexOf("://") + 3);
-  }
-  return endpoint;
 }
 function copyTransientData2(input) {
   return Object.fromEntries(
@@ -2860,13 +2727,13 @@ function copyProposalCreator2(input) {
 }
 
 // src/FabricBridge.ts
-import { Result as Result7 } from "better-result";
-function applyDefaultTimeouts(config) {
-  if (!config.timeouts) {
-    return { ...config, timeouts: { ...DEFAULT_TIMEOUTS } };
-  }
+import { Result as Result11 } from "better-result";
+function normalizeConfig(config) {
   return {
     ...config,
+    discoverySeed: config.discoverySeed || config.gatewayEndpoint,
+    discoveryTls: config.discoveryTls ?? config.gatewayTls,
+    ordererTls: config.ordererTls ?? config.gatewayTls,
     timeouts: {
       ...DEFAULT_TIMEOUTS,
       ...config.timeouts
@@ -2879,30 +2746,39 @@ var FabricBridge = class {
   discoveryCache;
   isConnected = false;
   constructor(config) {
-    this.config = applyDefaultTimeouts(config);
+    this.config = normalizeConfig(config);
     this.discoveryCache = new DiscoveryCache();
     log().debug("FabricBridge creado", {
-      gatewayPeer: config.gatewayPeer,
+      gatewayEndpoint: this.config.gatewayEndpoint,
+      discoverySeed: this.config.discoverySeed,
+      ordererEndpoint: this.config.ordererEndpoint,
       mspId: config.identity.mspId,
-      hasTlsOptions: !!config.tlsOptions,
-      hasTrustedRoots: !!config.tlsOptions?.trustedRoots,
-      hasClientCert: !!config.tlsOptions?.clientCert,
-      hasClientKey: !!config.tlsOptions?.clientKey,
+      hasGatewayTls: !!this.config.gatewayTls,
+      hasDiscoveryTls: !!this.config.discoveryTls,
+      hasOrdererTls: !!this.config.ordererTls,
+      hasTrustedRoots: !!this.config.gatewayTls?.trustedRoots,
+      hasClientCert: !!this.config.gatewayTls?.clientCert,
+      hasClientKey: !!this.config.gatewayTls?.clientKey,
       discovery: config.discovery
     });
   }
   async connect() {
     log().info("FabricBridge.connect() - Iniciando conexi\xF3n en modo GATEWAY");
     this.gatewayConnection = new GatewayConnection(this.config);
-    log().debug("FabricBridge.connect() - Llamando a GatewayConnection.connect()");
+    log().debug(
+      "FabricBridge.connect() - Llamando a GatewayConnection.connect()"
+    );
     const gatewayResult = await this.gatewayConnection.connect();
     if (!gatewayResult.isOk()) {
-      log().error("FabricBridge.connect() - Error en GatewayConnection.connect():", gatewayResult.error);
-      return Result7.err(gatewayResult.error);
+      log().error(
+        "FabricBridge.connect() - Error en GatewayConnection.connect():",
+        gatewayResult.error
+      );
+      return Result11.err(gatewayResult.error);
     }
     this.isConnected = true;
     log().info("FabricBridge.connect() - Conexi\xF3n GATEWAY exitosa");
-    return Result7.ok(void 0);
+    return Result11.ok(void 0);
   }
   async disconnect() {
     log().info("FabricBridge.disconnect() - Desconectando");
@@ -2912,43 +2788,53 @@ var FabricBridge = class {
   }
   async WaitForCommit(channelName, transactionId) {
     if (!this.gatewayConnection) {
-      return Result7.err(new NotConnectedError({
-        component: "FabricBridge",
-        action: "wait for commit"
-      }));
+      return Result11.err(
+        new NotConnectedError({
+          component: "FabricBridge",
+          action: "wait for commit"
+        })
+      );
     }
     return this.gatewayConnection.getCommitStatus(channelName, transactionId);
   }
   async getNetwork(channelName) {
     if (!this.isConnected || !this.config || !this.gatewayConnection) {
       log().error("FabricBridge.getNetwork() - No conectado");
-      return Result7.err(new NotConnectedError({
-        component: "FabricBridge",
-        action: "connect"
-      }));
+      return Result11.err(
+        new NotConnectedError({
+          component: "FabricBridge",
+          action: "connect"
+        })
+      );
     }
-    log().debug("FabricBridge.getNetwork() - Creando BridgeNetwork para canal:", channelName);
-    return Result7.ok(new BridgeNetworkImpl(
-      channelName,
-      this.config,
-      this.gatewayConnection,
-      this.discoveryCache
-    ));
+    log().debug(
+      "FabricBridge.getNetwork() - Creando BridgeNetwork para canal:",
+      channelName
+    );
+    return Result11.ok(
+      new BridgeNetworkImpl(
+        channelName,
+        this.config,
+        this.gatewayConnection,
+        this.discoveryCache
+      )
+    );
   }
   async NewSignedProposal(message) {
     if (message.routing?.mode === "single-peer" || message.routing?.mode === "endorsing-peers") {
-      const peerConnection = new PeerConnection(this.config, this.discoveryCache);
-      const connectResult = await peerConnection.connect();
-      if (!connectResult.isOk()) {
-        return Result7.err(connectResult.error);
-      }
-      return NewPeerSignedProposal(peerConnection.getGateway(), this.config, message);
+      const peerSession = new PeerDiscoverySession(
+        this.config,
+        this.discoveryCache
+      );
+      return NewPeerSignedProposal(peerSession, this.config, message);
     }
     if (!this.gatewayConnection) {
-      return Result7.err(new NotConnectedError({
-        component: "FabricBridge",
-        action: "resume signed proposal"
-      }));
+      return Result11.err(
+        new NotConnectedError({
+          component: "FabricBridge",
+          action: "resume signed proposal"
+        })
+      );
     }
     return NewGatewaySignedProposal(
       this.gatewayConnection.getGateway(),
@@ -3051,21 +2937,28 @@ var BridgeTransactionImpl = class {
   getChaincodeName() {
     return this.chaincodeName;
   }
-  UseSinglePeer(options = {}) {
-    const targeting = TransactionTargeting.singlePeer(options);
+  UseSinglePeer() {
+    const targeting = TransactionTargeting.singlePeer();
     if (!targeting.isOk()) {
-      return Result7.err(targeting.error);
+      return Result11.err(targeting.error);
     }
     this.targeting = targeting.value;
-    return Result7.ok(this);
+    return Result11.ok(this);
   }
-  UseEndorsingPeers(peerNames) {
-    const targeting = TransactionTargeting.endorsingPeers(peerNames);
+  UseEndorsingPeers(...peerNames) {
+    const canonicalPeerNames = dedupePeerEndpointInputsResult(
+      peerNames,
+      !!this.config.discoveryTls?.trustedRoots
+    );
+    if (!canonicalPeerNames.isOk()) {
+      return Result11.err(canonicalPeerNames.error);
+    }
+    const targeting = TransactionTargeting.endorsingPeers(canonicalPeerNames.value);
     if (!targeting.isOk()) {
-      return Result7.err(targeting.error);
+      return Result11.err(targeting.error);
     }
     this.targeting = targeting.value;
-    return Result7.ok(this);
+    return Result11.ok(this);
   }
   SetTransientData(transientData) {
     this.transientData = copyTransientData3(transientData);
@@ -3078,111 +2971,97 @@ var BridgeTransactionImpl = class {
   async Submit(...args) {
     const submitted = await this.SubmitAsync(...args);
     if (!submitted.isOk()) {
-      return Result7.err(submitted.error);
+      return Result11.err(submitted.error);
     }
     const commitStatus = await submitted.value.WaitForCommit();
     if (!commitStatus.isOk()) {
-      return Result7.err(commitStatus.error);
+      return Result11.err(commitStatus.error);
     }
-    return Result7.ok(new BridgeCommitResultImpl(submitted.value, commitStatus.value));
+    return Result11.ok(
+      new BridgeCommitResultImpl(submitted.value, commitStatus.value)
+    );
   }
   async SubmitAsync(...args) {
     if (this.targeting.requiresPeerMode()) {
-      let connection;
       try {
-        const prepared = await this.createPeerTargetedTransaction("peer-targeted transactions");
-        connection = prepared.connection;
-        const peerConnection = prepared.connection;
-        const transaction = prepared.transaction;
-        const submittedResult = await transaction.SubmitAsync(...args);
+        const prepared = await this.createPeerTargetedTransaction();
+        const submittedResult = await prepared.transaction.SubmitAsync(...args);
         if (!submittedResult.isOk()) {
-          await peerConnection.disconnect();
-          return Result7.err(submittedResult.error);
+          return Result11.err(submittedResult.error);
         }
-        const commitPromise = submittedResult.value.WaitForCommit().finally(async () => {
-          await peerConnection.disconnect();
-        });
+        const commitPromise = submittedResult.value.WaitForCommit();
         void commitPromise.catch(() => void 0);
-        return Result7.ok(new DeferredSubmittedTransaction(
-          submittedResult.value.Result(),
-          submittedResult.value.TransactionID(),
-          () => commitPromise
-        ));
+        return Result11.ok(
+          new DeferredSubmittedTransaction(
+            submittedResult.value.Result(),
+            submittedResult.value.TransactionID(),
+            () => commitPromise
+          )
+        );
       } catch (error) {
-        await connection?.disconnect();
         if (error instanceof ConfigurationError || error instanceof TimeoutError) {
-          return Result7.err(error);
+          return Result11.err(error);
         }
-        return Result7.err(new SubmitError({
-          message: error instanceof Error ? error.message : String(error)
-        }));
+        return Result11.err(
+          new SubmitError({
+            message: error instanceof Error ? error.message : String(error)
+          })
+        );
       }
     }
     return (await this.createGatewayTransaction()).SubmitAsync(...args);
   }
   async Evaluate(...args) {
     if (this.targeting.requiresPeerMode()) {
-      let connection;
-      try {
-        const prepared = await this.createPeerTargetedTransaction("peer-targeted transactions");
-        connection = prepared.connection;
-        return await prepared.transaction.Evaluate(...args);
-      } finally {
-        await connection?.disconnect();
-      }
+      const prepared = await this.createPeerTargetedTransaction();
+      return await prepared.transaction.Evaluate(...args);
     }
     return (await this.createGatewayTransaction()).Evaluate(...args);
   }
   async NewUnsignedProposal(...args) {
     if (!this.proposalCreator) {
-      return Result7.err(new ConfigurationError({
-        field: "proposalCreator",
-        message: "proposalCreator is required to build an unsigned proposal for offline signing"
-      }));
+      return Result11.err(
+        new ConfigurationError({
+          field: "proposalCreator",
+          message: "proposalCreator is required to build an unsigned proposal for offline signing"
+        })
+      );
     }
     if (this.targeting.requiresPeerMode()) {
-      let connection;
-      try {
-        const prepared = await this.createPeerTargetedTransaction("build peer-targeted proposals");
-        connection = prepared.connection;
-        return await prepared.transaction.NewUnsignedProposal(...args);
-      } finally {
-        await connection?.disconnect();
-      }
+      const prepared = await this.createPeerTargetedTransaction();
+      return await prepared.transaction.NewUnsignedProposal(...args);
     }
     return (await this.createGatewayTransaction()).NewUnsignedProposal(...args);
   }
   async createGatewayTransaction() {
-    const gatewayContract = await this.gatewayNetwork.getContract(this.chaincodeName);
+    const gatewayContract = await this.gatewayNetwork.getContract(
+      this.chaincodeName
+    );
     return this.prepareTransaction(gatewayContract.Transaction(this.name));
   }
-  async createPeerTargetedTransaction(reason) {
-    const connection = new PeerConnection(this.config, this.discoveryCache);
-    const connectResult = await connection.connect();
-    if (!connectResult.isOk()) {
-      throw connectResult.error;
+  async createPeerTargetedTransaction() {
+    log().debug(
+      "BridgeTransactionImpl - using direct peer discovery for:",
+      this.chaincodeName
+    );
+    const peerSession = new PeerDiscoverySession(
+      this.config,
+      this.discoveryCache
+    );
+    const peerNetwork = new PeerNetwork(
+      this.channelName,
+      this.config,
+      peerSession,
+      this.discoveryCache
+    );
+    const peerContract = await peerNetwork.getContract(this.chaincodeName);
+    const targetedTx = this.targeting.applyToPeerTransaction(
+      this.prepareTransaction(peerContract.Transaction(this.name))
+    );
+    if (!targetedTx.isOk()) {
+      throw targetedTx.error;
     }
-    try {
-      log().debug("BridgeTransactionImpl - using dedicated peer connection for:", this.chaincodeName);
-      const peerNetwork = new PeerNetwork(
-        connection.getGateway(),
-        this.channelName,
-        this.config,
-        connection,
-        this.discoveryCache
-      );
-      const peerContract = await peerNetwork.getContract(this.chaincodeName);
-      const targetedTx = this.targeting.applyToPeerTransaction(
-        this.prepareTransaction(peerContract.Transaction(this.name))
-      );
-      if (!targetedTx.isOk()) {
-        throw targetedTx.error;
-      }
-      return { connection, transaction: targetedTx.value };
-    } catch (error) {
-      await connection.disconnect();
-      throw error;
-    }
+    return { transaction: targetedTx.value };
   }
   prepareTransaction(transaction) {
     if (Object.keys(this.transientData).length > 0) {

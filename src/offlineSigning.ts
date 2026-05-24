@@ -8,8 +8,6 @@ import type {
   SigningRequest,
 } from "./types/bridge";
 
-import fabproto6 from "fabric-protos";
-
 export function toBase64(bytes: Buffer | Uint8Array): string {
   return Buffer.from(bytes).toString("base64");
 }
@@ -123,14 +121,16 @@ export function proposalCreatorIdentity(
   proposalBytes: Buffer | Uint8Array,
 ): Result<Buffer, OfflineSigningError> {
   try {
-    const proposal = fabproto6.protos.Proposal.decode(
+    const proposal = fabricGatewayProtos.peer.Proposal.deserializeBinary(
       unwrapProposalBytes(proposalBytes),
     );
-    const header = fabproto6.common.Header.decode(proposal.header);
-    const signatureHeader = fabproto6.common.SignatureHeader.decode(
-      header.signature_header,
+    const header = fabricGatewayProtos.common.Header.deserializeBinary(
+      proposal.getHeader_asU8(),
     );
-    return Result.ok(Buffer.from(signatureHeader.creator));
+    const signatureHeader = fabricGatewayProtos.common.SignatureHeader.deserializeBinary(
+      header.getSignatureHeader_asU8(),
+    );
+    return Result.ok(Buffer.from(signatureHeader.getCreator_asU8()));
   } catch (error) {
     return Result.err(
       new OfflineSigningError({
@@ -147,8 +147,8 @@ export function proposalCreatorMSPID(
   const creator = proposalCreatorIdentity(proposalBytes);
   if (!creator.isOk()) return Result.err(creator.error);
   try {
-    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
-    return Result.ok(identity.mspid);
+    const identity = fabricGatewayProtos.msp.SerializedIdentity.deserializeBinary(creator.value);
+    return Result.ok(identity.getMspid());
   } catch (error) {
     return Result.err(
       new OfflineSigningError({
@@ -165,8 +165,8 @@ export function proposalCreatorCertificate(
   const creator = proposalCreatorIdentity(proposalBytes);
   if (!creator.isOk()) return Result.err(creator.error);
   try {
-    const identity = fabproto6.msp.SerializedIdentity.decode(creator.value);
-    return Result.ok(Buffer.from(identity.id_bytes));
+    const identity = fabricGatewayProtos.msp.SerializedIdentity.deserializeBinary(creator.value);
+    return Result.ok(Buffer.from(identity.getIdBytes_asU8()));
   } catch (error) {
     return Result.err(
       new OfflineSigningError({
@@ -179,18 +179,38 @@ export function proposalCreatorCertificate(
 
 function unwrapProposalBytes(proposalBytes: Buffer | Uint8Array): Buffer {
   const bytes = Buffer.from(proposalBytes);
+  if (isFabricProposalBytes(bytes)) {
+    return bytes;
+  }
+
   try {
     const proposedTransaction =
       fabricGatewayProtos.gateway.ProposedTransaction.deserializeBinary(bytes);
     const signedProposal = proposedTransaction.getProposal();
     const rawProposalBytes = signedProposal?.getProposalBytes_asU8();
     if (rawProposalBytes && rawProposalBytes.length > 0) {
-      return Buffer.from(rawProposalBytes);
+      const candidate = Buffer.from(rawProposalBytes);
+      if (isFabricProposalBytes(candidate)) {
+        return candidate;
+      }
     }
   } catch {
     // Peer-targeted proposal signing uses raw Fabric proposal bytes.
   }
   return bytes;
+}
+
+function isFabricProposalBytes(bytes: Buffer): boolean {
+  try {
+    const proposal = fabricGatewayProtos.peer.Proposal.deserializeBinary(bytes);
+    if (proposal.getHeader_asU8().length === 0 || proposal.getPayload_asU8().length === 0) {
+      return false;
+    }
+    const header = fabricGatewayProtos.common.Header.deserializeBinary(proposal.getHeader_asU8());
+    return header.getChannelHeader_asU8().length > 0 && header.getSignatureHeader_asU8().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function decodeBase64(

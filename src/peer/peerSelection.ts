@@ -1,93 +1,52 @@
-import type { SinglePeerOptions } from '../types/bridge';
 import type { DiscoveryResult, PeerInfo } from '../types/discovery';
 import { PeerNotFoundError } from '../errors/index';
 import { DiscoveryCache } from '../cache/DiscoveryCache';
-import { PeerConnection } from './PeerConnection';
+import { Result } from 'better-result';
 
 export interface SinglePeerSelection {
   orderedPeers: PeerInfo[];
-  candidates?: string[];
 }
 
 export function selectSinglePeers(
   discovery: DiscoveryResult,
-  peerConnection: PeerConnection,
   discoveryCache: DiscoveryCache,
-  options: SinglePeerOptions | undefined,
 ): SinglePeerSelection {
-  const candidates = options?.candidates?.filter((candidate) => candidate.trim() !== '');
-  const eligible = candidates && candidates.length > 0
-    ? resolveCandidatePeers(discovery, peerConnection, candidates)
-    : Array.from(discovery.peers.values());
-
-  if (eligible.length === 0) {
-    throw new PeerNotFoundError({
-      peerName: candidates && candidates.length > 0 ? candidates.join(', ') : '<discovered peers>',
-      availablePeers: Array.from(discovery.peers.keys()),
-    });
+  const selected = selectSinglePeersResult(discovery, discoveryCache);
+  if (!selected.isOk()) {
+    throw selected.error;
   }
-
-  const policy = options?.policy ?? 'round-robin';
-  const sorted = [...eligible].sort((a, b) => a.name.localeCompare(b.name));
-  const orderedPeers = policy === 'random'
-    ? randomOrder(sorted)
-    : roundRobinOrder(sorted, discoveryCache, discovery.channelName, candidates);
-
-  return {
-    orderedPeers,
-    candidates,
-  };
+  return selected.value;
 }
 
-function resolveCandidatePeers(
+export function selectSinglePeersResult(
   discovery: DiscoveryResult,
-  peerConnection: PeerConnection,
-  candidates: string[],
-): PeerInfo[] {
-  const resolved: PeerInfo[] = [];
-  const missing: string[] = [];
-  const seen = new Set<string>();
+  discoveryCache: DiscoveryCache,
+): Result<SinglePeerSelection, PeerNotFoundError> {
+  const eligible = Array.from(discovery.peers.values());
 
-  for (const candidate of candidates) {
-    const canonicalCandidate = peerConnection.normalizePeerEndpointIdentity(candidate);
-    if (seen.has(canonicalCandidate)) {
-      continue;
-    }
-    const peer = peerConnection.matchPeerByEndpointIdentity(discovery, canonicalCandidate);
-    if (!peer) {
-      missing.push(canonicalCandidate);
-      continue;
-    }
-    resolved.push(peer);
-    seen.add(peer.endpoint);
+  if (eligible.length === 0) {
+    return Result.err(
+      new PeerNotFoundError({
+        peerName: '<discovered peers>',
+        availablePeers: Array.from(discovery.peers.keys()),
+      }),
+    );
   }
 
-  if (missing.length > 0) {
-    throw new PeerNotFoundError({
-      peerName: missing.join(', '),
-      availablePeers: Array.from(discovery.peers.keys()),
-    });
-  }
+  const sorted = [...eligible].sort((a, b) => a.name.localeCompare(b.name));
+  const orderedPeers = roundRobinOrder(sorted, discoveryCache, discovery.channelName);
 
-  return resolved;
+  return Result.ok({
+    orderedPeers,
+  });
 }
 
 function roundRobinOrder(
   peers: PeerInfo[],
   discoveryCache: DiscoveryCache,
   channelName: string,
-  candidates?: string[],
 ): PeerInfo[] {
-  const key = `${channelName}:${peers.map((peer) => peer.endpoint).join('|')}:${candidates?.join('|') ?? '*'}`;
+  const key = `${channelName}:${peers.map((peer) => peer.endpoint).join('|')}`;
   const start = discoveryCache.nextRoundRobinIndex(key, peers.length);
   return peers.slice(start).concat(peers.slice(0, start));
-}
-
-function randomOrder(peers: PeerInfo[]): PeerInfo[] {
-  const out = [...peers];
-  for (let i = out.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [out[i], out[j]] = [out[j]!, out[i]!];
-  }
-  return out;
 }

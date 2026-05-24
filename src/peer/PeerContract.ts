@@ -1,9 +1,5 @@
-import * as fabricNetwork from "fabric-network";
 import { Result } from "better-result";
-import {
-  asBuffer,
-  getTransactionResponse,
-} from "fabric-network/lib/impl/gatewayutils.js";
+import * as fabricProtos from "@hyperledger/fabric-protos";
 import type {
   BridgeCommitResult,
   BridgeContract,
@@ -18,13 +14,11 @@ import type {
   OfflineSigningRouting,
   SignedMessage,
   SigningRequest,
-  SinglePeerOptions,
   ProposalCreator,
 } from "../types/bridge";
 import type { BridgeConfig, TimeoutConfig } from "../types/config";
 import type { DiscoveryResult, PeerInfo } from "../types/discovery";
 import {
-  CommitError,
   ConfigurationError,
   DiscoveryError,
   EndorsementError,
@@ -36,16 +30,14 @@ import {
   TimeoutError,
 } from "../errors/index";
 import { DEFAULT_TIMEOUTS } from "../types/config";
-import {
-  normalizePeerEndpointIdentity,
-  PeerConnection,
-} from "./PeerConnection";
+import { PeerDiscoverySession } from "./PeerDiscoverySession";
 import { DiscoveryCache } from "../cache/DiscoveryCache";
 import { log } from "../utils/logger";
-import { selectSinglePeers } from "./peerSelection";
+import { selectSinglePeersResult } from "./peerSelection";
 import type { FailoverDecision } from "../types/failover";
 import { classifyFailover } from "./failoverEligibility";
 import { TransactionTargeting } from "../transactionTargeting";
+import { dedupePeerEndpointInputsResult } from "./endpointIdentity";
 import {
   decodeSignedMessage,
   digestBytes,
@@ -57,43 +49,67 @@ import {
   proposalCreatorIdentity,
   proposalCreatorMSPID,
 } from "../offlineSigning";
-import { createProposalIdentityContext } from "../fabricIdentity";
-
-import fabproto6 from "fabric-protos";
+import { buildPeerProposal } from "./PeerProposalBuilder";
+import {
+  DirectPeerRuntime,
+  signDirectTransactionPayload,
+} from "./DirectPeerRuntime";
+import {
+  normalizePeerEndpointIdentity,
+  normalizePeerEndpointIdentityResult,
+} from "./endpointIdentity";
 
 type NormalizedArg = string | Buffer;
+type PeerProposal = InstanceType<typeof fabricProtos.peer.Proposal>;
+type DirectProposalResponse = Awaited<
+  ReturnType<DirectPeerRuntime["processProposal"]>
+>;
+
+interface DirectProposalResponseSet {
+  responses: DirectProposalResponse[];
+  errors?: Array<{
+    message?: string;
+    connection?: {
+      name?: string;
+    };
+  }>;
+}
+
+type EndorsedDirectProposalResponse = DirectProposalResponse & {
+  endorsement: NonNullable<DirectProposalResponse["endorsement"]>;
+};
+
+function hasEndorsement(
+  response: DirectProposalResponse,
+): response is EndorsedDirectProposalResponse {
+  return !!response.endorsement;
+}
 
 export class PeerNetwork implements BridgeNetwork {
-  private gateway: fabricNetwork.Gateway;
   private channelName: string;
   private timeouts: Required<TimeoutConfig>;
-  private peerConnection: PeerConnection;
+  private config: BridgeConfig;
+  private peerConnection: PeerDiscoverySession;
   private discoveryCache: DiscoveryCache;
-  private networkPromise: Promise<fabricNetwork.Network> | null = null;
 
   constructor(
-    gateway: fabricNetwork.Gateway,
     channelName: string,
     config: BridgeConfig,
-    peerConnection: PeerConnection,
+    peerConnection: PeerDiscoverySession,
     discoveryCache: DiscoveryCache,
   ) {
-    this.gateway = gateway;
     this.channelName = channelName;
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
-    this.networkPromise = this.gateway.getNetwork(channelName);
   }
 
   async getContract(chaincodeName: string): Promise<BridgeContract> {
-    const network = await this.networkPromise!;
-    const contract = network.getContract(chaincodeName);
-
     return new PeerContract(
-      contract as fabricNetwork.Contract,
       chaincodeName,
       this.timeouts,
+      this.config,
       this.peerConnection,
       this.discoveryCache,
       this.channelName,
@@ -102,7 +118,7 @@ export class PeerNetwork implements BridgeNetwork {
 }
 
 export async function NewPeerSignedProposal(
-  gateway: fabricNetwork.Gateway,
+  peerConnection: PeerDiscoverySession,
   config: BridgeConfig,
   message: SignedMessage,
 ): Promise<BridgeResult<BridgeSignedProposal>> {
@@ -123,24 +139,38 @@ export async function NewPeerSignedProposal(
   }
   const routingPeers = normalizeSnapshotPeerEndpoints(
     decoded.value.routing.peers,
-    !!config.tlsOptions?.trustedRoots,
+    !!config.discoveryTls?.trustedRoots,
   );
   if (!routingPeers.isOk()) {
     return Result.err(routingPeers.error);
   }
+  if (
+    decoded.value.routing.mode === "single-peer" &&
+    routingPeers.value.length !== 1
+  ) {
+    return Result.err(
+      new OfflineSigningError({
+        field: "routing.peers",
+        message: "single-peer routing requires exactly one peer endpoint",
+      }),
+    );
+  }
   const routing = { ...decoded.value.routing, peers: routingPeers.value };
 
   try {
-    const proposal = fabproto6.protos.Proposal.decode(decoded.value.bytes);
-    const header = fabproto6.common.Header.decode(proposal.header);
-    const channelHeader = fabproto6.common.ChannelHeader.decode(
-      header.channel_header,
+    const proposal = fabricProtos.peer.Proposal.deserializeBinary(
+      decoded.value.bytes,
     );
-    const channelName = channelHeader.channel_id;
-    const network = await gateway.getNetwork(channelName);
+    const header = fabricProtos.common.Header.deserializeBinary(
+      proposal.getHeader_asU8(),
+    );
+    const channelHeader = fabricProtos.common.ChannelHeader.deserializeBinary(
+      header.getChannelHeader_asU8(),
+    );
+    const channelName = channelHeader.getChannelId();
     return Result.ok(
       new PeerSignedProposal(
-        network,
+        peerConnection,
         channelName,
         config,
         decoded.value.bytes,
@@ -158,24 +188,24 @@ export async function NewPeerSignedProposal(
 }
 
 class PeerContract implements BridgeContract {
-  private contract: fabricNetwork.Contract;
   private chaincodeName: string;
   private timeouts: Required<TimeoutConfig>;
-  private peerConnection: PeerConnection;
+  private config: BridgeConfig;
+  private peerConnection: PeerDiscoverySession;
   private discoveryCache: DiscoveryCache;
   private channelName: string;
 
   constructor(
-    contract: fabricNetwork.Contract,
     chaincodeName: string,
     timeouts: Required<TimeoutConfig>,
-    peerConnection: PeerConnection,
+    config: BridgeConfig,
+    peerConnection: PeerDiscoverySession,
     discoveryCache: DiscoveryCache,
     channelName: string,
   ) {
-    this.contract = contract;
     this.chaincodeName = chaincodeName;
     this.timeouts = timeouts;
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
@@ -214,8 +244,8 @@ class PeerContract implements BridgeContract {
     return new PeerTransaction(
       name,
       this.chaincodeName,
-      this.contract,
       this.timeouts,
+      this.config,
       this.peerConnection,
       this.discoveryCache,
       this.channelName,
@@ -226,9 +256,9 @@ class PeerContract implements BridgeContract {
 class PeerTransaction implements BridgeTransaction {
   private name: string;
   private chaincodeName: string;
-  private contract: fabricNetwork.Contract;
   private timeouts: Required<TimeoutConfig>;
-  private peerConnection: PeerConnection;
+  private config: BridgeConfig;
+  private peerConnection: PeerDiscoverySession;
   private discoveryCache: DiscoveryCache;
   private channelName: string;
   private targeting = TransactionTargeting.gatewayDefault();
@@ -238,16 +268,16 @@ class PeerTransaction implements BridgeTransaction {
   constructor(
     name: string,
     chaincodeName: string,
-    contract: fabricNetwork.Contract,
     timeouts: Required<TimeoutConfig>,
-    peerConnection: PeerConnection,
+    config: BridgeConfig,
+    peerConnection: PeerDiscoverySession,
     discoveryCache: DiscoveryCache,
     channelName: string,
   ) {
     this.name = name;
     this.chaincodeName = chaincodeName;
-    this.contract = contract;
     this.timeouts = timeouts;
+    this.config = config;
     this.peerConnection = peerConnection;
     this.discoveryCache = discoveryCache;
     this.channelName = channelName;
@@ -261,10 +291,8 @@ class PeerTransaction implements BridgeTransaction {
     return this.chaincodeName;
   }
 
-  UseSinglePeer(
-    options: SinglePeerOptions = {},
-  ): BridgeResult<BridgeTransaction> {
-    const targeting = TransactionTargeting.singlePeer(options);
+  UseSinglePeer(): BridgeResult<BridgeTransaction> {
+    const targeting = TransactionTargeting.singlePeer();
     if (!targeting.isOk()) {
       return Result.err(targeting.error);
     }
@@ -272,8 +300,16 @@ class PeerTransaction implements BridgeTransaction {
     return Result.ok(this);
   }
 
-  UseEndorsingPeers(peerNames: string[]): BridgeResult<BridgeTransaction> {
-    const targeting = TransactionTargeting.endorsingPeers(peerNames);
+  UseEndorsingPeers(...peerNames: string[]): BridgeResult<BridgeTransaction> {
+    const canonicalPeerNames = dedupePeerEndpointInputsResult(
+      peerNames,
+      this.peerConnection.usesDiscoveryTLS(),
+    );
+    if (!canonicalPeerNames.isOk()) {
+      return Result.err(canonicalPeerNames.error);
+    }
+
+    const targeting = TransactionTargeting.endorsingPeers(canonicalPeerNames.value);
     if (!targeting.isOk()) {
       return Result.err(targeting.error);
     }
@@ -323,10 +359,7 @@ class PeerTransaction implements BridgeTransaction {
       try: async () => {
         const submitted = this.targeting.isSinglePeer()
           ? await this.submitAsyncSinglePeer(normalizedArgs)
-          : await this.submitAsyncInternal(
-              await this.createPreparedTransaction(),
-              normalizedArgs,
-            );
+          : await this.submitAsyncEndorsingPeers(normalizedArgs);
         return new PeerSubmittedTx(
           submitted.result,
           submitted.transactionId,
@@ -343,9 +376,7 @@ class PeerTransaction implements BridgeTransaction {
     try {
       const result = this.targeting.isSinglePeer()
         ? await this.evaluateSinglePeer(normalizedArgs)
-        : await (
-            await this.createPreparedTransaction()
-          ).evaluate(...(normalizedArgs as string[]));
+        : await this.evaluateEndorsingPeers(normalizedArgs);
       return Result.ok(Buffer.from(result));
     } catch (error) {
       if (
@@ -381,26 +412,22 @@ class PeerTransaction implements BridgeTransaction {
       }
 
       if (this.targeting.isSinglePeer()) {
-        const selected = (await this.resolveSinglePeerEndorsers())[0];
+        const selected = (await this.resolveSinglePeerTargets())[0];
         if (!selected) {
           throw new PeerNotFoundError({
             peerName: "<single-peer>",
             availablePeers: [],
           });
         }
-        const transaction = await this.createPreparedTransactionForPeers([
-          selected.endorser,
-        ]);
         return Result.ok(
-          this.buildUnsignedProposal(transaction, normalizedArgs, {
+          this.buildUnsignedProposal(normalizedArgs, {
             mode: "single-peer",
-            peers: [selected.peerName],
+            peers: [selected.endpoint],
           }),
         );
       }
 
       const endorsingPeerNames = this.targeting.endorsingPeerNames();
-      const transaction = await this.createPreparedTransaction();
       const peers =
         endorsingPeerNames.length > 0
           ? await this.resolvedEndorsingPeerSnapshot(endorsingPeerNames)
@@ -409,83 +436,30 @@ class PeerTransaction implements BridgeTransaction {
         peers.length > 0
           ? { mode: "endorsing-peers", peers }
           : { mode: "gateway-default" };
-      return Result.ok(
-        this.buildUnsignedProposal(transaction, normalizedArgs, routing),
-      );
+      return Result.ok(this.buildUnsignedProposal(normalizedArgs, routing));
     } catch (error) {
       return Result.err(this.mapSubmitError(error as Error));
     }
   }
 
   private buildUnsignedProposal(
-    transaction: fabricNetwork.Transaction,
     stringArgs: NormalizedArg[],
     routing: OfflineSigningRouting,
   ): BridgeUnsignedProposal {
-    const tx = transaction as any;
-    const network = tx.contract.network;
-    const channel = network.getChannel();
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    const proposalBuildRequest = tx.newBuildProposalRequest(stringArgs);
-    const identityContext = createProposalIdentityContext(
-      tx.identityContext,
-      this.proposalCreator!,
-    );
-    const bytes = Buffer.from(
-      endorsement.build(identityContext, proposalBuildRequest),
-    );
+    const proposal = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData(this.transientData),
+      proposalCreator: this.proposalCreator!,
+    });
     return new PeerUnsignedProposal(
-      bytes,
-      digestBytes(bytes),
-      endorsement.getTransactionId(),
+      proposal.bytes,
+      proposal.digest,
+      proposal.transactionId,
       routing,
     );
-  }
-
-  private async createPreparedTransaction(): Promise<fabricNetwork.Transaction> {
-    const transaction = this.contract.createTransaction(this.name);
-
-    if (Object.keys(this.transientData).length > 0) {
-      transaction.setTransient(copyTransientData(this.transientData));
-    }
-
-    const endorsingPeerNames = this.targeting.endorsingPeerNames();
-    if (endorsingPeerNames.length > 0) {
-      const discoveryResult = await this.ensureDiscovery();
-      if (!discoveryResult.isOk()) {
-        throw discoveryResult.error;
-      }
-
-      const endorsingPeers = this.matchPeersToEndorsers(
-        discoveryResult.value,
-        endorsingPeerNames,
-      );
-      if (!endorsingPeers.isOk()) {
-        throw endorsingPeers.error;
-      }
-
-      if (endorsingPeers.value.length > 0) {
-        transaction.setEndorsingPeers(endorsingPeers.value);
-      }
-    }
-
-    return transaction;
-  }
-
-  private async createPreparedTransactionForPeers(
-    peers: any[],
-  ): Promise<fabricNetwork.Transaction> {
-    const transaction = this.contract.createTransaction(this.name);
-
-    if (Object.keys(this.transientData).length > 0) {
-      transaction.setTransient(copyTransientData(this.transientData));
-    }
-
-    if (peers.length > 0) {
-      transaction.setEndorsingPeers(peers);
-    }
-
-    return transaction;
   }
 
   private async resolvedEndorsingPeerSnapshot(
@@ -504,30 +478,38 @@ class PeerTransaction implements BridgeTransaction {
     return peerInfos.value.map((peer) => peer.endpoint);
   }
 
-  private async resolveSinglePeerEndorsers(): Promise<
-    Array<{ peerName: string; endorser: any }>
-  > {
+  private async resolveSinglePeerTargets(): Promise<PeerInfo[]> {
     const discoveryResult = await this.ensureDiscovery();
     if (!discoveryResult.isOk()) {
       throw discoveryResult.error;
     }
 
-    const selection = selectSinglePeers(
+    const selection = selectSinglePeersResult(
       discoveryResult.value,
-      this.peerConnection,
       this.discoveryCache,
-      this.targeting.singlePeerOptions() ?? undefined,
     );
-
-    const endorsers = this.matchPeerInfosToEndorsers(
-      discoveryResult.value,
-      selection.orderedPeers,
-    );
-    if (!endorsers.isOk()) {
-      throw endorsers.error;
+    if (!selection.isOk()) {
+      throw selection.error;
     }
 
-    return endorsers.value;
+    return selection.value.orderedPeers;
+  }
+
+  private async resolveEndorsingPeerTargets(): Promise<PeerInfo[]> {
+    const discoveryResult = await this.ensureDiscovery();
+    if (!discoveryResult.isOk()) {
+      throw discoveryResult.error;
+    }
+
+    const peerInfos = this.resolvePeerInfos(
+      discoveryResult.value,
+      this.targeting.endorsingPeerNames(),
+    );
+    if (!peerInfos.isOk()) {
+      throw peerInfos.error;
+    }
+
+    return peerInfos.value;
   }
 
   private async submitAsyncSinglePeer(stringArgs: NormalizedArg[]): Promise<{
@@ -536,38 +518,51 @@ class PeerTransaction implements BridgeTransaction {
     waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
   }> {
     return this.executeSinglePeer("submitAsync", async (selected) => {
-      const transaction = await this.createPreparedTransactionForPeers([
-        selected.endorser,
-      ]);
-      return this.submitAsyncInternal(transaction, stringArgs);
+      return this.submitAsyncToSinglePeer(selected, stringArgs);
     });
+  }
+
+  private async submitAsyncEndorsingPeers(
+    stringArgs: NormalizedArg[],
+  ): Promise<{
+    result: Buffer;
+    transactionId: string;
+    waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
+  }> {
+    return this.submitAsyncToEndorsers(
+      await this.resolveEndorsingPeerTargets(),
+      stringArgs,
+    );
   }
 
   private async evaluateSinglePeer(
     stringArgs: NormalizedArg[],
   ): Promise<Buffer> {
     return this.executeSinglePeer("evaluate", async (selected) => {
-      const transaction = await this.createPreparedTransactionForPeers([
-        selected.endorser,
-      ]);
-      return Buffer.from(
-        await transaction.evaluate(...(stringArgs as string[])),
-      );
+      return this.evaluateSinglePeerTarget(selected, stringArgs);
     });
+  }
+
+  private async evaluateEndorsingPeers(
+    stringArgs: NormalizedArg[],
+  ): Promise<Buffer> {
+    return this.evaluateEndorsers(
+      await this.resolveEndorsingPeerTargets(),
+      stringArgs,
+    );
   }
 
   private async executeSinglePeer<T>(
     operation: "submitAsync" | "evaluate",
-    execute: (selected: { peerName: string; endorser: any }) => Promise<T>,
+    execute: (selected: PeerInfo) => Promise<T>,
   ): Promise<T> {
-    const peers = await this.resolveSinglePeerEndorsers();
+    const peers = await this.resolveSinglePeerTargets();
     const attempts: Array<{
       peer: string;
       cause: string;
       failover: FailoverDecision;
     }> = [];
-    const failover = this.targeting.singlePeerOptions()?.failover ?? true;
-    const peersToTry = failover ? peers : peers.slice(0, 1);
+    const peersToTry = peers;
 
     for (let index = 0; index < peersToTry.length; index += 1) {
       const selected = peersToTry[index]!;
@@ -576,14 +571,14 @@ class PeerTransaction implements BridgeTransaction {
       } catch (error) {
         const decision = classifyFailover(error);
         attempts.push({
-          peer: selected.peerName,
+          peer: selected.endpoint,
           cause: error instanceof Error ? error.message : String(error),
           failover: decision,
         });
         if (!decision.eligible) {
           throw error;
         }
-        if (!failover || index === peersToTry.length - 1) {
+        if (index === peersToTry.length - 1) {
           throw this.singlePeerExecutionError(operation, peers, attempts);
         }
 
@@ -594,8 +589,8 @@ class PeerTransaction implements BridgeTransaction {
           channel: this.channelName,
           chaincode: this.chaincodeName,
           transaction: this.name,
-          failedPeer: selected.peerName,
-          nextPeer: next.peerName,
+          failedPeer: selected.endpoint,
+          nextPeer: next.endpoint,
           attempt: index + 1,
           maxAttempts: peersToTry.length,
           reason: decision.reason,
@@ -607,211 +602,149 @@ class PeerTransaction implements BridgeTransaction {
     throw this.singlePeerExecutionError(operation, peers, attempts);
   }
 
-  private async submitAsyncInternal(
-    transaction: fabricNetwork.Transaction,
+  private async submitAsyncToSinglePeer(
+    peer: PeerInfo,
     stringArgs: NormalizedArg[],
   ): Promise<{
     result: Buffer;
     transactionId: string;
     waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
   }> {
-    const tx = transaction as any;
-    const network = tx.contract.network;
-    const channel = network.getChannel();
-    const transactionOptions = tx.gatewayOptions.eventHandlerOptions ?? {};
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    const proposalBuildRequest = tx.newBuildProposalRequest(stringArgs);
-
-    endorsement.build(tx.identityContext, proposalBuildRequest);
-    endorsement.sign(tx.identityContext);
-
-    const proposalSendRequest: Record<string, unknown> = {};
-    if (Number.isInteger(transactionOptions.endorseTimeout)) {
-      proposalSendRequest.requestTimeout =
-        (transactionOptions.endorseTimeout as number) * 1000;
-    }
-
-    if (tx.endorsingPeers) {
-      proposalSendRequest.targets = tx.endorsingPeers;
-    } else if (tx.contract.network.discoveryService) {
-      proposalSendRequest.handler = await tx.contract.getDiscoveryHandler();
-      if (tx.endorsingOrgs) {
-        proposalSendRequest.requiredOrgs = tx.endorsingOrgs;
-      }
-    } else if (tx.endorsingOrgs) {
-      const targets = tx.endorsingOrgs
-        .map((mspid: string) => channel.getEndorsers(mspid))
-        .flat();
-      proposalSendRequest.targets = targets;
-    } else {
-      proposalSendRequest.targets = channel.getEndorsers();
-    }
-
-    const proposalResponse = await endorsement.send(proposalSendRequest);
-    const result = this.getResponsePayload(proposalResponse);
-    const transactionId = endorsement.getTransactionId();
-
-    const peers = tx.endorsingPeers ?? channel.getEndorsers();
-    const commitWaiter = await this.createCommitWaiter(
-      network,
-      peers,
-      transactionId,
+    const prepared = await this.sendDirectSinglePeerProposal(peer, stringArgs);
+    const result = getPeerProposalPayload({
+      responses: [prepared.proposalResponse],
+    });
+    const transactionPayload = buildPeerTransactionPayload(prepared.proposal, [
+      prepared.proposalResponse,
+    ]);
+    const runtime = new DirectPeerRuntime(this.config);
+    await runtime.submitEnvelope(
+      transactionPayload,
+      await signDirectTransactionPayload(this.config, transactionPayload),
+      prepared.transactionId,
     );
-
-    try {
-      const commit = endorsement.newCommit();
-      commit.build(tx.identityContext);
-      commit.sign(tx.identityContext);
-
-      const commitSendRequest: Record<string, unknown> = {};
-      if (Number.isInteger(transactionOptions.commitTimeout)) {
-        commitSendRequest.requestTimeout =
-          (transactionOptions.commitTimeout as number) * 1000;
-      }
-
-      if (proposalSendRequest.handler) {
-        commitSendRequest.handler = proposalSendRequest.handler;
-      } else {
-        commitSendRequest.targets = channel.getCommitters();
-      }
-
-      const commitResponse = await commit.send(commitSendRequest);
-      if (commitResponse.status !== "SUCCESS") {
-        const message = `Failed to commit transaction ${transactionId}, orderer response status: ${commitResponse.status}`;
-        commitWaiter.fail(
-          new SubmitError({
-            message,
-            transactionId,
-          }),
-        );
-        throw new SubmitError({
-          message,
-          transactionId,
-        });
-      }
-    } catch (error) {
-      commitWaiter.fail(error as Error);
-      throw error;
-    }
 
     return {
       result,
-      transactionId,
-      waitForCommit: commitWaiter.waitForCommit,
+      transactionId: prepared.transactionId,
+      waitForCommit: () =>
+        runtime.waitForCommit(this.channelName, prepared.transactionId),
     };
   }
 
-  private async createCommitWaiter(
-    network: any,
-    peers: any[],
-    transactionId: string,
+  private async evaluateSinglePeerTarget(
+    peer: PeerInfo,
+    stringArgs: NormalizedArg[],
+  ): Promise<Buffer> {
+    const prepared = await this.sendDirectSinglePeerProposal(peer, stringArgs);
+    return getPeerProposalPayload({ responses: [prepared.proposalResponse] });
+  }
+
+  private async sendDirectSinglePeerProposal(
+    peer: PeerInfo,
+    stringArgs: NormalizedArg[],
   ): Promise<{
-    waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
-    fail: (error: Error) => void;
+    proposal: PeerProposal;
+    proposalResponse: DirectProposalResponse;
+    transactionId: string;
   }> {
-    let settled = false;
-    let timeoutHandle: NodeJS.Timeout | undefined;
-    let resolvePromise: ((status: CommitStatus) => void) | undefined;
-    let rejectPromise: ((error: Error) => void) | undefined;
-
-    const cleanup = (listener: fabricNetwork.CommitListener) => {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-
-      try {
-        network.removeCommitListener(listener);
-      } catch {
-        // Listener may already be removed.
-      }
-    };
-
-    const commitPromise = new Promise<CommitStatus>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
+    const built = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData(this.transientData),
+      proposalCreator: {
+        mspId: this.config.identity.mspId,
+        credentials: this.config.identity.credentials,
+      },
     });
-
-    const listener: fabricNetwork.CommitListener = (error, event) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup(listener);
-
-      if (error) {
-        rejectPromise?.(
-          new CommitError({
-            message: error.message,
-            transactionId,
-          }),
-        );
-        return;
-      }
-
-      if (!event) {
-        rejectPromise?.(
-          new CommitError({
-            message: "Missing commit event",
-            transactionId,
-          }),
-        );
-        return;
-      }
-
-      const blockEvent = event.getBlockEvent();
-      const status: CommitStatus = {
-        blockNumber: BigInt(blockEvent.blockNumber.toString()),
-        status: event.isValid ? "VALID" : "INVALID",
-        transactionId,
-      };
-
-      if (!event.isValid) {
-        rejectPromise?.(
-          new CommitError({
-            message: "transaction committed with invalid validation code",
-            transactionId,
-            status: "INVALID",
-          }),
-        );
-        return;
-      }
-
-      resolvePromise?.(status);
+    const signature = Buffer.from(await this.config.signer(built.digest));
+    return {
+      proposal: fabricProtos.peer.Proposal.deserializeBinary(built.bytes),
+      proposalResponse: await new DirectPeerRuntime(
+        this.config,
+      ).processProposal(peer.endpoint, built.bytes, signature),
+      transactionId: built.transactionId,
     };
+  }
 
-    await network.addCommitListener(listener, peers, transactionId);
-
-    timeoutHandle = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      cleanup(listener);
-      rejectPromise?.(
-        new TimeoutError({
-          message: `Commit event listener timeout for transaction ${transactionId}`,
-          operation: "commit",
-          timeout: this.timeouts.commit,
-        }),
-      );
-    }, this.timeouts.commit);
+  private async submitAsyncToEndorsers(
+    peers: PeerInfo[],
+    stringArgs: NormalizedArg[],
+  ): Promise<{
+    result: Buffer;
+    transactionId: string;
+    waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
+  }> {
+    const prepared = await this.sendDirectExplicitProposal(peers, stringArgs);
+    const result = getPeerProposalPayload({
+      responses: prepared.proposalResponses,
+    });
+    const transactionPayload = buildPeerTransactionPayload(
+      prepared.proposal,
+      prepared.proposalResponses,
+    );
+    const runtime = new DirectPeerRuntime(this.config);
+    await runtime.submitEnvelope(
+      transactionPayload,
+      await signDirectTransactionPayload(this.config, transactionPayload),
+      prepared.transactionId,
+    );
 
     return {
-      waitForCommit: async () =>
-        Result.tryPromise({
-          try: async () => commitPromise,
-          catch: (error) => this.mapCommitError(error as Error, transactionId),
-        }),
-      fail: (error: Error) => {
-        if (settled) {
-          return;
-        }
+      result,
+      transactionId: prepared.transactionId,
+      waitForCommit: () =>
+        runtime.waitForCommit(this.channelName, prepared.transactionId),
+    };
+  }
 
-        settled = true;
-        cleanup(listener);
-        rejectPromise?.(error);
+  private async evaluateEndorsers(
+    peers: PeerInfo[],
+    stringArgs: NormalizedArg[],
+  ): Promise<Buffer> {
+    const prepared = await this.sendDirectExplicitProposal(peers, stringArgs);
+    return getPeerProposalPayload({ responses: prepared.proposalResponses });
+  }
+
+  private async sendDirectExplicitProposal(
+    peers: PeerInfo[],
+    stringArgs: NormalizedArg[],
+  ): Promise<{
+    proposal: PeerProposal;
+    proposalResponses: DirectProposalResponse[];
+    transactionId: string;
+  }> {
+    const built = buildPeerProposal({
+      channelName: this.channelName,
+      chaincodeName: this.chaincodeName,
+      transactionName: this.name,
+      args: stringArgs,
+      transientData: copyTransientData(this.transientData),
+      proposalCreator: {
+        mspId: this.config.identity.mspId,
+        credentials: this.config.identity.credentials,
       },
+    });
+    const signature = Buffer.from(await this.config.signer(built.digest));
+    const runtime = new DirectPeerRuntime(this.config);
+    const settled = await Promise.all(
+      peers.map(async (peer) => ({
+        peer,
+        response: await runtime.processProposal(
+          peer.endpoint,
+          built.bytes,
+          signature,
+        ),
+      })),
+    );
+    const proposalResponses = settled.map((item) => item.response);
+    validateExplicitProposalResponses(proposalResponses);
+    return {
+      proposal: fabricProtos.peer.Proposal.deserializeBinary(built.bytes),
+      proposalResponses,
+      transactionId: built.transactionId,
     };
   }
 
@@ -829,59 +762,6 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return Result.ok(result.value);
-  }
-
-  private matchPeersToEndorsers(
-    discovery: DiscoveryResult,
-    peerNames: string[],
-  ): Result<any[], PeerNotFoundError | ConfigurationError> {
-    const endorsers: any[] = [];
-    const availablePeers = Array.from(discovery.peers.keys());
-    const network = (this.contract as any).network;
-    const channel = network?.getChannel?.() || (network as any)?.channel;
-
-    if (!channel) {
-      return Result.err(
-        new PeerNotFoundError({
-          peerName: peerNames.join(", "),
-          availablePeers,
-        }),
-      );
-    }
-
-    const peerInfos = this.resolvePeerInfos(discovery, peerNames);
-    if (!peerInfos.isOk()) {
-      return Result.err(peerInfos.error);
-    }
-    const notFound: string[] = [];
-    for (const peerInfo of peerInfos.value) {
-      const endorser = channel.getEndorser?.(peerInfo.endpoint);
-      if (endorser) {
-        endorsers.push(endorser);
-        continue;
-      }
-
-      const allEndorsers = channel.getEndorsers?.() || [];
-      const matched = allEndorsers.find(
-        (candidate: { name?: string }) => candidate.name === peerInfo.endpoint,
-      );
-      if (matched) {
-        endorsers.push(matched);
-      } else {
-        notFound.push(peerInfo.endpoint);
-      }
-    }
-
-    if (notFound.length > 0) {
-      return Result.err(
-        new PeerNotFoundError({
-          peerName: notFound.join(", "),
-          availablePeers,
-        }),
-      );
-    }
-
-    return Result.ok(endorsers);
   }
 
   private resolvePeerInfos(
@@ -923,60 +803,9 @@ class PeerTransaction implements BridgeTransaction {
     return Result.ok(peerInfos);
   }
 
-  private matchPeerInfosToEndorsers(
-    discovery: DiscoveryResult,
-    peers: Array<{ name: string; endpoint: string }>,
-  ): Result<Array<{ peerName: string; endorser: any }>, PeerNotFoundError> {
-    const endorsers: Array<{ peerName: string; endorser: any }> = [];
-    const notFound: string[] = [];
-    const availablePeers = Array.from(discovery.peers.keys());
-    const network = (this.contract as any).network;
-    const channel = network?.getChannel?.() || (network as any)?.channel;
-
-    if (!channel) {
-      return Result.err(
-        new PeerNotFoundError({
-          peerName: peers.map((peer) => peer.name).join(", "),
-          availablePeers,
-        }),
-      );
-    }
-
-    const allEndorsers = channel.getEndorsers?.() || [];
-    for (const peer of peers) {
-      const endpointWithoutScheme = stripGrpcScheme(peer.endpoint);
-      const endorser =
-        channel.getEndorser?.(peer.endpoint) ??
-        channel.getEndorser?.(endpointWithoutScheme) ??
-        allEndorsers.find(
-          (candidate: { name?: string; endpoint?: string }) =>
-            candidate.name === peer.endpoint ||
-            candidate.name === endpointWithoutScheme ||
-            candidate.endpoint === peer.endpoint ||
-            candidate.endpoint === endpointWithoutScheme,
-        );
-      if (endorser) {
-        endorsers.push({ peerName: peer.endpoint, endorser });
-      } else {
-        notFound.push(peer.endpoint);
-      }
-    }
-
-    if (notFound.length > 0) {
-      return Result.err(
-        new PeerNotFoundError({
-          peerName: notFound.join(", "),
-          availablePeers,
-        }),
-      );
-    }
-
-    return Result.ok(endorsers);
-  }
-
   private singlePeerExecutionError(
     operation: string,
-    eligiblePeers: Array<{ peerName: string }>,
+    eligiblePeers: Array<{ endpoint: string }>,
     attempts: Array<{
       peer: string;
       cause: string;
@@ -989,43 +818,9 @@ class PeerTransaction implements BridgeTransaction {
       channel: this.channelName,
       chaincode: this.chaincodeName,
       transaction: this.name,
-      candidates: this.targeting.singlePeerOptions()?.candidates,
-      eligiblePeers: eligiblePeers.map((peer) => peer.peerName),
+      eligiblePeers: eligiblePeers.map((peer) => peer.endpoint),
       attempts,
     });
-  }
-
-  private getResponsePayload(proposalResponse: any): Buffer {
-    const validEndorsementResponse = proposalResponse.responses.find(
-      (endorsementResponse: { endorsement?: unknown }) =>
-        endorsementResponse.endorsement,
-    );
-
-    if (!validEndorsementResponse) {
-      const errorInfos: string[] = [];
-
-      for (const error of proposalResponse.errors ?? []) {
-        errorInfos.push(
-          `peer=${error?.connection?.name ?? "unknown"}, status=grpc, message=${error?.message ?? "unknown error"}`,
-        );
-      }
-
-      for (const response of proposalResponse.responses ?? []) {
-        errorInfos.push(
-          `peer=${response?.connection?.name ?? "unknown"}, status=${response?.response?.status ?? "unknown"}, message=${response?.response?.message ?? "unknown error"}`,
-        );
-      }
-
-      throw new EndorsementError({
-        message:
-          errorInfos.length > 0
-            ? `No valid responses from any peers. Errors:\n    ${errorInfos.join("\n    ")}`
-            : "No valid responses from any peers",
-      });
-    }
-
-    const payload = getTransactionResponse(validEndorsementResponse).payload;
-    return asBuffer(payload);
   }
 
   private mapSubmitError(
@@ -1064,32 +859,6 @@ class PeerTransaction implements BridgeTransaction {
 
     return new SubmitError({
       message: error.message,
-    });
-  }
-
-  private mapCommitError(
-    error: Error,
-    transactionId: string,
-  ): CommitError | TimeoutError {
-    if (error instanceof CommitError || error instanceof TimeoutError) {
-      return error;
-    }
-
-    if (
-      error.message?.includes("timeout") ||
-      error.message?.includes("Timeout") ||
-      error.message?.includes("TIMEOUT")
-    ) {
-      return new TimeoutError({
-        message: error.message,
-        operation: "commit",
-        timeout: this.timeouts.commit,
-      });
-    }
-
-    return new CommitError({
-      message: error.message,
-      transactionId,
     });
   }
 }
@@ -1190,49 +959,43 @@ class PeerUnsignedProposal implements BridgeUnsignedProposal {
 }
 
 class PeerSignedProposal implements BridgeSignedProposal {
-  private network: any;
+  private peerConnection: PeerDiscoverySession;
   private channelName: string;
   private config: BridgeConfig;
-  private timeouts: Required<TimeoutConfig>;
   private bytes: Buffer;
   private signature: Buffer;
   private routing: Exclude<OfflineSigningRouting, { mode: "gateway-default" }>;
   private transactionId: string;
-  private chaincodeName: string;
-  private proposal: any;
-  private header: any;
+  private proposal: PeerProposal;
 
   constructor(
-    network: fabricNetwork.Network,
+    peerConnection: PeerDiscoverySession,
     channelName: string,
     config: BridgeConfig,
     bytes: Buffer,
     signature: Buffer,
     routing: Exclude<OfflineSigningRouting, { mode: "gateway-default" }>,
   ) {
-    this.network = network as any;
+    this.peerConnection = peerConnection;
     this.channelName = channelName;
     this.config = config;
-    this.timeouts = { ...DEFAULT_TIMEOUTS, ...config.timeouts };
     this.bytes = Buffer.from(bytes);
     this.signature = Buffer.from(signature);
     this.routing = {
       mode: routing.mode,
       peers: uniqueCanonicalPeerEndpoints(
         routing.peers,
-        !!config.tlsOptions?.trustedRoots,
+        !!config.discoveryTls?.trustedRoots,
       ),
     };
-    this.proposal = fabproto6.protos.Proposal.decode(this.bytes);
-    this.header = fabproto6.common.Header.decode(this.proposal.header);
-    const channelHeader = fabproto6.common.ChannelHeader.decode(
-      this.header.channel_header,
+    this.proposal = fabricProtos.peer.Proposal.deserializeBinary(this.bytes);
+    const header = fabricProtos.common.Header.deserializeBinary(
+      this.proposal.getHeader_asU8(),
     );
-    const extension = fabproto6.protos.ChaincodeHeaderExtension.decode(
-      channelHeader.extension,
+    const channelHeader = fabricProtos.common.ChannelHeader.deserializeBinary(
+      header.getChannelHeader_asU8(),
     );
-    this.transactionId = channelHeader.tx_id;
-    this.chaincodeName = extension.chaincode_id?.name ?? "";
+    this.transactionId = channelHeader.getTxId();
   }
 
   TransactionID(): string {
@@ -1242,14 +1005,14 @@ class PeerSignedProposal implements BridgeSignedProposal {
     try {
       const proposalResponse = await this.sendProposal();
       const payload = getPeerProposalPayload(proposalResponse);
-      const txPayload = this.buildTransactionPayload(
+      const txPayload = buildPeerTransactionPayload(
+        this.proposal,
         proposalResponse.responses,
       );
       return Result.ok(
         new PeerEndorsedTransaction(
-          this.network,
           this.config,
-          this.timeouts,
+          this.channelName,
           txPayload,
           payload,
           this.transactionId,
@@ -1292,28 +1055,25 @@ class PeerSignedProposal implements BridgeSignedProposal {
     }
   }
 
-  private async sendProposal(): Promise<any> {
-    const channel = this.network.getChannel();
-    const endorsement = channel.newEndorsement(this.chaincodeName);
-    endorsement._reset();
-    endorsement._payload = this.bytes;
-    endorsement._signature = this.signature;
-    endorsement._action.proposal = this.proposal;
-    endorsement._action.header = this.header;
-    endorsement._action.transactionId = this.transactionId;
-
-    const targets = await this.resolveEndorsers(channel);
-    const proposalResponse = await endorsement.send({ targets });
-    endorsement._proposalResponses = proposalResponse.responses;
-    endorsement._proposalErrors = proposalResponse.errors;
-    return proposalResponse;
+  private async sendProposal(): Promise<DirectProposalResponseSet> {
+    const endpoints = await this.resolveSnapshottedPeerEndpoints();
+    const runtime = new DirectPeerRuntime(this.config);
+    const responses = await Promise.all(
+      endpoints.map((endpoint) =>
+        runtime.processProposal(endpoint, this.bytes, this.signature),
+      ),
+    );
+    if (this.routing.mode === "endorsing-peers") {
+      validateExplicitProposalResponses(responses);
+    }
+    return { responses, errors: [] };
   }
 
-  private async resolveEndorsers(channel: any): Promise<any[]> {
+  private async resolveSnapshottedPeerEndpoints(): Promise<string[]> {
     const discovery = await discoveredPeerEndpoints(
-      this.network,
+      this.peerConnection,
       this.channelName,
-      !!this.config.tlsOptions?.trustedRoots,
+      !!this.config.discoveryTls?.trustedRoots,
     );
     const missingFromDiscovery = this.routing.peers.filter(
       (endpoint) => !discovery.has(endpoint),
@@ -1324,100 +1084,26 @@ class PeerSignedProposal implements BridgeSignedProposal {
         availablePeers: Array.from(discovery),
       });
     }
-
-    const allEndorsers = channel.getEndorsers?.() ?? [];
-    const targets = this.routing.peers
-      .map((endpoint) => {
-        const endorserName = stripGrpcScheme(endpoint);
-        return (
-          channel.getEndorser?.(endpoint) ??
-          channel.getEndorser?.(endorserName) ??
-          allEndorsers.find(
-            (candidate: { name?: string }) =>
-              candidate.name === endpoint || candidate.name === endorserName,
-          )
-        );
-      })
-      .filter(Boolean);
-
-    if (targets.length !== this.routing.peers.length) {
-      throw new PeerNotFoundError({
-        peerName: this.routing.peers.join(", "),
-        availablePeers: allEndorsers.map(
-          (endorser: { name?: string }) => endorser.name ?? "<unknown>",
-        ),
-      });
-    }
-    return targets;
-  }
-
-  private buildTransactionPayload(proposalResponses: any[]): Buffer {
-    const validResponses = proposalResponses.filter(
-      (response) => response?.endorsement,
-    );
-    if (validResponses.length === 0) {
-      throw new EndorsementError({ message: "No valid endorsements found" });
-    }
-
-    const endorsements = validResponses.map((response) => response.endorsement);
-    const proposalResponse = validResponses[0];
-    const chaincodeEndorsedAction =
-      fabproto6.protos.ChaincodeEndorsedAction.create({
-        proposal_response_payload: proposalResponse.payload,
-        endorsements,
-      });
-    const originalProposalPayload =
-      fabproto6.protos.ChaincodeProposalPayload.decode(this.proposal.payload);
-    const proposalPayloadNoTransient =
-      fabproto6.protos.ChaincodeProposalPayload.create({
-        input: originalProposalPayload.input,
-      });
-    const proposalPayloadNoTransientBytes =
-      fabproto6.protos.ChaincodeProposalPayload.encode(
-        proposalPayloadNoTransient,
-      ).finish();
-    const actionPayload = fabproto6.protos.ChaincodeActionPayload.create({
-      action: chaincodeEndorsedAction,
-      chaincode_proposal_payload: proposalPayloadNoTransientBytes,
-    });
-    const actionPayloadBytes =
-      fabproto6.protos.ChaincodeActionPayload.encode(actionPayload).finish();
-    const transactionAction = fabproto6.protos.TransactionAction.create({
-      header: this.header.signature_header,
-      payload: actionPayloadBytes,
-    });
-    const transaction = fabproto6.protos.Transaction.create({
-      actions: [transactionAction],
-    });
-    const transactionBytes =
-      fabproto6.protos.Transaction.encode(transaction).finish();
-    const payload = fabproto6.common.Payload.create({
-      header: this.header,
-      data: transactionBytes,
-    });
-    return Buffer.from(fabproto6.common.Payload.encode(payload).finish());
+    return [...this.routing.peers];
   }
 }
 
 class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
-  private network: any;
   private config: BridgeConfig;
-  private timeouts: Required<TimeoutConfig>;
+  private channelName: string;
   private bytes: Buffer;
   private result: Buffer;
   private transactionId: string;
 
   constructor(
-    network: fabricNetwork.Network,
     config: BridgeConfig,
-    timeouts: Required<TimeoutConfig>,
+    channelName: string,
     bytes: Buffer,
     result: Buffer,
     transactionId: string,
   ) {
-    this.network = network as any;
     this.config = config;
-    this.timeouts = timeouts;
+    this.channelName = channelName;
     this.bytes = Buffer.from(bytes);
     this.result = Buffer.from(result);
     this.transactionId = transactionId;
@@ -1436,48 +1122,17 @@ class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
     return this.transactionId;
   }
 
-  SigningRequest(): SigningRequest {
-    return signingRequest(this.bytes, this.Digest());
-  }
-
-  WithSignature(
-    signature: Buffer | Uint8Array | string,
-  ): BridgeResult<SignedMessage> {
-    return signedMessage(this.SigningRequest(), signature);
-  }
-
   async SubmitAsync(): Promise<BridgeResult<BridgeSubmittedTx>> {
-    return this.submitAsyncWithSignature(await this.config.signer(digestBytes(this.bytes)));
-  }
-
-  private async submitAsyncWithSignature(
-    signature: Buffer | Uint8Array,
-  ): Promise<BridgeResult<BridgeSubmittedTx>> {
     try {
-      const channel = this.network.getChannel();
-      const peers = channel.getEndorsers?.() ?? [];
-      const commitWaiter = await createPeerCommitWaiter(
-        this.network,
-        peers,
+      const runtime = new DirectPeerRuntime(this.config);
+      await runtime.submitEnvelope(
+        this.bytes,
+        await signDirectTransactionPayload(this.config, this.bytes),
         this.transactionId,
-        this.timeouts.commit,
       );
-      const commit = channel.newCommit("_offline");
-      commit._reset();
-      commit._payload = this.bytes;
-      commit._signature = Buffer.from(signature);
-      const response = await commit.send({ targets: channel.getCommitters() });
-      if (response.status !== "SUCCESS") {
-        throw new SubmitError({
-          message: `Failed to commit transaction ${this.transactionId}, orderer response status: ${response.status}`,
-          transactionId: this.transactionId,
-        });
-      }
       return Result.ok(
-        new PeerSubmittedTx(
-          this.result,
-          this.transactionId,
-          commitWaiter.waitForCommit,
+        new PeerSubmittedTx(this.result, this.transactionId, () =>
+          runtime.waitForCommit(this.channelName, this.transactionId),
         ),
       );
     } catch (error) {
@@ -1494,31 +1149,6 @@ class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
 
   async Submit(): Promise<BridgeResult<BridgeCommitResult>> {
     const submitted = await this.SubmitAsync();
-    if (!submitted.isOk()) return Result.err(submitted.error);
-    const status = await submitted.value.WaitForCommit();
-    if (!status.isOk()) return Result.err(status.error);
-    return Result.ok(new PeerCommitResult(submitted.value, status.value));
-  }
-
-  async SubmitWithSignature(
-    signature: Buffer | Uint8Array | string,
-  ): Promise<BridgeResult<BridgeCommitResult>> {
-    const signed = this.WithSignature(signature);
-    if (!signed.isOk()) return Result.err(signed.error);
-
-    const decoded = decodeSignedMessage(signed.value);
-    if (!decoded.isOk()) return Result.err(decoded.error);
-
-    if (!decoded.value.digest.equals(this.Digest())) {
-      return Result.err(
-        new OfflineSigningError({
-          field: "digest",
-          message: "digest does not match transaction bytes",
-        }),
-      );
-    }
-
-    const submitted = await this.submitAsyncWithSignature(decoded.value.signature);
     if (!submitted.isOk()) return Result.err(submitted.error);
     const status = await submitted.value.WaitForCommit();
     if (!status.isOk()) return Result.err(status.error);
@@ -1546,7 +1176,9 @@ function decodePeerSignedMessage(message: SignedMessage): BridgeResult<{
   return Result.ok(decoded.value);
 }
 
-function getPeerProposalPayload(proposalResponse: any): Buffer {
+function getPeerProposalPayload(
+  proposalResponse: DirectProposalResponseSet,
+): Buffer {
   const valid = proposalResponse.responses?.find(
     (response: { endorsement?: unknown }) => response.endorsement,
   );
@@ -1555,10 +1187,109 @@ function getPeerProposalPayload(proposalResponse: any): Buffer {
       message: noValidPeerResponsesMessage(proposalResponse),
     });
   }
-  return asBuffer(getTransactionResponse(valid).payload);
+  if (valid.response?.payload) {
+    return Buffer.from(valid.response.payload);
+  }
+  throw new EndorsementError({
+    message: "proposal response has no chaincode result payload",
+  });
 }
 
-function noValidPeerResponsesMessage(proposalResponse: any): string {
+export function validateExplicitProposalResponses(
+  proposalResponses: DirectProposalResponse[],
+): void {
+  if (proposalResponses.length === 0) {
+    throw new EndorsementError({
+      message: "at least one proposal response is required",
+    });
+  }
+
+  const first = proposalResponses[0]!;
+  validateExplicitProposalResponse(first);
+  const firstPayload = Buffer.from(first.payload ?? []);
+
+  for (const response of proposalResponses.slice(1)) {
+    validateExplicitProposalResponse(response);
+    if (!firstPayload.equals(Buffer.from(response.payload ?? []))) {
+      throw new EndorsementError({
+        message: "proposal response payloads do not match",
+      });
+    }
+  }
+}
+
+function validateExplicitProposalResponse(
+  response: DirectProposalResponse,
+): void {
+  if (!response) {
+    throw new EndorsementError({ message: "proposal response is empty" });
+  }
+  const status = response.response?.status ?? 0;
+  if (status < 200 || status >= 400) {
+    throw new EndorsementError({
+      message: `proposal response was not successful, status ${status}: ${response.response?.message ?? ""}`,
+    });
+  }
+  if (!response.endorsement) {
+    throw new EndorsementError({
+      message: "proposal response has no endorsement",
+    });
+  }
+}
+
+export function buildPeerTransactionPayload(
+  proposal: PeerProposal,
+  proposalResponses: DirectProposalResponse[],
+): Buffer {
+  const validResponses = proposalResponses.filter(hasEndorsement);
+  if (validResponses.length === 0) {
+    throw new EndorsementError({ message: "No valid endorsements found" });
+  }
+
+  const header = fabricProtos.common.Header.deserializeBinary(
+    proposal.getHeader_asU8(),
+  );
+  const endorsements = validResponses.map((response) => {
+    const endorsement = new fabricProtos.peer.Endorsement();
+    endorsement.setEndorser(response.endorsement.endorser);
+    endorsement.setSignature(response.endorsement.signature);
+    return endorsement;
+  });
+  const proposalResponse = validResponses[0]!;
+  const chaincodeEndorsedAction =
+    new fabricProtos.peer.ChaincodeEndorsedAction();
+  chaincodeEndorsedAction.setProposalResponsePayload(proposalResponse.payload);
+  chaincodeEndorsedAction.setEndorsementsList(endorsements);
+  const originalProposalPayload =
+    fabricProtos.peer.ChaincodeProposalPayload.deserializeBinary(
+      proposal.getPayload_asU8(),
+    );
+  const proposalPayloadNoTransient =
+    new fabricProtos.peer.ChaincodeProposalPayload();
+  proposalPayloadNoTransient.setInput(originalProposalPayload.getInput_asU8());
+
+  const actionPayload = new fabricProtos.peer.ChaincodeActionPayload();
+  actionPayload.setAction(chaincodeEndorsedAction);
+  actionPayload.setChaincodeProposalPayload(
+    proposalPayloadNoTransient.serializeBinary(),
+  );
+
+  const transactionAction = new fabricProtos.peer.TransactionAction();
+  transactionAction.setHeader(header.getSignatureHeader_asU8());
+  transactionAction.setPayload(actionPayload.serializeBinary());
+
+  const transaction = new fabricProtos.peer.Transaction();
+  transaction.setActionsList([transactionAction]);
+
+  const payload = new fabricProtos.common.Payload();
+  payload.setHeader(header);
+  payload.setData(transaction.serializeBinary());
+  return Buffer.from(payload.serializeBinary());
+}
+
+function noValidPeerResponsesMessage(
+  proposalResponse: DirectProposalResponseSet,
+): string {
   const errorInfos: string[] = [];
 
   for (const error of proposalResponse.errors ?? []) {
@@ -1569,91 +1300,13 @@ function noValidPeerResponsesMessage(proposalResponse: any): string {
 
   for (const response of proposalResponse.responses ?? []) {
     errorInfos.push(
-      `peer=${response?.connection?.name ?? "unknown"}, status=${response?.response?.status ?? "unknown"}, message=${response?.response?.message ?? "unknown error"}`,
+      `status=${response.response?.status ?? "unknown"}, message=${response.response?.message ?? "unknown error"}`,
     );
   }
 
   return errorInfos.length > 0
     ? `No valid responses from any peers. Errors:\n    ${errorInfos.join("\n    ")}`
     : "No valid responses from any peers";
-}
-
-async function createPeerCommitWaiter(
-  network: any,
-  peers: any[],
-  transactionId: string,
-  timeout: number,
-): Promise<{
-  waitForCommit: () => Promise<BridgeResult<CommitStatus>>;
-}> {
-  let settled = false;
-  let timeoutHandle: NodeJS.Timeout | undefined;
-  let resolvePromise: ((status: CommitStatus) => void) | undefined;
-  let rejectPromise: ((error: Error) => void) | undefined;
-  const commitPromise = new Promise<CommitStatus>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  const cleanup = (listener: fabricNetwork.CommitListener) => {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    try {
-      network.removeCommitListener(listener);
-    } catch {}
-  };
-  const listener: fabricNetwork.CommitListener = (error, event) => {
-    if (settled) return;
-    settled = true;
-    cleanup(listener);
-    if (error) {
-      rejectPromise?.(
-        new CommitError({ message: error.message, transactionId }),
-      );
-      return;
-    }
-    if (!event) {
-      rejectPromise?.(
-        new CommitError({ message: "Missing commit event", transactionId }),
-      );
-      return;
-    }
-    const blockEvent = event.getBlockEvent();
-    const status: CommitStatus = {
-      blockNumber: BigInt(blockEvent.blockNumber.toString()),
-      status: event.isValid ? "VALID" : "INVALID",
-      transactionId,
-    };
-    if (!event.isValid) {
-      rejectPromise?.(
-        new CommitError({
-          message: "transaction committed with invalid validation code",
-          transactionId,
-          status: "INVALID",
-        }),
-      );
-      return;
-    }
-    resolvePromise?.(status);
-  };
-  await network.addCommitListener(listener, peers, transactionId);
-  timeoutHandle = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    cleanup(listener);
-    rejectPromise?.(
-      new TimeoutError({
-        message: `Commit event listener timeout for transaction ${transactionId}`,
-        operation: "commit",
-        timeout,
-      }),
-    );
-  }, timeout);
-  return {
-    waitForCommit: async () =>
-      Result.tryPromise({
-        try: async () => commitPromise,
-        catch: (error) => error as CommitError | TimeoutError,
-      }),
-  };
 }
 
 function normalizeArgs(args: unknown[]): NormalizedArg[] {
@@ -1680,46 +1333,37 @@ function normalizeSnapshotPeerEndpoints(
   peers: string[],
   tlsEnabled: boolean,
 ): BridgeResult<string[]> {
-  try {
-    return Result.ok(uniqueCanonicalPeerEndpoints(peers, tlsEnabled));
-  } catch (error) {
-    return Result.err(
-      new OfflineSigningError({
-        field: "routing.peers",
-        message: error instanceof Error ? error.message : String(error),
-      }),
-    );
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const peer of peers) {
+    const normalized = normalizePeerEndpointIdentityResult(peer, tlsEnabled);
+    if (!normalized.isOk()) {
+      return Result.err(
+        new OfflineSigningError({
+          field: "routing.peers",
+          message: normalized.error.message,
+        }),
+      );
+    }
+    if (seen.has(normalized.value)) {
+      continue;
+    }
+    seen.add(normalized.value);
+    out.push(normalized.value);
   }
+  return Result.ok(out);
 }
 
 async function discoveredPeerEndpoints(
-  network: any,
+  peerConnection: PeerDiscoverySession,
   channelName: string,
-  tlsEnabled: boolean,
+  _tlsEnabled: boolean,
 ): Promise<Set<string>> {
-  const service = network.discoveryService;
-  if (service?.getDiscoveryResults) {
-    await service.getDiscoveryResults(true);
+  const discovery = await peerConnection.discover(channelName);
+  if (!discovery.isOk()) {
+    throw discovery.error;
   }
-
-  const results = service?.discoveryResults ?? {};
-  const out = new Set<string>();
-  for (const orgInfo of Object.values(results.peers_by_org ?? {})) {
-    for (const peer of (orgInfo as { peers?: Array<{ endpoint?: string }> })
-      .peers ?? []) {
-      if (!peer.endpoint) {
-        continue;
-      }
-      const endpoint = normalizePeerEndpointIdentity(peer.endpoint, tlsEnabled);
-      if (out.has(endpoint)) {
-        throw new DiscoveryError({
-          message: `Discovery returned duplicate peer endpoint identity for channel ${channelName}: ${endpoint}`,
-        });
-      }
-      out.add(endpoint);
-    }
-  }
-  return out;
+  return new Set(discovery.value.peers.keys());
 }
 
 function uniquePeerEndpoints(
@@ -1736,15 +1380,6 @@ function uniquePeerEndpoints(
     }
   }
   return out;
-}
-
-function stripGrpcScheme(endpoint: string): string {
-  const lower = endpoint.toLowerCase();
-  if (lower.startsWith("grpc://") || lower.startsWith("grpcs://")) {
-    return endpoint.slice(endpoint.indexOf("://") + 3);
-  }
-
-  return endpoint;
 }
 
 function copyTransientData(

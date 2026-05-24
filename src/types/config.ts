@@ -27,7 +27,9 @@ export interface TlsOptions {
 }
 
 export interface BridgeConfig {
-  gatewayPeer: string;
+  gatewayEndpoint: string;
+  discoverySeed?: string;
+  ordererEndpoint?: string;
   
   identity: {
     mspId: string;
@@ -36,7 +38,9 @@ export interface BridgeConfig {
   
   signer: Signer;
   
-  tlsOptions?: TlsOptions;
+  gatewayTls?: TlsOptions;
+  discoveryTls?: TlsOptions;
+  ordererTls?: TlsOptions;
   
   discovery?: boolean;
   

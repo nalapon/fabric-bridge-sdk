@@ -10,8 +10,7 @@ const namedCurves = {
 /**
  * Creates a private-key signer that returns the signature synchronously.
  *
- * Use this signer when peer targeting is enabled through fabric-network. The
- * legacy fabric-network signing path cannot await Promise-returning signers.
+ * Use this signer when an integration needs a synchronous bridge signer.
  */
 export function createSyncPrivateKeySigner(key: KeyObject): Signer {
   if (key.type !== "private") {
