@@ -467,13 +467,6 @@ func createLegacyProposal(txID string, channelName string, chaincodeName string,
 func (t *Transaction) submitAsyncWithPeerTargeting(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
 
-	if bridge.config.OrdererEndpoint == "" {
-		return nil, &ConfigurationError{
-			Field:   "ordererEndpoint",
-			Message: "ordererEndpoint is required for Submit and SubmitAsync when peer targeting is enabled",
-		}
-	}
-
 	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {
 		return nil, &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
@@ -528,13 +521,6 @@ func (t *Transaction) Evaluate(ctx context.Context, args ...string) ([]byte, err
 
 func (t *Transaction) submitAsyncWithSinglePeer(ctx context.Context, args []string) (*SubmittedTransaction, error) {
 	bridge := t.contract.network.bridge
-
-	if bridge.config.OrdererEndpoint == "" {
-		return nil, &ConfigurationError{
-			Field:   "ordererEndpoint",
-			Message: "ordererEndpoint is required for Submit and SubmitAsync when UseSinglePeer is enabled",
-		}
-	}
 
 	pc, err := newPeerRuntime(bridge.config, t.contract.network.channel)
 	if err != nil {

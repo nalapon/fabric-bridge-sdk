@@ -8,7 +8,7 @@ Go SDK for Hyperledger Fabric applications that need both the normal Gateway pat
 - **Single peer**: call `UseSinglePeer()` to endorse through one discovered peer, then submit directly to the orderer and wait for commit status through Gateway.
 - **Explicit endorsement**: call `UseEndorsingPeers(...)` to endorse concurrently through the exact discovered peers supplied by the caller, then submit directly to the orderer and wait for commit status through Gateway.
 
-Fabric service discovery is part of the direct endorsement model. `DiscoverySeed` defaults to `GatewayEndpoint`, but production code should set it explicitly when gateway, discovery, and orderer endpoints are different.
+Fabric service discovery is part of the direct endorsement model. `DiscoverySeed` defaults to `GatewayEndpoint`, and direct endorsement submit uses discovered orderers unless `WithOrderer(...)` is provided as an explicit override.
 
 ## Installation
 
@@ -25,7 +25,6 @@ cd go
 
 export FABRIC_BRIDGE_GATEWAY_ENDPOINT=peer0.org1.example.com:7051
 export FABRIC_BRIDGE_DISCOVERY_SEED=peer0.org1.example.com:7051
-export FABRIC_BRIDGE_ORDERER_ENDPOINT=orderer.example.com:7050
 export FABRIC_BRIDGE_MSP_ID=Org1MSP
 export FABRIC_BRIDGE_CERT_PATH=/path/to/signcert.pem
 export FABRIC_BRIDGE_KEY_PATH=/path/to/private-key.pem
@@ -60,7 +59,6 @@ config := fabricbridge.NewConfig(
     },
     signer,
     fabricbridge.WithDiscoverySeed("peer0.org1.example.com:7051"),
-    fabricbridge.WithOrderer("orderer.example.com:7050"),
     fabricbridge.WithGatewayTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),
     fabricbridge.WithDiscoveryTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),
     fabricbridge.WithOrdererTLS(fabricbridge.TLSOptions{TrustedRoots: tlsRootPEM}),

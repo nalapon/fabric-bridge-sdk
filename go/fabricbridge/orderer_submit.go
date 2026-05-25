@@ -8,12 +8,16 @@ import (
 	ordererProto "github.com/hyperledger/fabric-protos-go-apiv2/orderer"
 )
 
-func submitEnvelopeToOrderer(ctx context.Context, cfg Config, envelope *common.Envelope, txID string) error {
+func submitEnvelopeToOrderer(ctx context.Context, cfg Config, envelope *common.Envelope, txID string, discoveredOrdererEndpoint ...string) error {
 	cfg = cfg.normalized()
-	if cfg.OrdererEndpoint == "" {
+	ordererEndpoint := cfg.OrdererEndpoint
+	if ordererEndpoint == "" && len(discoveredOrdererEndpoint) > 0 {
+		ordererEndpoint = discoveredOrdererEndpoint[0]
+	}
+	if ordererEndpoint == "" {
 		return &ConfigurationError{
 			Field:   "ordererEndpoint",
-			Message: "ordererEndpoint is required for direct endorsement submit",
+			Message: "ordererEndpoint is required for direct endorsement submit when discovery returns no orderer endpoints",
 		}
 	}
 
@@ -23,7 +27,7 @@ func submitEnvelopeToOrderer(ctx context.Context, cfg Config, envelope *common.E
 		defer cancel()
 	}
 
-	conn, err := createGRPCConnectionTo(cfg.OrdererEndpoint, cfg.OrdererTLS)
+	conn, err := createGRPCConnectionTo(ordererEndpoint, cfg.OrdererTLS)
 	if err != nil {
 		return &SubmitError{Message: fmt.Sprintf("connect orderer: %v", err), TransactionID: txID}
 	}

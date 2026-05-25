@@ -77,13 +77,17 @@ export async function newSignedDiscoveryRequest(
   auth.setClientIdentity(identity.serializeBinary());
   auth.setClientTlsCertHash(discoveryTLSCertHash(config.discoveryTls));
 
-  const query = new discoveryProto.Query();
-  query.setChannel(channelName);
-  query.setPeerQuery(new discoveryProto.PeerMembershipQuery());
+  const peerQuery = new discoveryProto.Query();
+  peerQuery.setChannel(channelName);
+  peerQuery.setPeerQuery(new discoveryProto.PeerMembershipQuery());
+
+  const configQuery = new discoveryProto.Query();
+  configQuery.setChannel(channelName);
+  configQuery.setConfigQuery(new discoveryProto.ConfigQuery());
 
   const request = new discoveryProto.Request();
   request.setAuthentication(auth);
-  request.setQueriesList([query]);
+  request.setQueriesList([peerQuery, configQuery]);
 
   const payload = request.serializeBinary();
   const signature = await config.signer(createHash("sha256").update(payload).digest());
@@ -116,32 +120,71 @@ export function discoveryResultFromResponseResult(
   }
 
   const results = response.getResultsList();
-  if (results.length !== 1) {
+  if (results.length === 0) {
     return Result.err(
-      new DiscoveryError({ message: `expected 1 discovery result, got ${results.length}` }),
+      new DiscoveryError({ message: "empty discovery results" }),
     );
   }
 
-  const result = results[0]!;
-  const discoveryError = result.getError();
-  if (discoveryError) {
-    return Result.err(
-      new DiscoveryError({ message: `discovery service error: ${discoveryError.getContent()}` }),
-    );
+  const peers = new Map<string, PeerInfo>();
+  const orderers: OrdererInfo[] = [];
+
+  for (const result of results) {
+    const discoveryError = result.getError();
+    if (discoveryError) {
+      return Result.err(
+        new DiscoveryError({ message: `discovery service error: ${discoveryError.getContent()}` }),
+      );
+    }
+
+    const members = result.getMembers();
+    if (members) {
+      const parsedPeers = peersFromMembershipResult(members, tlsEnabled);
+      if (!parsedPeers.isOk()) {
+        return Result.err(parsedPeers.error);
+      }
+      for (const [endpoint, peer] of parsedPeers.value.entries()) {
+        if (peers.has(endpoint)) {
+          return Result.err(
+            new DiscoveryError({
+              message: `Discovery returned duplicate peer endpoint identity: ${endpoint}`,
+            }),
+          );
+        }
+        peers.set(endpoint, peer);
+      }
+      continue;
+    }
+
+    const config = result.getConfigResult();
+    if (config) {
+      orderers.push(...orderersFromConfigResult(config));
+    }
   }
 
-  const members = result.getMembers();
-  if (!members) {
+  if (peers.size === 0) {
     return Result.err(new DiscoveryError({ message: "expected peer membership result" }));
   }
 
+  return Result.ok({
+    timestamp: Date.now(),
+    channelName,
+    peers,
+    orderers,
+    msps: new Map<string, MSPInfo>(),
+  });
+}
+
+function peersFromMembershipResult(
+  members: DiscoveryProto.PeerMembershipResult,
+  tlsEnabled: boolean,
+): Result<Map<string, PeerInfo>, DiscoveryError | ConfigurationError> {
   const peers = new Map<string, PeerInfo>();
   const orgEntries: Array<[string, DiscoveryProto.Peers]> = [];
   members.getPeersByOrgMap().forEach((orgPeers: DiscoveryProto.Peers, mspId: string) => {
     orgEntries.push([mspId, orgPeers]);
   });
   orgEntries.sort(([left], [right]) => left.localeCompare(right));
-
   for (const [mspId, orgPeers] of orgEntries) {
     for (const peer of orgPeers.getPeersList()) {
       const rawEndpoint = peerEndpointFromDiscoveryPeerResult(peer);
@@ -173,14 +216,26 @@ export function discoveryResultFromResponseResult(
       });
     }
   }
+  return Result.ok(peers);
+}
 
-  return Result.ok({
-    timestamp: Date.now(),
-    channelName,
-    peers,
-    orderers: [] satisfies OrdererInfo[],
-    msps: new Map<string, MSPInfo>(),
+function orderersFromConfigResult(config: DiscoveryProto.ConfigResult): OrdererInfo[] {
+  const orderers: OrdererInfo[] = [];
+  config.getOrderersMap().forEach((endpoints: DiscoveryProto.Endpoints, mspId: string) => {
+    for (const endpoint of endpoints.getEndpointList()) {
+      const host = endpoint.getHost().trim();
+      const port = endpoint.getPort();
+      if (!host || port === 0) {
+        continue;
+      }
+      orderers.push({ endpoint: `${host}:${port}`, mspId });
+    }
   });
+  return orderers.sort((a, b) =>
+    a.endpoint === b.endpoint
+      ? a.mspId.localeCompare(b.mspId)
+      : a.endpoint.localeCompare(b.endpoint),
+  );
 }
 
 function createDiscoveryCredentials(tlsOptions: TlsOptions | undefined): grpc.ChannelCredentials {

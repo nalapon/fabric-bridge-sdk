@@ -17,7 +17,7 @@ import type {
   ProposalCreator,
 } from "../types/bridge";
 import type { BridgeConfig, TimeoutConfig } from "../types/config";
-import type { DiscoveryResult, PeerInfo } from "../types/discovery";
+import type { DiscoveryResult, OrdererInfo, PeerInfo } from "../types/discovery";
 import {
   ConfigurationError,
   DiscoveryError,
@@ -622,6 +622,7 @@ class PeerTransaction implements BridgeTransaction {
       transactionPayload,
       await signDirectTransactionPayload(this.config, transactionPayload),
       prepared.transactionId,
+      await this.resolveSubmitOrdererEndpoint(),
     );
 
     return {
@@ -690,6 +691,7 @@ class PeerTransaction implements BridgeTransaction {
       transactionPayload,
       await signDirectTransactionPayload(this.config, transactionPayload),
       prepared.transactionId,
+      await this.resolveSubmitOrdererEndpoint(),
     );
 
     return {
@@ -762,6 +764,18 @@ class PeerTransaction implements BridgeTransaction {
     }
 
     return Result.ok(result.value);
+  }
+
+  private async resolveSubmitOrdererEndpoint(): Promise<string | undefined> {
+    if (this.config.ordererEndpoint) {
+      return this.config.ordererEndpoint;
+    }
+
+    const discovery = await this.ensureDiscovery();
+    if (!discovery.isOk()) {
+      throw discovery.error;
+    }
+    return selectDiscoveredOrdererEndpoint(discovery.value.orderers);
   }
 
   private resolvePeerInfos(
@@ -1012,6 +1026,7 @@ class PeerSignedProposal implements BridgeSignedProposal {
       return Result.ok(
         new PeerEndorsedTransaction(
           this.config,
+          this.peerConnection,
           this.channelName,
           txPayload,
           payload,
@@ -1090,6 +1105,7 @@ class PeerSignedProposal implements BridgeSignedProposal {
 
 class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
   private config: BridgeConfig;
+  private peerConnection: PeerDiscoverySession;
   private channelName: string;
   private bytes: Buffer;
   private result: Buffer;
@@ -1097,12 +1113,14 @@ class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
 
   constructor(
     config: BridgeConfig,
+    peerConnection: PeerDiscoverySession,
     channelName: string,
     bytes: Buffer,
     result: Buffer,
     transactionId: string,
   ) {
     this.config = config;
+    this.peerConnection = peerConnection;
     this.channelName = channelName;
     this.bytes = Buffer.from(bytes);
     this.result = Buffer.from(result);
@@ -1129,6 +1147,7 @@ class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
         this.bytes,
         await signDirectTransactionPayload(this.config, this.bytes),
         this.transactionId,
+        await this.resolveSubmitOrdererEndpoint(),
       );
       return Result.ok(
         new PeerSubmittedTx(this.result, this.transactionId, () =>
@@ -1145,6 +1164,18 @@ class PeerEndorsedTransaction implements BridgeEndorsedTransaction {
             }),
       );
     }
+  }
+
+  private async resolveSubmitOrdererEndpoint(): Promise<string | undefined> {
+    if (this.config.ordererEndpoint) {
+      return this.config.ordererEndpoint;
+    }
+
+    const discovery = await this.peerConnection.discover(this.channelName);
+    if (!discovery.isOk()) {
+      throw discovery.error;
+    }
+    return selectDiscoveredOrdererEndpoint(discovery.value.orderers);
   }
 
   async Submit(): Promise<BridgeResult<BridgeCommitResult>> {
@@ -1364,6 +1395,16 @@ async function discoveredPeerEndpoints(
     throw discovery.error;
   }
   return new Set(discovery.value.peers.keys());
+}
+
+function selectDiscoveredOrdererEndpoint(
+  orderers: OrdererInfo[],
+): string | undefined {
+  return [...orderers].sort((a, b) =>
+    a.endpoint === b.endpoint
+      ? a.mspId.localeCompare(b.mspId)
+      : a.endpoint.localeCompare(b.endpoint),
+  )[0]?.endpoint;
 }
 
 function uniquePeerEndpoints(

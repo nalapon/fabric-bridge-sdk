@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -52,15 +54,22 @@ func TestDirectDiscoveryContactsSeedAndParsesPeers(t *testing.T) {
 		WithDiscoverySeed(address),
 	)
 
-	peers, err := newDirectDiscoveryClient(cfg).DiscoverPeers(context.Background(), "mychannel")
+	discovered, err := newDirectDiscoveryClient(cfg).Discover(context.Background(), "mychannel")
 	if err != nil {
 		t.Fatalf("expected discovery success, got %v", err)
 	}
+	peers := discovered.Peers
 	if got, want := len(peers), 2; got != want {
 		t.Fatalf("peer count mismatch: got %d want %d", got, want)
 	}
 	if peers[0].MSPID() != "Org1MSP" || peers[0].URL() != "Peer0.Org1.Example.com:7051" {
 		t.Fatalf("first peer mismatch: MSP=%q URL=%q", peers[0].MSPID(), peers[0].URL())
+	}
+	if got, want := len(discovered.Orderers), 1; got != want {
+		t.Fatalf("orderer count mismatch: got %d want %d", got, want)
+	}
+	if discovered.Orderers[0].MSPID != "OrdererMSP" || discovered.Orderers[0].Endpoint != "orderer.example.com:7050" {
+		t.Fatalf("orderer mismatch: %#v", discovered.Orderers[0])
 	}
 
 	server.mu.Lock()
@@ -85,7 +94,7 @@ func TestDirectDiscoveryContactsSeedAndParsesPeers(t *testing.T) {
 	if identity.GetMspid() != testIdentity.MSPId {
 		t.Fatalf("identity MSP mismatch: got %q want %q", identity.GetMspid(), testIdentity.MSPId)
 	}
-	if len(decoded.GetQueries()) != 1 || decoded.GetQueries()[0].GetChannel() != "mychannel" || decoded.GetQueries()[0].GetPeerQuery() == nil {
+	if len(decoded.GetQueries()) != 2 || decoded.GetQueries()[0].GetChannel() != "mychannel" || decoded.GetQueries()[0].GetPeerQuery() == nil || decoded.GetQueries()[1].GetConfigQuery() == nil {
 		t.Fatalf("unexpected discovery query: %#v", decoded.GetQueries())
 	}
 }
@@ -173,7 +182,27 @@ func discoveryPeerMembershipResponse(t *testing.T, peersByOrg map[string][]strin
 	}
 	return &discoveryProto.Response{Results: []*discoveryProto.QueryResult{
 		{Result: &discoveryProto.QueryResult_Members{Members: &discoveryProto.PeerMembershipResult{PeersByOrg: byOrg}}},
+		{Result: &discoveryProto.QueryResult_ConfigResult{ConfigResult: discoveryConfigResult(map[string][]string{
+			"OrdererMSP": {"orderer.example.com:7050"},
+		})}},
 	}}
+}
+
+func discoveryConfigResult(orderersByOrg map[string][]string) *discoveryProto.ConfigResult {
+	orderers := make(map[string]*discoveryProto.Endpoints, len(orderersByOrg))
+	for mspID, values := range orderersByOrg {
+		for _, value := range values {
+			host, portText, _ := strings.Cut(value, ":")
+			port, _ := strconv.Atoi(portText)
+			orderers[mspID] = &discoveryProto.Endpoints{
+				Endpoint: append(orderers[mspID].GetEndpoint(), &discoveryProto.Endpoint{
+					Host: host,
+					Port: uint32(port),
+				}),
+			}
+		}
+	}
+	return &discoveryProto.ConfigResult{Orderers: orderers}
 }
 
 func discoveryMembershipEnvelope(t *testing.T, endpoint string) *gossipProto.Envelope {

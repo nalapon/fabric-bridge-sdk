@@ -10,7 +10,7 @@ const TEST_NETWORK_DIR =
   process.env.FABRIC_TEST_NETWORK_DIR ?? path.resolve("fabric-samples/test-network");
 const CHAINCODE = process.env.FABRIC_CHAINCODE ?? "basic";
 const CHANNEL = process.env.FABRIC_CHANNEL ?? "mychannel";
-const ORDERER_ENDPOINT = process.env.FABRIC_ORDERER_ENDPOINT ?? "localhost:7050";
+const ORDERER_ENDPOINT = process.env.FABRIC_ORDERER_ENDPOINT;
 const ORDERER_TLS_PATH =
   process.env.FABRIC_ORDERER_TLS_CERT ??
   path.join(
@@ -22,7 +22,7 @@ interface OrgRole {
   mspId: string;
   gatewayEndpoint: string;
   discoverySeed: string;
-  ordererEndpoint: string;
+  ordererEndpoint?: string;
   explicitEndorsementPeers: string[];
   certPath: string;
   keyDirectory: string;
@@ -195,7 +195,7 @@ async function withContract(
   const bridge = new FabricBridge({
     gatewayEndpoint: org.gatewayEndpoint,
     discoverySeed: org.discoverySeed,
-    ordererEndpoint: org.ordererEndpoint,
+    ...(org.ordererEndpoint ? { ordererEndpoint: org.ordererEndpoint } : {}),
     identity: {
       mspId: org.mspId,
       credentials: certificate,

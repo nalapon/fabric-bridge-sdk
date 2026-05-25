@@ -42,6 +42,7 @@ type proposalResponse struct {
 
 type peerRuntime interface {
 	Close()
+	Discover(channelName string) (*discoveryResult, error)
 	DiscoverPeers(channelName string) ([]peerTarget, error)
 	QueryTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []peerTarget, transientData map[string][]byte) ([]byte, error)
 }
@@ -61,7 +62,15 @@ func newDirectPeerRuntime(cfg Config, _ string) *directPeerRuntime {
 func (p *directPeerRuntime) Close() {}
 
 func (p *directPeerRuntime) DiscoverPeers(channelName string) ([]peerTarget, error) {
-	return newDirectDiscoveryClient(p.config).DiscoverPeers(context.Background(), channelName)
+	result, err := p.Discover(channelName)
+	if err != nil {
+		return nil, err
+	}
+	return result.Peers, nil
+}
+
+func (p *directPeerRuntime) Discover(channelName string) (*discoveryResult, error) {
+	return newDirectDiscoveryClient(p.config).Discover(context.Background(), channelName)
 }
 
 func (p *directPeerRuntime) QueryTargets(ctx context.Context, channelName string, chaincodeID string, fn string, args [][]byte, peers []peerTarget, transientData map[string][]byte) ([]byte, error) {

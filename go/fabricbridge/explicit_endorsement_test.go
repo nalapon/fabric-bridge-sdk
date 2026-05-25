@@ -165,6 +165,13 @@ func TestEvaluateWithEndorsingPeersFailsWhenRequestedPeerMissing(t *testing.T) {
 }
 
 func TestSubmitAsyncWithEndorsingPeersRequiresOrdererEndpointLocally(t *testing.T) {
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			return successfulProposalResponse("peer0", []byte("submitted")), nil
+		}},
+	}
+	installExplicitPeerRuntimeHarness(t, peers)
+
 	tx := newExplicitPeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer(), "peer0.org1.example.com:7051")
 	_, err := tx.SubmitAsync(context.Background(), "asset1")
 	var configErr *ConfigurationError
@@ -173,6 +180,27 @@ func TestSubmitAsyncWithEndorsingPeersRequiresOrdererEndpointLocally(t *testing.
 	}
 	if configErr.Field != "ordererEndpoint" {
 		t.Fatalf("expected ordererEndpoint field, got %q", configErr.Field)
+	}
+}
+
+func TestSubmitAsyncWithEndorsingPeersUsesDiscoveredOrdererWhenUnconfigured(t *testing.T) {
+	ordererAddress, _, stop := startTestOrdererServer(t, common.Status_SUCCESS)
+	defer stop()
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			return successfulProposalResponse("peer0", []byte("submitted")), nil
+		}},
+	}
+	harness := installExplicitPeerRuntimeHarness(t, peers)
+	harness.orderers = []ordererTarget{{MSPID: "OrdererMSP", Endpoint: ordererAddress}}
+
+	tx := newExplicitPeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer(), "peer0.org1.example.com:7051")
+	submitted, err := tx.SubmitAsync(context.Background(), "asset1")
+	if err != nil {
+		t.Fatalf("expected explicit endorsement submit with discovered orderer, got %v", err)
+	}
+	if submitted.TransactionID() == "" {
+		t.Fatal("expected non-empty direct transaction ID")
 	}
 }
 
@@ -219,6 +247,7 @@ func TestResolveEndorsingPeerTargetsPreservesCallerOrderAfterDeduplication(t *te
 
 type explicitPeerRuntimeHarness struct {
 	peers      []peerTarget
+	orderers   []ordererTarget
 	discovered int
 	mu         sync.Mutex
 }
@@ -247,6 +276,16 @@ func (r *explicitPeerRuntime) DiscoverPeers(string) ([]peerTarget, error) {
 	defer r.harness.mu.Unlock()
 	r.harness.discovered++
 	return append([]peerTarget(nil), r.harness.peers...), nil
+}
+
+func (r *explicitPeerRuntime) Discover(string) (*discoveryResult, error) {
+	r.harness.mu.Lock()
+	defer r.harness.mu.Unlock()
+	r.harness.discovered++
+	return &discoveryResult{
+		Peers:    append([]peerTarget(nil), r.harness.peers...),
+		Orderers: append([]ordererTarget(nil), r.harness.orderers...),
+	}, nil
 }
 
 func (r *explicitPeerRuntime) QueryTargets(context.Context, string, string, string, [][]byte, []peerTarget, map[string][]byte) ([]byte, error) {

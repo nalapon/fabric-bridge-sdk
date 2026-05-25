@@ -62,12 +62,13 @@ export class DirectPeerRuntime {
     transactionBytes: Buffer,
     signature: Buffer,
     transactionId: string,
+    discoveredOrdererEndpoint?: string,
   ): Promise<void> {
-    const ordererEndpoint = this.config.ordererEndpoint;
+    const ordererEndpoint = this.config.ordererEndpoint || discoveredOrdererEndpoint;
     if (!ordererEndpoint) {
       throw new ConfigurationError({
         field: "ordererEndpoint",
-        message: "ordererEndpoint is required for direct endorsement submit",
+        message: "ordererEndpoint is required for direct endorsement submit when discovery returns no orderer endpoints",
       });
     }
 

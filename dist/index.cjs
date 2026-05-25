@@ -1208,12 +1208,15 @@ async function newSignedDiscoveryRequest(config, channelName) {
   const auth = new discoveryProto.AuthInfo();
   auth.setClientIdentity(identity.serializeBinary());
   auth.setClientTlsCertHash(discoveryTLSCertHash(config.discoveryTls));
-  const query = new discoveryProto.Query();
-  query.setChannel(channelName);
-  query.setPeerQuery(new discoveryProto.PeerMembershipQuery());
+  const peerQuery = new discoveryProto.Query();
+  peerQuery.setChannel(channelName);
+  peerQuery.setPeerQuery(new discoveryProto.PeerMembershipQuery());
+  const configQuery = new discoveryProto.Query();
+  configQuery.setChannel(channelName);
+  configQuery.setConfigQuery(new discoveryProto.ConfigQuery());
   const request = new discoveryProto.Request();
   request.setAuthentication(auth);
-  request.setQueriesList([query]);
+  request.setQueriesList([peerQuery, configQuery]);
   const payload = request.serializeBinary();
   const signature = await config.signer((0, import_crypto3.createHash)("sha256").update(payload).digest());
   const signed = new discoveryProto.SignedRequest();
@@ -1226,22 +1229,55 @@ function discoveryResultFromResponseResult(response, channelName, tlsEnabled) {
     return import_better_result6.Result.err(new DiscoveryError({ message: "empty discovery response" }));
   }
   const results = response.getResultsList();
-  if (results.length !== 1) {
+  if (results.length === 0) {
     return import_better_result6.Result.err(
-      new DiscoveryError({ message: `expected 1 discovery result, got ${results.length}` })
+      new DiscoveryError({ message: "empty discovery results" })
     );
   }
-  const result = results[0];
-  const discoveryError = result.getError();
-  if (discoveryError) {
-    return import_better_result6.Result.err(
-      new DiscoveryError({ message: `discovery service error: ${discoveryError.getContent()}` })
-    );
+  const peers = /* @__PURE__ */ new Map();
+  const orderers = [];
+  for (const result of results) {
+    const discoveryError = result.getError();
+    if (discoveryError) {
+      return import_better_result6.Result.err(
+        new DiscoveryError({ message: `discovery service error: ${discoveryError.getContent()}` })
+      );
+    }
+    const members = result.getMembers();
+    if (members) {
+      const parsedPeers = peersFromMembershipResult(members, tlsEnabled);
+      if (!parsedPeers.isOk()) {
+        return import_better_result6.Result.err(parsedPeers.error);
+      }
+      for (const [endpoint, peer5] of parsedPeers.value.entries()) {
+        if (peers.has(endpoint)) {
+          return import_better_result6.Result.err(
+            new DiscoveryError({
+              message: `Discovery returned duplicate peer endpoint identity: ${endpoint}`
+            })
+          );
+        }
+        peers.set(endpoint, peer5);
+      }
+      continue;
+    }
+    const config = result.getConfigResult();
+    if (config) {
+      orderers.push(...orderersFromConfigResult(config));
+    }
   }
-  const members = result.getMembers();
-  if (!members) {
+  if (peers.size === 0) {
     return import_better_result6.Result.err(new DiscoveryError({ message: "expected peer membership result" }));
   }
+  return import_better_result6.Result.ok({
+    timestamp: Date.now(),
+    channelName,
+    peers,
+    orderers,
+    msps: /* @__PURE__ */ new Map()
+  });
+}
+function peersFromMembershipResult(members, tlsEnabled) {
   const peers = /* @__PURE__ */ new Map();
   const orgEntries = [];
   members.getPeersByOrgMap().forEach((orgPeers, mspId) => {
@@ -1278,13 +1314,23 @@ function discoveryResultFromResponseResult(response, channelName, tlsEnabled) {
       });
     }
   }
-  return import_better_result6.Result.ok({
-    timestamp: Date.now(),
-    channelName,
-    peers,
-    orderers: [],
-    msps: /* @__PURE__ */ new Map()
+  return import_better_result6.Result.ok(peers);
+}
+function orderersFromConfigResult(config) {
+  const orderers = [];
+  config.getOrderersMap().forEach((endpoints, mspId) => {
+    for (const endpoint of endpoints.getEndpointList()) {
+      const host = endpoint.getHost().trim();
+      const port = endpoint.getPort();
+      if (!host || port === 0) {
+        continue;
+      }
+      orderers.push({ endpoint: `${host}:${port}`, mspId });
+    }
   });
+  return orderers.sort(
+    (a, b) => a.endpoint === b.endpoint ? a.mspId.localeCompare(b.mspId) : a.endpoint.localeCompare(b.endpoint)
+  );
 }
 function createDiscoveryCredentials(tlsOptions) {
   if (!tlsOptions?.trustedRoots) {
@@ -1638,12 +1684,12 @@ var DirectPeerRuntime = class {
       client.close();
     }
   }
-  async submitEnvelope(transactionBytes, signature, transactionId) {
-    const ordererEndpoint = this.config.ordererEndpoint;
+  async submitEnvelope(transactionBytes, signature, transactionId, discoveredOrdererEndpoint) {
+    const ordererEndpoint = this.config.ordererEndpoint || discoveredOrdererEndpoint;
     if (!ordererEndpoint) {
       throw new ConfigurationError({
         field: "ordererEndpoint",
-        message: "ordererEndpoint is required for direct endorsement submit"
+        message: "ordererEndpoint is required for direct endorsement submit when discovery returns no orderer endpoints"
       });
     }
     const client = new ordererGrpc.AtomicBroadcastClient(
@@ -2198,7 +2244,8 @@ var PeerTransaction = class {
     await runtime.submitEnvelope(
       transactionPayload,
       await signDirectTransactionPayload(this.config, transactionPayload),
-      prepared.transactionId
+      prepared.transactionId,
+      await this.resolveSubmitOrdererEndpoint()
     );
     return {
       result,
@@ -2244,7 +2291,8 @@ var PeerTransaction = class {
     await runtime.submitEnvelope(
       transactionPayload,
       await signDirectTransactionPayload(this.config, transactionPayload),
-      prepared.transactionId
+      prepared.transactionId,
+      await this.resolveSubmitOrdererEndpoint()
     );
     return {
       result,
@@ -2298,6 +2346,16 @@ var PeerTransaction = class {
       return import_better_result11.Result.err(result.error);
     }
     return import_better_result11.Result.ok(result.value);
+  }
+  async resolveSubmitOrdererEndpoint() {
+    if (this.config.ordererEndpoint) {
+      return this.config.ordererEndpoint;
+    }
+    const discovery = await this.ensureDiscovery();
+    if (!discovery.isOk()) {
+      throw discovery.error;
+    }
+    return selectDiscoveredOrdererEndpoint(discovery.value.orderers);
   }
   resolvePeerInfos(discovery, peerNames) {
     const peerInfos = [];
@@ -2473,6 +2531,7 @@ var PeerSignedProposal = class {
       return import_better_result11.Result.ok(
         new PeerEndorsedTransaction(
           this.config,
+          this.peerConnection,
           this.channelName,
           txPayload,
           payload,
@@ -2538,12 +2597,14 @@ var PeerSignedProposal = class {
 };
 var PeerEndorsedTransaction = class {
   config;
+  peerConnection;
   channelName;
   bytes;
   result;
   transactionId;
-  constructor(config, channelName, bytes, result, transactionId) {
+  constructor(config, peerConnection, channelName, bytes, result, transactionId) {
     this.config = config;
+    this.peerConnection = peerConnection;
     this.channelName = channelName;
     this.bytes = Buffer.from(bytes);
     this.result = Buffer.from(result);
@@ -2567,7 +2628,8 @@ var PeerEndorsedTransaction = class {
       await runtime.submitEnvelope(
         this.bytes,
         await signDirectTransactionPayload(this.config, this.bytes),
-        this.transactionId
+        this.transactionId,
+        await this.resolveSubmitOrdererEndpoint()
       );
       return import_better_result11.Result.ok(
         new PeerSubmittedTx(
@@ -2584,6 +2646,16 @@ var PeerEndorsedTransaction = class {
         })
       );
     }
+  }
+  async resolveSubmitOrdererEndpoint() {
+    if (this.config.ordererEndpoint) {
+      return this.config.ordererEndpoint;
+    }
+    const discovery = await this.peerConnection.discover(this.channelName);
+    if (!discovery.isOk()) {
+      throw discovery.error;
+    }
+    return selectDiscoveredOrdererEndpoint(discovery.value.orderers);
   }
   async Submit() {
     const submitted = await this.SubmitAsync();
@@ -2753,6 +2825,11 @@ async function discoveredPeerEndpoints(peerConnection, channelName, _tlsEnabled)
     throw discovery.error;
   }
   return new Set(discovery.value.peers.keys());
+}
+function selectDiscoveredOrdererEndpoint(orderers) {
+  return [...orderers].sort(
+    (a, b) => a.endpoint === b.endpoint ? a.mspId.localeCompare(b.mspId) : a.endpoint.localeCompare(b.endpoint)
+  )[0]?.endpoint;
 }
 function uniquePeerEndpoints(peers, normalize) {
   const out = [];

@@ -68,7 +68,25 @@ describe("DirectPeerRuntime", () => {
     expect(Buffer.from(envelopes[0]!.getSignature_asU8())).toEqual(Buffer.from("transaction-signature"));
   });
 
-  test("submitEnvelope fails locally when ordererEndpoint is absent", async () => {
+  test("submitEnvelope sends signed transaction bytes to a discovered orderer when unconfigured", async () => {
+    const envelopes: CommonProto.Envelope[] = [];
+    const ordererAddress = await startOrdererServer((envelope) => {
+      envelopes.push(envelope);
+      return commonProto.Status.SUCCESS;
+    });
+
+    await new DirectPeerRuntime(bridgeConfig()).submitEnvelope(
+      Buffer.from("transaction-payload"),
+      Buffer.from("transaction-signature"),
+      "tx1",
+      ordererAddress,
+    );
+
+    expect(envelopes).toHaveLength(1);
+    expect(Buffer.from(envelopes[0]!.getPayload_asU8())).toEqual(Buffer.from("transaction-payload"));
+  });
+
+  test("submitEnvelope fails locally when ordererEndpoint and discovered orderers are absent", async () => {
     try {
       await new DirectPeerRuntime(bridgeConfig()).submitEnvelope(
         Buffer.from("transaction-payload"),

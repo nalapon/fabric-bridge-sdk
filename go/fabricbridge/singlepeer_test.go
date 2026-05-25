@@ -237,6 +237,13 @@ func TestEvaluateWithSinglePeerDoesNotRequireOrdererEndpoint(t *testing.T) {
 }
 
 func TestSubmitAsyncWithSinglePeerRequiresOrdererEndpointLocally(t *testing.T) {
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			return successfulProposalResponse("peer0", []byte("submitted")), nil
+		}},
+	}
+	installSinglePeerRuntimeHarness(t, peers)
+
 	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer())
 	_, err := tx.SubmitAsync(context.Background(), "asset1")
 	var configErr *ConfigurationError
@@ -274,6 +281,27 @@ func TestSubmitAsyncWithSinglePeerTargetsExactlyOnePeerPerAttempt(t *testing.T) 
 	}
 	if got, want := attempts, []string{"grpcs://peer0.org1.example.com:7051", "grpcs://peer1.org1.example.com:8051"}; !equalStrings(got, want) {
 		t.Fatalf("submit attempts mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestSubmitAsyncWithSinglePeerUsesDiscoveredOrdererWhenUnconfigured(t *testing.T) {
+	ordererAddress, _, stop := startTestOrdererServer(t, common.Status_SUCCESS)
+	defer stop()
+	peers := []peerTarget{
+		fakeExplicitPeer{url: "grpcs://peer0.org1.example.com:7051", process: func(context.Context, processProposalRequest) (*proposalResponse, error) {
+			return successfulProposalResponse("peer0", []byte("submitted")), nil
+		}},
+	}
+	harness := installSinglePeerRuntimeHarness(t, peers)
+	harness.orderers = []ordererTarget{{MSPID: "OrdererMSP", Endpoint: ordererAddress}}
+
+	tx := newSinglePeerTestTransaction(t, newSinglePeerTestBridgeWithoutOrderer())
+	submitted, err := tx.SubmitAsync(context.Background(), "asset1")
+	if err != nil {
+		t.Fatalf("expected submit with discovered orderer, got %v", err)
+	}
+	if submitted.TransactionID() == "" {
+		t.Fatal("expected non-empty transaction ID")
 	}
 }
 
@@ -420,6 +448,7 @@ func equalStrings(a, b []string) bool {
 
 type singlePeerRuntimeHarness struct {
 	peers         []peerTarget
+	orderers      []ordererTarget
 	queryErrors   map[string]error
 	queryAttempts [][]string
 }
@@ -448,6 +477,13 @@ func (r *recordingPeerRuntime) Close() {}
 
 func (r *recordingPeerRuntime) DiscoverPeers(string) ([]peerTarget, error) {
 	return append([]peerTarget(nil), r.harness.peers...), nil
+}
+
+func (r *recordingPeerRuntime) Discover(string) (*discoveryResult, error) {
+	return &discoveryResult{
+		Peers:    append([]peerTarget(nil), r.harness.peers...),
+		Orderers: append([]ordererTarget(nil), r.harness.orderers...),
+	}, nil
 }
 
 func (r *recordingPeerRuntime) QueryTargets(_ context.Context, _ string, _ string, _ string, _ [][]byte, peers []peerTarget, _ map[string][]byte) ([]byte, error) {

@@ -52,6 +52,11 @@ describe("DirectDiscoveryClient", () => {
     expect(bytesOf(identity.getIdBytes())).toEqual(Buffer.from("certificate"));
     expect(payload.getQueriesList()[0]?.getChannel()).toBe("mychannel");
     expect(payload.getQueriesList()[0]?.getPeerQuery()).toBeDefined();
+    expect(payload.getQueriesList()[1]?.getChannel()).toBe("mychannel");
+    expect(payload.getQueriesList()[1]?.getConfigQuery()).toBeDefined();
+    expect(result.value.orderers).toEqual([
+      { endpoint: "orderer.example.com:7050", mspId: "OrdererMSP" },
+    ]);
   });
 
   test("canonicalizes discovered peer endpoints for TLS and no-TLS modes", () => {
@@ -151,11 +156,31 @@ function membershipResponse(peersByOrg: Record<string, string[]>): DiscoveryProt
     members.getPeersByOrgMap().set(mspId, peers);
   }
 
-  const result = new discoveryProto.QueryResult();
-  result.setMembers(members);
+  const membershipResult = new discoveryProto.QueryResult();
+  membershipResult.setMembers(members);
+  const configResult = new discoveryProto.QueryResult();
+  configResult.setConfigResult(configResultWithOrderers({
+    OrdererMSP: ["orderer.example.com:7050"],
+  }));
   const response = new discoveryProto.Response();
-  response.setResultsList([result]);
+  response.setResultsList([membershipResult, configResult]);
   return response;
+}
+
+function configResultWithOrderers(orderersByOrg: Record<string, string[]>): DiscoveryProto.ConfigResult {
+  const config = new discoveryProto.ConfigResult();
+  for (const [mspId, endpoints] of Object.entries(orderersByOrg)) {
+    const discoveredEndpoints = new discoveryProto.Endpoints();
+    for (const value of endpoints) {
+      const [host, port] = value.split(":");
+      const endpoint = new discoveryProto.Endpoint();
+      endpoint.setHost(host!);
+      endpoint.setPort(Number(port));
+      discoveredEndpoints.addEndpoint(endpoint);
+    }
+    config.getOrderersMap().set(mspId, discoveredEndpoints);
+  }
+  return config;
 }
 
 function membershipEnvelope(endpoint: string) {

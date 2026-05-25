@@ -18,6 +18,16 @@ type directDiscoveryClient struct {
 	config Config
 }
 
+type discoveryResult struct {
+	Peers    []peerTarget
+	Orderers []ordererTarget
+}
+
+type ordererTarget struct {
+	MSPID    string
+	Endpoint string
+}
+
 type directDiscoveredPeer struct {
 	url        string
 	mspID      string
@@ -30,6 +40,14 @@ func newDirectDiscoveryClient(cfg Config) *directDiscoveryClient {
 }
 
 func (c *directDiscoveryClient) DiscoverPeers(ctx context.Context, channelName string) ([]peerTarget, error) {
+	result, err := c.Discover(ctx, channelName)
+	if err != nil {
+		return nil, err
+	}
+	return result.Peers, nil
+}
+
+func (c *directDiscoveryClient) Discover(ctx context.Context, channelName string) (*discoveryResult, error) {
 	cfg := c.config.normalized()
 	if timeout := cfg.Timeouts.Discovery; timeout > 0 {
 		var cancel context.CancelFunc
@@ -53,11 +71,11 @@ func (c *directDiscoveryClient) DiscoverPeers(ctx context.Context, channelName s
 		return nil, &DiscoveryError{Message: fmt.Sprintf("discover peers from %s", cfg.DiscoverySeed), Cause: err}
 	}
 
-	peers, err := discoveredPeersFromResponse(response, cfg)
+	result, err := discoveryResultFromResponse(response, cfg)
 	if err != nil {
 		return nil, &DiscoveryError{Message: "parse discovery response", Cause: err}
 	}
-	return peers, nil
+	return result, nil
 }
 
 func newSignedDiscoveryRequest(cfg Config, channelName string) (*discoveryProto.SignedRequest, error) {
@@ -79,6 +97,12 @@ func newSignedDiscoveryRequest(cfg Config, channelName string) (*discoveryProto.
 				Channel: channelName,
 				Query: &discoveryProto.Query_PeerQuery{
 					PeerQuery: &discoveryProto.PeerMembershipQuery{},
+				},
+			},
+			{
+				Channel: channelName,
+				Query: &discoveryProto.Query_ConfigQuery{
+					ConfigQuery: &discoveryProto.ConfigQuery{},
 				},
 			},
 		},
@@ -115,22 +139,52 @@ func discoveryTLSCertHash(tlsOptions *TLSOptions) []byte {
 }
 
 func discoveredPeersFromResponse(response *discoveryProto.Response, cfg Config) ([]peerTarget, error) {
+	result, err := discoveryResultFromResponse(response, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return result.Peers, nil
+}
+
+func discoveryResultFromResponse(response *discoveryProto.Response, cfg Config) (*discoveryResult, error) {
 	if response == nil {
 		return nil, fmt.Errorf("empty discovery response")
 	}
-	if len(response.GetResults()) != 1 {
-		return nil, fmt.Errorf("expected 1 discovery result, got %d", len(response.GetResults()))
+	if len(response.GetResults()) == 0 {
+		return nil, fmt.Errorf("empty discovery results")
 	}
 
-	result := response.GetResults()[0]
-	if discoveryError := result.GetError(); discoveryError != nil {
-		return nil, fmt.Errorf("discovery service error: %s", discoveryError.GetContent())
+	var peers []peerTarget
+	var orderers []ordererTarget
+	for _, result := range response.GetResults() {
+		if discoveryError := result.GetError(); discoveryError != nil {
+			return nil, fmt.Errorf("discovery service error: %s", discoveryError.GetContent())
+		}
+		if members := result.GetMembers(); members != nil {
+			parsedPeers, err := peersFromMembershipResult(members, cfg)
+			if err != nil {
+				return nil, err
+			}
+			peers = append(peers, parsedPeers...)
+			continue
+		}
+		if config := result.GetConfigResult(); config != nil {
+			orderers = append(orderers, orderersFromConfigResult(config)...)
+		}
 	}
-	members := result.GetMembers()
-	if members == nil {
+	if len(peers) == 0 {
 		return nil, fmt.Errorf("expected peer membership result")
 	}
+	sort.SliceStable(orderers, func(i, j int) bool {
+		if orderers[i].Endpoint == orderers[j].Endpoint {
+			return orderers[i].MSPID < orderers[j].MSPID
+		}
+		return orderers[i].Endpoint < orderers[j].Endpoint
+	})
+	return &discoveryResult{Peers: peers, Orderers: orderers}, nil
+}
 
+func peersFromMembershipResult(members *discoveryProto.PeerMembershipResult, cfg Config) ([]peerTarget, error) {
 	orgIDs := make([]string, 0, len(members.GetPeersByOrg()))
 	for orgID := range members.GetPeersByOrg() {
 		orgIDs = append(orgIDs, orgID)
@@ -153,6 +207,36 @@ func discoveredPeersFromResponse(response *discoveryProto.Response, cfg Config) 
 		}
 	}
 	return peers, nil
+}
+
+func orderersFromConfigResult(config *discoveryProto.ConfigResult) []ordererTarget {
+	var orderers []ordererTarget
+	for mspID, endpoints := range config.GetOrderers() {
+		for _, endpoint := range endpoints.GetEndpoint() {
+			if endpoint.GetHost() == "" || endpoint.GetPort() == 0 {
+				continue
+			}
+			orderers = append(orderers, ordererTarget{
+				MSPID:    mspID,
+				Endpoint: fmt.Sprintf("%s:%d", endpoint.GetHost(), endpoint.GetPort()),
+			})
+		}
+	}
+	return orderers
+}
+
+func selectDiscoveredOrdererEndpoint(orderers []ordererTarget) string {
+	if len(orderers) == 0 {
+		return ""
+	}
+	sorted := append([]ordererTarget(nil), orderers...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Endpoint == sorted[j].Endpoint {
+			return sorted[i].MSPID < sorted[j].MSPID
+		}
+		return sorted[i].Endpoint < sorted[j].Endpoint
+	})
+	return sorted[0].Endpoint
 }
 
 func peerEndpointFromDiscoveryPeer(peer *discoveryProto.Peer) (string, error) {

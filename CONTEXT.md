@@ -200,7 +200,8 @@ _Avoid_: configuration error, endorsement error
 - Offline resume fails locally when any **Peer endpoint identity** recorded in the **Endorsement routing snapshot** is absent from current channel discovery.
 - Offline **Single-peer transaction** snapshots store exactly the selected **Peer endpoint identity**, not the full eligible peer set.
 - **Endorsement routing snapshot** appears only on proposal **Signing request** values because peer routing ends at endorsement.
-- An **Endorsement routing snapshot** selects endorsement targets but does not replace the bridge network, TLS, discovery, or orderer configuration required to resume the flow.
+- An **Endorsement routing snapshot** selects endorsement targets but does not replace the bridge network, TLS, or discovery configuration required to resume the flow.
+- **Orderer submit** prefers an explicitly configured orderer endpoint and otherwise uses an orderer endpoint returned by Fabric service discovery for the channel.
 - The **Signing request wire format** encodes `bytes`, **Message digest**, and signatures as base64.
 - The SDK validates that a signed-message digest matches the canonical Fabric bytes but does not verify the external signature cryptographically before sending to Fabric.
 - Signed-message DTOs retain the **Message digest** from the **Signing request**, and the bridge validates it against the canonical Fabric bytes before resuming.

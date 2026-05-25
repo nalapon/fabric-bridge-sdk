@@ -5,6 +5,8 @@ The **Direct endorsement path** will submit endorsed transactions directly to th
 ## Consequences
 
 - The bridge-owned peer adapter must retain a minimal orderer submit implementation.
-- Direct endorsement evaluation, proposal creation, and endorsement do not require orderer configuration, but direct endorsement submit requires an orderer endpoint.
+- Direct endorsement evaluation, proposal creation, and endorsement do not require orderer configuration.
+- Direct endorsement submit uses the configured orderer endpoint when provided; otherwise it uses an orderer endpoint discovered from Fabric service discovery for the channel.
+- Direct endorsement submit fails locally only when neither configuration nor discovery provides an orderer endpoint.
 - Offline peer-targeted submit must not resume through Gateway submit after direct peer endorsement.
 - The terms **Gateway submit** and **Orderer submit** should be used instead of "direct submit", which is ambiguous in this codebase.

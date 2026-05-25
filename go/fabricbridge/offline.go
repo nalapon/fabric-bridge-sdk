@@ -348,7 +348,11 @@ func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransac
 	}
 
 	envelope := &common.Envelope{Payload: append([]byte(nil), t.bytes...), Signature: signature}
-	if err := submitEnvelopeToOrderer(ctx, t.bridge.config, envelope, t.txID); err != nil {
+	discoveredOrderer, err := t.resolveSubmitOrdererEndpoint()
+	if err != nil {
+		return nil, err
+	}
+	if err := submitEnvelopeToOrderer(ctx, t.bridge.config, envelope, t.txID, discoveredOrderer); err != nil {
 		return nil, err
 	}
 	return &SubmittedTransaction{
@@ -358,6 +362,23 @@ func (t *EndorsedTransaction) submitPeer(ctx context.Context) (*SubmittedTransac
 			return t.bridge.commitStatus(ctx, t.channelName, t.txID)
 		},
 	}, nil
+}
+
+func (t *EndorsedTransaction) resolveSubmitOrdererEndpoint() (string, error) {
+	if t.bridge.config.OrdererEndpoint != "" {
+		return t.bridge.config.OrdererEndpoint, nil
+	}
+	pc, err := newPeerRuntime(t.bridge.config, t.channelName)
+	if err != nil {
+		return "", &ConnectionError{Message: "failed to connect in peer mode", Cause: err}
+	}
+	defer pc.Close()
+
+	discovered, err := pc.Discover(t.channelName)
+	if err != nil {
+		return "", &DiscoveryError{Message: "discover orderer for peer submit", Cause: err}
+	}
+	return selectDiscoveredOrdererEndpoint(discovered.Orderers), nil
 }
 
 // Submit signs the endorsed transaction with the bridge identity, submits it, and waits for commit.
