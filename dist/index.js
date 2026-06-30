@@ -112,9 +112,11 @@ var GatewayConnection = class {
           tlsCredentials = grpc.credentials.createInsecure();
         }
         const hostname = gatewayTls?.sslTargetNameOverride ?? this.extractHostname(gatewayEndpoint);
-        const clientOptions = hostname ? {
-          "grpc.ssl_target_name_override": hostname
-        } : {};
+        const clientOptions = {
+          "grpc.max_receive_message_length": -1,
+          "grpc.max_send_message_length": -1,
+          ...hostname ? { "grpc.ssl_target_name_override": hostname } : {}
+        };
         log().debug("GatewayConnection.connect() - Creando gRPC Client:", {
           endpoint: gatewayEndpoint,
           hostname,
@@ -1295,7 +1297,11 @@ function createDiscoveryCredentials(tlsOptions) {
 }
 function channelOptions(endpoint, tlsOptions) {
   const hostname = tlsOptions?.sslTargetNameOverride ?? endpointHost(endpoint);
-  return hostname ? { "grpc.ssl_target_name_override": hostname } : {};
+  return {
+    "grpc.max_receive_message_length": -1,
+    "grpc.max_send_message_length": -1,
+    ...hostname ? { "grpc.ssl_target_name_override": hostname } : {}
+  };
 }
 function discoverWithDeadline(client, request, timeout) {
   return new Promise((resolve, reject) => {
@@ -1777,7 +1783,11 @@ function createCredentials(tlsOptions) {
 }
 function channelOptions2(endpoint, tlsOptions) {
   const hostname = tlsOptions?.sslTargetNameOverride ?? endpointHost2(endpoint);
-  return hostname ? { "grpc.ssl_target_name_override": hostname } : {};
+  return {
+    "grpc.max_receive_message_length": -1,
+    "grpc.max_send_message_length": -1,
+    ...hostname ? { "grpc.ssl_target_name_override": hostname } : {}
+  };
 }
 function endpointAddress(endpoint) {
   if (endpoint.startsWith("grpc://") || endpoint.startsWith("grpcs://")) {
