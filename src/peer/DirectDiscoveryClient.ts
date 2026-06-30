@@ -256,7 +256,11 @@ function createDiscoveryCredentials(tlsOptions: TlsOptions | undefined): grpc.Ch
 
 function channelOptions(endpoint: string, tlsOptions: TlsOptions | undefined): grpc.ChannelOptions {
   const hostname = tlsOptions?.sslTargetNameOverride ?? endpointHost(endpoint);
-  return hostname ? { "grpc.ssl_target_name_override": hostname } : {};
+  return {
+    "grpc.max_receive_message_length": -1,
+    "grpc.max_send_message_length": -1,
+    ...(hostname ? { "grpc.ssl_target_name_override": hostname } : {}),
+  };
 }
 
 function discoverWithDeadline(

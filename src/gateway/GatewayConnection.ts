@@ -64,9 +64,11 @@ export class GatewayConnection {
         }
 
         const hostname = gatewayTls?.sslTargetNameOverride ?? this.extractHostname(gatewayEndpoint);
-        const clientOptions: grpc.ChannelOptions = hostname ? {
-          'grpc.ssl_target_name_override': hostname,
-        } : {};
+        const clientOptions: grpc.ChannelOptions = {
+          'grpc.max_receive_message_length': -1,
+          'grpc.max_send_message_length': -1,
+          ...(hostname ? { 'grpc.ssl_target_name_override': hostname } : {}),
+        };
 
         log().debug('GatewayConnection.connect() - Creando gRPC Client:', {
           endpoint: gatewayEndpoint,
