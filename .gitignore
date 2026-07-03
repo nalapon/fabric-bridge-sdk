@@ -6,6 +6,7 @@ opensrc
 out
 dist
 *.tgz
+.scratch
 
 # code coverage
 coverage
