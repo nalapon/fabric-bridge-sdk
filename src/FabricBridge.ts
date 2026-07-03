@@ -17,6 +17,8 @@ import type {
   BridgeResult,
   BridgeSubmittedTx,
   BridgeUnsignedProposal,
+  ChaincodeEventsOptions,
+  ChaincodeEventStream,
   CommitStatus,
   SignedMessage,
   ProposalCreator,
@@ -209,6 +211,13 @@ class BridgeNetworkImpl implements BridgeNetwork {
       this.gatewayNetwork,
       this.discoveryCache,
     );
+  }
+
+  async ChaincodeEvents(
+    chaincodeName: string,
+    options?: ChaincodeEventsOptions,
+  ): Promise<BridgeResult<ChaincodeEventStream>> {
+    return this.gatewayNetwork.ChaincodeEvents(chaincodeName, options);
   }
 }
 

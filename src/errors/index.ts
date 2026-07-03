@@ -42,6 +42,11 @@ export class EvaluationError extends TaggedError('EvaluationError')<{
   details?: string;
 }>() {}
 
+export class ChaincodeEventError extends TaggedError('ChaincodeEventError')<{
+  message: string;
+  chaincodeName: string;
+}>() {}
+
 export class ConfigurationError extends TaggedError('ConfigurationError')<{
   message: string;
   field?: string;

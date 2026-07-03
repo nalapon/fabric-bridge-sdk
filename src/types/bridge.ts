@@ -6,6 +6,7 @@ import type {
   SubmitError,
   CommitError,
   EvaluationError,
+  ChaincodeEventError,
   ConfigurationError,
   TimeoutError,
   NotConnectedError,
@@ -20,6 +21,7 @@ export type BridgeError =
   | SubmitError
   | CommitError
   | EvaluationError
+  | ChaincodeEventError
   | ConfigurationError
   | TimeoutError
   | NotConnectedError
@@ -30,6 +32,7 @@ export type BridgeResult<T> = Result<T, BridgeError>;
 
 export interface BridgeNetwork {
   getContract(chaincodeName: string): Promise<BridgeContract>;
+  ChaincodeEvents(chaincodeName: string, options?: ChaincodeEventsOptions): Promise<BridgeResult<ChaincodeEventStream>>;
 }
 
 export interface BridgeContract {
@@ -117,4 +120,33 @@ export interface CommitStatus {
   blockNumber: bigint;
   status: string;
   transactionId: string;
+}
+
+export interface ChaincodeEvent {
+  blockNumber: bigint;
+  transactionId: string;
+  chaincodeName: string;
+  eventName: string;
+  payload: Buffer;
+}
+
+export interface Checkpoint {
+  getBlockNumber(): bigint | undefined;
+  getTransactionId(): string | undefined;
+}
+
+export interface Checkpointer extends Checkpoint {
+  checkpointBlock(blockNumber: bigint): Promise<void>;
+  checkpointTransaction(blockNumber: bigint, transactionId: string): Promise<void>;
+  checkpointChaincodeEvent(event: ChaincodeEvent): Promise<void>;
+}
+
+export interface ChaincodeEventsOptions {
+  startBlock?: bigint;
+  checkpoint?: Checkpoint;
+}
+
+export interface ChaincodeEventStream {
+  Recv(): Promise<BridgeResult<ChaincodeEvent | null>>;
+  Close(): void;
 }

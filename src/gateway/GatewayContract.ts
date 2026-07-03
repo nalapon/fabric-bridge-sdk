@@ -13,6 +13,9 @@ import type {
   BridgeSubmittedTx,
   BridgeTransaction,
   BridgeUnsignedProposal,
+  ChaincodeEvent,
+  ChaincodeEventStream,
+  ChaincodeEventsOptions,
   CommitStatus,
   SignedMessage,
   ProposalCreator,
@@ -20,6 +23,7 @@ import type {
 import type { BridgeConfig, TimeoutConfig } from '../types/config';
 import {
   CommitError,
+  ChaincodeEventError,
   ConfigurationError,
   EndorsementError,
   EvaluationError,
@@ -57,6 +61,60 @@ export class GatewayNetwork implements BridgeNetwork {
     const network = gateway.getNetwork(this.channelName);
     const contract = network.getContract(chaincodeName);
     return new GatewayContract(contract, chaincodeName, this.channelName, this.timeouts);
+  }
+
+  async ChaincodeEvents(
+    chaincodeName: string,
+    options?: ChaincodeEventsOptions,
+  ): Promise<BridgeResult<ChaincodeEventStream>> {
+    try {
+      const gateway = this.gatewayConnection.getGateway();
+      const network = gateway.getNetwork(this.channelName);
+      const events = await network.getChaincodeEvents(chaincodeName, options);
+      return Result.ok(new GatewayChaincodeEventStream(chaincodeName, events));
+    } catch (error) {
+      return Result.err(new ChaincodeEventError({
+        chaincodeName,
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+}
+
+class GatewayChaincodeEventStream implements ChaincodeEventStream {
+  private iterator: AsyncIterator<fabricGateway.ChaincodeEvent>;
+
+  constructor(
+    private chaincodeName: string,
+    private events: fabricGateway.CloseableAsyncIterable<fabricGateway.ChaincodeEvent>,
+  ) {
+    this.iterator = events[Symbol.asyncIterator]();
+  }
+
+  async Recv(): Promise<BridgeResult<ChaincodeEvent | null>> {
+    try {
+      const next = await this.iterator.next();
+      if (next.done) {
+        return Result.ok(null);
+      }
+
+      return Result.ok({
+        blockNumber: next.value.blockNumber,
+        transactionId: next.value.transactionId,
+        chaincodeName: next.value.chaincodeName,
+        eventName: next.value.eventName,
+        payload: Buffer.from(next.value.payload),
+      });
+    } catch (error) {
+      return Result.err(new ChaincodeEventError({
+        chaincodeName: this.chaincodeName,
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
+  Close(): void {
+    this.events.close();
   }
 }
 

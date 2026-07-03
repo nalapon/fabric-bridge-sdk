@@ -4,7 +4,6 @@ import type {
   BridgeCommitResult,
   BridgeContract,
   BridgeEndorsedTransaction,
-  BridgeNetwork,
   BridgeResult,
   BridgeSignedProposal,
   BridgeSubmittedTx,
@@ -85,7 +84,7 @@ function hasEndorsement(
   return !!response.endorsement;
 }
 
-export class PeerNetwork implements BridgeNetwork {
+export class PeerNetwork {
   private channelName: string;
   private timeouts: Required<TimeoutConfig>;
   private config: BridgeConfig;
