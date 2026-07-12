@@ -30,6 +30,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/index.ts
 var index_exports = {};
 __export(index_exports, {
+  ChaincodeEventError: () => ChaincodeEventError,
   CommitError: () => CommitError,
   ConfigurationError: () => ConfigurationError,
   DEFAULT_TIMEOUTS: () => DEFAULT_TIMEOUTS,
@@ -73,6 +74,8 @@ var SubmitError = class extends (0, import_better_result.TaggedError)("SubmitErr
 var CommitError = class extends (0, import_better_result.TaggedError)("CommitError")() {
 };
 var EvaluationError = class extends (0, import_better_result.TaggedError)("EvaluationError")() {
+};
+var ChaincodeEventError = class extends (0, import_better_result.TaggedError)("ChaincodeEventError")() {
 };
 var ConfigurationError = class extends (0, import_better_result.TaggedError)("ConfigurationError")() {
 };
@@ -334,7 +337,7 @@ function txValidationCodeName(code) {
 }
 
 // src/gateway/GatewayContract.ts
-var fabricGateway2 = require("@hyperledger/fabric-gateway");
+var fabricGateway2 = __toESM(require("@hyperledger/fabric-gateway"), 1);
 var fabricProtos = __toESM(require("@hyperledger/fabric-protos"), 1);
 var import_better_result4 = require("better-result");
 var import_node_crypto = require("crypto");
@@ -563,6 +566,52 @@ var GatewayNetwork = class {
     const contract = network.getContract(chaincodeName);
     return new GatewayContract(contract, chaincodeName, this.channelName, this.timeouts);
   }
+  async ChaincodeEvents(chaincodeName, options) {
+    try {
+      const gateway3 = this.gatewayConnection.getGateway();
+      const network = gateway3.getNetwork(this.channelName);
+      const events = await network.getChaincodeEvents(chaincodeName, options);
+      return import_better_result4.Result.ok(new GatewayChaincodeEventStream(chaincodeName, events));
+    } catch (error) {
+      return import_better_result4.Result.err(new ChaincodeEventError({
+        chaincodeName,
+        message: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+};
+var GatewayChaincodeEventStream = class {
+  constructor(chaincodeName, events) {
+    this.chaincodeName = chaincodeName;
+    this.events = events;
+    this.iterator = events[Symbol.asyncIterator]();
+  }
+  chaincodeName;
+  events;
+  iterator;
+  async Recv() {
+    try {
+      const next = await this.iterator.next();
+      if (next.done) {
+        return import_better_result4.Result.ok(null);
+      }
+      return import_better_result4.Result.ok({
+        blockNumber: next.value.blockNumber,
+        transactionId: next.value.transactionId,
+        chaincodeName: next.value.chaincodeName,
+        eventName: next.value.eventName,
+        payload: Buffer.from(next.value.payload)
+      });
+    } catch (error) {
+      return import_better_result4.Result.err(new ChaincodeEventError({
+        chaincodeName: this.chaincodeName,
+        message: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+  Close() {
+    this.events.close();
+  }
 };
 var GatewayContract = class {
   contract;
@@ -727,20 +776,19 @@ var GatewayTransaction = class {
     }
   }
   mapSubmitError(error) {
-    if (error.message?.includes("timeout") || error.message?.includes("TIMEOUT")) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("timeout") || message.includes("TIMEOUT")) {
       return new TimeoutError({
-        message: error.message,
+        message,
         operation: "submit",
         timeout: this.timeouts.submit
       });
     }
-    if (error.name === "EndorseError") {
-      return new EndorsementError({
-        message: error.message
-      });
+    if (error instanceof fabricGateway2.EndorseError) {
+      return gatewayEndorsementError(error);
     }
     return new SubmitError({
-      message: error.message
+      message
     });
   }
 };
@@ -824,7 +872,11 @@ var GatewaySignedProposal = class {
       const transaction = await this.proposal.endorse();
       return import_better_result4.Result.ok(new GatewayEndorsedTransaction(this.gateway, transaction, this.timeouts));
     } catch (error) {
-      return import_better_result4.Result.err(new EndorsementError({ message: error.message }));
+      return import_better_result4.Result.err(
+        error instanceof fabricGateway2.EndorseError ? gatewayEndorsementError(error) : new EndorsementError({
+          message: error instanceof Error ? error.message : String(error)
+        })
+      );
     }
   }
   async Evaluate() {
@@ -836,6 +888,16 @@ var GatewaySignedProposal = class {
     }
   }
 };
+function gatewayEndorsementError(error) {
+  return new EndorsementError({
+    message: error.message,
+    details: error.details.map((detail) => ({
+      message: detail.message,
+      endpoint: detail.address,
+      mspId: detail.mspId
+    }))
+  });
+}
 var GatewayEndorsedTransaction = class {
   gateway;
   transaction;
@@ -3006,6 +3068,9 @@ var BridgeNetworkImpl = class {
       this.discoveryCache
     );
   }
+  async ChaincodeEvents(chaincodeName, options) {
+    return this.gatewayNetwork.ChaincodeEvents(chaincodeName, options);
+  }
 };
 var BridgeContractImpl = class {
   chaincodeName;
@@ -3297,6 +3362,7 @@ function createSyncECPrivateKeySigner(key) {
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  ChaincodeEventError,
   CommitError,
   ConfigurationError,
   DEFAULT_TIMEOUTS,

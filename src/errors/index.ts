@@ -1,9 +1,16 @@
 import { TaggedError } from 'better-result';
 import type { FailoverDecision } from '../types/failover';
 
+/** Safe peer attribution retained from a Fabric Gateway endorsement failure. */
+export type EndorsementDetail = {
+  message: string;
+  endpoint: string;
+  mspId: string;
+};
+
 export class EndorsementError extends TaggedError('EndorsementError')<{
   message: string;
-  details?: Array<{ message: string; endpoint: string }>;
+  details?: EndorsementDetail[];
 }>() {}
 
 export class DiscoveryError extends TaggedError('DiscoveryError')<{

@@ -283,7 +283,7 @@ class GatewayTransaction implements BridgeTransaction {
 
       return Result.ok(new GatewaySubmittedTx(submitted, this.timeouts));
     } catch (error) {
-      return Result.err(this.mapSubmitError(error as Error));
+      return Result.err(this.mapSubmitError(error));
     }
   }
 
@@ -322,27 +322,26 @@ class GatewayTransaction implements BridgeTransaction {
         proposalCreator: this.proposalCreator,
       })));
     } catch (error) {
-      return Result.err(this.mapSubmitError(error as Error));
+      return Result.err(this.mapSubmitError(error));
     }
   }
 
-  private mapSubmitError(error: Error): EndorsementError | SubmitError | TimeoutError {
-    if (error.message?.includes('timeout') || error.message?.includes('TIMEOUT')) {
+  private mapSubmitError(error: unknown): EndorsementError | SubmitError | TimeoutError {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('timeout') || message.includes('TIMEOUT')) {
       return new TimeoutError({
-        message: error.message,
+        message,
         operation: 'submit',
         timeout: this.timeouts.submit,
       });
     }
 
-    if (error.name === 'EndorseError') {
-      return new EndorsementError({
-        message: error.message,
-      });
+    if (error instanceof fabricGateway.EndorseError) {
+      return gatewayEndorsementError(error);
     }
 
     return new SubmitError({
-      message: error.message,
+      message,
     });
   }
 }
@@ -446,7 +445,13 @@ class GatewaySignedProposal implements BridgeSignedProposal {
       const transaction = await this.proposal.endorse();
       return Result.ok(new GatewayEndorsedTransaction(this.gateway, transaction, this.timeouts));
     } catch (error) {
-      return Result.err(new EndorsementError({ message: (error as Error).message }));
+      return Result.err(
+        error instanceof fabricGateway.EndorseError
+          ? gatewayEndorsementError(error)
+          : new EndorsementError({
+              message: error instanceof Error ? error.message : String(error),
+            }),
+      );
     }
   }
 
@@ -458,6 +463,17 @@ class GatewaySignedProposal implements BridgeSignedProposal {
       return Result.err(new EvaluationError({ message: (error as Error).message }));
     }
   }
+}
+
+function gatewayEndorsementError(error: fabricGateway.EndorseError): EndorsementError {
+  return new EndorsementError({
+    message: error.message,
+    details: error.details.map((detail) => ({
+      message: detail.message,
+      endpoint: detail.address,
+      mspId: detail.mspId,
+    })),
+  });
 }
 
 class GatewayEndorsedTransaction implements BridgeEndorsedTransaction {

@@ -28,7 +28,7 @@
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build",
-    "test": "bun test test/integration/initLedger.test.ts",
+    "test": "bun test test",
     "test:integration": "bun test test/integration/",
     "example": "bun run examples/app.ts",
     "example:app": "bun run examples/app.ts"

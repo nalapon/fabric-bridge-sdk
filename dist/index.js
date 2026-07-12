@@ -22,6 +22,8 @@ var CommitError = class extends TaggedError("CommitError")() {
 };
 var EvaluationError = class extends TaggedError("EvaluationError")() {
 };
+var ChaincodeEventError = class extends TaggedError("ChaincodeEventError")() {
+};
 var ConfigurationError = class extends TaggedError("ConfigurationError")() {
 };
 var TimeoutError = class extends TaggedError("TimeoutError")() {
@@ -282,7 +284,7 @@ function txValidationCodeName(code) {
 }
 
 // src/gateway/GatewayContract.ts
-import "@hyperledger/fabric-gateway";
+import * as fabricGateway2 from "@hyperledger/fabric-gateway";
 import * as fabricProtos from "@hyperledger/fabric-protos";
 import { Result as Result3 } from "better-result";
 import { createHash as createHash3, randomBytes } from "crypto";
@@ -511,6 +513,52 @@ var GatewayNetwork = class {
     const contract = network.getContract(chaincodeName);
     return new GatewayContract(contract, chaincodeName, this.channelName, this.timeouts);
   }
+  async ChaincodeEvents(chaincodeName, options) {
+    try {
+      const gateway3 = this.gatewayConnection.getGateway();
+      const network = gateway3.getNetwork(this.channelName);
+      const events = await network.getChaincodeEvents(chaincodeName, options);
+      return Result3.ok(new GatewayChaincodeEventStream(chaincodeName, events));
+    } catch (error) {
+      return Result3.err(new ChaincodeEventError({
+        chaincodeName,
+        message: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+};
+var GatewayChaincodeEventStream = class {
+  constructor(chaincodeName, events) {
+    this.chaincodeName = chaincodeName;
+    this.events = events;
+    this.iterator = events[Symbol.asyncIterator]();
+  }
+  chaincodeName;
+  events;
+  iterator;
+  async Recv() {
+    try {
+      const next = await this.iterator.next();
+      if (next.done) {
+        return Result3.ok(null);
+      }
+      return Result3.ok({
+        blockNumber: next.value.blockNumber,
+        transactionId: next.value.transactionId,
+        chaincodeName: next.value.chaincodeName,
+        eventName: next.value.eventName,
+        payload: Buffer.from(next.value.payload)
+      });
+    } catch (error) {
+      return Result3.err(new ChaincodeEventError({
+        chaincodeName: this.chaincodeName,
+        message: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+  Close() {
+    this.events.close();
+  }
 };
 var GatewayContract = class {
   contract;
@@ -675,20 +723,19 @@ var GatewayTransaction = class {
     }
   }
   mapSubmitError(error) {
-    if (error.message?.includes("timeout") || error.message?.includes("TIMEOUT")) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("timeout") || message.includes("TIMEOUT")) {
       return new TimeoutError({
-        message: error.message,
+        message,
         operation: "submit",
         timeout: this.timeouts.submit
       });
     }
-    if (error.name === "EndorseError") {
-      return new EndorsementError({
-        message: error.message
-      });
+    if (error instanceof fabricGateway2.EndorseError) {
+      return gatewayEndorsementError(error);
     }
     return new SubmitError({
-      message: error.message
+      message
     });
   }
 };
@@ -772,7 +819,11 @@ var GatewaySignedProposal = class {
       const transaction = await this.proposal.endorse();
       return Result3.ok(new GatewayEndorsedTransaction(this.gateway, transaction, this.timeouts));
     } catch (error) {
-      return Result3.err(new EndorsementError({ message: error.message }));
+      return Result3.err(
+        error instanceof fabricGateway2.EndorseError ? gatewayEndorsementError(error) : new EndorsementError({
+          message: error instanceof Error ? error.message : String(error)
+        })
+      );
     }
   }
   async Evaluate() {
@@ -784,6 +835,16 @@ var GatewaySignedProposal = class {
     }
   }
 };
+function gatewayEndorsementError(error) {
+  return new EndorsementError({
+    message: error.message,
+    details: error.details.map((detail) => ({
+      message: detail.message,
+      endpoint: detail.address,
+      mspId: detail.mspId
+    }))
+  });
+}
 var GatewayEndorsedTransaction = class {
   gateway;
   transaction;
@@ -2954,6 +3015,9 @@ var BridgeNetworkImpl = class {
       this.discoveryCache
     );
   }
+  async ChaincodeEvents(chaincodeName, options) {
+    return this.gatewayNetwork.ChaincodeEvents(chaincodeName, options);
+  }
 };
 var BridgeContractImpl = class {
   chaincodeName;
@@ -3244,6 +3308,7 @@ function createSyncECPrivateKeySigner(key) {
   return (digest) => Buffer.from(curve.sign(digest, privateKey, { lowS: true }).toBytes("der"));
 }
 export {
+  ChaincodeEventError,
   CommitError,
   ConfigurationError,
   DEFAULT_TIMEOUTS,

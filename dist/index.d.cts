@@ -57,12 +57,15 @@ interface FailoverDecision {
     reason: string;
 }
 
+/** Safe peer attribution retained from a Fabric Gateway endorsement failure. */
+type EndorsementDetail = {
+    message: string;
+    endpoint: string;
+    mspId: string;
+};
 declare const EndorsementError_base: better_result.TaggedErrorClass<"EndorsementError", {
     message: string;
-    details?: Array<{
-        message: string;
-        endpoint: string;
-    }>;
+    details?: EndorsementDetail[];
 }>;
 declare class EndorsementError extends EndorsementError_base {
 }
@@ -112,6 +115,12 @@ declare const EvaluationError_base: better_result.TaggedErrorClass<"EvaluationEr
 }>;
 declare class EvaluationError extends EvaluationError_base {
 }
+declare const ChaincodeEventError_base: better_result.TaggedErrorClass<"ChaincodeEventError", {
+    message: string;
+    chaincodeName: string;
+}>;
+declare class ChaincodeEventError extends ChaincodeEventError_base {
+}
 declare const ConfigurationError_base: better_result.TaggedErrorClass<"ConfigurationError", {
     message: string;
     field?: string;
@@ -138,10 +147,11 @@ declare const OfflineSigningError_base: better_result.TaggedErrorClass<"OfflineS
 declare class OfflineSigningError extends OfflineSigningError_base {
 }
 
-type BridgeError = EndorsementError | DiscoveryError | PeerNotFoundError | SubmitError | CommitError | EvaluationError | ConfigurationError | TimeoutError | NotConnectedError | SinglePeerExecutionError | OfflineSigningError;
+type BridgeError = EndorsementError | DiscoveryError | PeerNotFoundError | SubmitError | CommitError | EvaluationError | ChaincodeEventError | ConfigurationError | TimeoutError | NotConnectedError | SinglePeerExecutionError | OfflineSigningError;
 type BridgeResult<T> = Result<T, BridgeError>;
 interface BridgeNetwork {
     getContract(chaincodeName: string): Promise<BridgeContract>;
+    ChaincodeEvents(chaincodeName: string, options?: ChaincodeEventsOptions): Promise<BridgeResult<ChaincodeEventStream>>;
 }
 interface BridgeContract {
     getChaincodeName(): string;
@@ -221,6 +231,30 @@ interface CommitStatus {
     status: string;
     transactionId: string;
 }
+interface ChaincodeEvent {
+    blockNumber: bigint;
+    transactionId: string;
+    chaincodeName: string;
+    eventName: string;
+    payload: Buffer;
+}
+interface Checkpoint {
+    getBlockNumber(): bigint | undefined;
+    getTransactionId(): string | undefined;
+}
+interface Checkpointer extends Checkpoint {
+    checkpointBlock(blockNumber: bigint): Promise<void>;
+    checkpointTransaction(blockNumber: bigint, transactionId: string): Promise<void>;
+    checkpointChaincodeEvent(event: ChaincodeEvent): Promise<void>;
+}
+interface ChaincodeEventsOptions {
+    startBlock?: bigint;
+    checkpoint?: Checkpoint;
+}
+interface ChaincodeEventStream {
+    Recv(): Promise<BridgeResult<ChaincodeEvent | null>>;
+    Close(): void;
+}
 
 declare class FabricBridge {
     private config;
@@ -252,4 +286,4 @@ declare function setLogger(newLogger: Logger): void;
 declare function enableDebugLogging(): void;
 declare function disableDebugLogging(): void;
 
-export { type BridgeCommitResult, type BridgeConfig, type BridgeContract, type BridgeEndorsedTransaction, type BridgeError, type BridgeNetwork, type BridgeResult, type BridgeSignedProposal, type BridgeSubmittedTx, type BridgeTransaction, type BridgeUnsignedProposal, CommitError, type CommitStatus, ConfigurationError, DEFAULT_TIMEOUTS, DiscoveryError, EndorsementError, EvaluationError, FabricBridge, type Logger, NotConnectedError, OfflineSigningError, type OfflineSigningRouting, PeerNotFoundError, type ProposalCreator, type SignedMessage, type Signer, type SigningRequest, SinglePeerExecutionError, SubmitError, type TimeoutConfig, TimeoutError, type TlsOptions, createSyncPrivateKeySigner, disableDebugLogging, enableDebugLogging, setLogger };
+export { type BridgeCommitResult, type BridgeConfig, type BridgeContract, type BridgeEndorsedTransaction, type BridgeError, type BridgeNetwork, type BridgeResult, type BridgeSignedProposal, type BridgeSubmittedTx, type BridgeTransaction, type BridgeUnsignedProposal, type ChaincodeEvent, ChaincodeEventError, type ChaincodeEventStream, type ChaincodeEventsOptions, type Checkpoint, type Checkpointer, CommitError, type CommitStatus, ConfigurationError, DEFAULT_TIMEOUTS, DiscoveryError, type EndorsementDetail, EndorsementError, EvaluationError, FabricBridge, type Logger, NotConnectedError, OfflineSigningError, type OfflineSigningRouting, PeerNotFoundError, type ProposalCreator, type SignedMessage, type Signer, type SigningRequest, SinglePeerExecutionError, SubmitError, type TimeoutConfig, TimeoutError, type TlsOptions, createSyncPrivateKeySigner, disableDebugLogging, enableDebugLogging, setLogger };
